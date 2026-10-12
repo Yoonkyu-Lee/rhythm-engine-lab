@@ -87,6 +87,6 @@ WASAPI 공유 모드, 이벤트 구동, 44,100 Hz float32, 버퍼 970프레임, 
 
 1. 예약기: 샘플 위치 예약 / 즉시 재생 정책 스위치
 3. 고장 주입 지점과 시나리오 (A 오디오, B 소비자 정지, C 입력 굶기기, D 시계 점프)
-4. (선택) 케이블 실험으로 25 ms 분리
+3. (선택) 케이블 실험으로 25 ms 분리
 
 근거 문서: [../design/만약 리듬게임을 개발한다면.md](../design/만약%20리듬게임을%20개발한다면.md), [../research/BMS_player_timing_policy.md](../research/BMS_player_timing_policy.md)
