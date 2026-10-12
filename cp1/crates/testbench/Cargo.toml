@@ -1,0 +1,8 @@
+[package]
+name = "testbench"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+synchronizer = { path = "../synchronizer" }
+windows.workspace = true

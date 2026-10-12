@@ -1,0 +1,21 @@
+# 게임 데이터 (코나미 저작물) — 올리지 않음
+converter/converted example/
+converter/system_bgm/
+converter/out/
+converter/out_charts/
+converter/out_soflan/
+converter/logs/
+
+# 다른 프로젝트의 소스 복제본 (분석 보고서 _analysis/ 만 우리 것)
+research/third_party/beatoraja/
+research/third_party/lunaticvibesf/
+
+# 개인 환경 정보
+HANDOFF_PROMPT.md
+
+# 빌드 결과물, 측정 원시 데이터, 도구 캐시
+cp1/target/
+cp1/runs/
+__pycache__/
+.context/
+.gstack/

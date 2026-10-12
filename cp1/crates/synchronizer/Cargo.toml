@@ -1,0 +1,7 @@
+[package]
+name = "synchronizer"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+windows.workspace = true
