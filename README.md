@@ -10,7 +10,7 @@ beatmania IIDX 데이터 분석에서 시작해, IIDX → BMS 컨버터를 완�
 | [cp1/](cp1/) | 엔진 Checkpoint 1: 싱크로나이저와 테스트벤치 (Rust) | 진행 예정 |
 | `HANDOFF_PROMPT.md` | 원본 데이터 환경과 폴더 규칙 (인수인계) | 로컬 전용 |
 
-게임 데이터(변환 결과, 추출 음원, 커뮤니티 변환본)와 다른 프로젝트의 소스 복제본은 저장소에 올리지 않습니다 (`.gitignore`).
+게임 데이터(변환 결과, 추출 음원, 커뮤니티 변환본), 다른 프로젝트의 소스 복제본, IIDX 역공학 문서와 도구는 저장소에 올리지 않습니다 (`.gitignore`). 그래서 일부 문서의 IIDX 분석 링크는 저장소에서 열리지 않습니다.
 
 ## converter/
 
@@ -29,10 +29,10 @@ beatmania IIDX 데이터 분석에서 시작해, IIDX → BMS 컨버터를 완�
 
 | 문서 | 내용 |
 |---|---|
-| `IIDX_vs_BMS.md` | `.1` 채보 형식과 BMS 비교 |
-| `IIDX_timing_policy.md` | `bm2dx.dll` 정적 분석: 고정 틱, 반주 동기화, 주사율 재추정 |
+| `IIDX_vs_BMS.md` | `.1` 채보 형식과 BMS 비교 (로컬 전용) |
+| `IIDX_timing_policy.md` | `bm2dx.dll` 정적 분석: 고정 틱, 반주 동기화, 주사율 재추정 (로컬 전용) |
 | `BMS_player_timing_policy.md` | beatoraja · LVF 소스 분석과 정책 공간(측정 축) |
-| `third_party/` | 두 구동기 소스(얕은 복제)와 축별 분석 보고서 `_analysis/` |
+| `third_party/_analysis/` | beatoraja · LVF 축별 분석 보고서 (소스 복제본은 올리지 않음: beatoraja `8320241`, lunaticvibesf `3e8a655`) |
 
 ## 엔진 계획 (요약)
 

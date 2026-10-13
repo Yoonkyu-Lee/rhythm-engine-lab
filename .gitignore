@@ -19,3 +19,9 @@ cp1/runs/
 __pycache__/
 .context/
 .gstack/
+
+# IIDX 역공학 문서와 도구 — 비공개
+research/IIDX_vs_BMS.md
+research/IIDX_timing_policy.md
+converter/tools/re_disasm_index.py
+research/third_party/_partial_copy_beatoraja/
