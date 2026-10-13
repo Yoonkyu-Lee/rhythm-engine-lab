@@ -35,6 +35,15 @@ cargo build --release
 python -I tools\analyze_step0.py runs\step0-<시각>      # 분석 → summary.json
 ```
 
+## 실험할 때 주의
+
+- 오디오 실험(`step0`, `sched`) 중에는 E2x2로 다른 소리(영상, 게임, Windows 알림음)를 내지 않는다. 공유 모드는 모든 앱 소리를 Playback 1/2에 섞어 루프백에 같이 녹음된다. 방해 금지 모드 권장.
+- Playback 1/2의 Windows 볼륨을 0이나 음소거로 두지 않는다 (루프백보다 앞에서 적용). 소리가 듣기 싫으면 제어 앱 Mix B에서 Playback 1/2만 뮤트한다.
+- 제어 앱 설정(샘플레이트, 버퍼, 루프백 경로)을 바꾸거나 인터페이스를 뽑지 않는다. ASIO·배타 모드 프로그램(spice2x IIDX, Qwilight ASIO)은 장치를 독점하므로 끈다.
+- 무거운 작업(게임, 대형 빌드, 인코딩)은 실제 언더런을 만들어 평상시 값을 오염시킨다. 가벼운 작업은 괜찮다.
+- 입력 실험(`input`)은 F24 키를 초당 4번 시스템에 보낸다. 30초 동안 키보드(특히 Ctrl·Shift)를 누르지 않는다.
+- `clockeval`, `clockjump`, Python 분석은 기록만 읽으므로 제약 없음.
+
 ## 0번 단계 결과 (2026-10-12, 측정 기준 확보: 완료)
 
 WASAPI 공유 모드, 이벤트 구동, 44,100 Hz float32, 버퍼 970프레임, 엔진 주기 10 ms, MMCSS Pro Audio. 클릭: 1초부터 0.5초마다 3샘플 펄스.
