@@ -183,8 +183,10 @@ Windows 시계 자체(NTP 보정)의 점프는 실험하지 않았다: 시스템
 
 ## 다음
 
-1. CP1 마무리: 렉 도감 3장 그래프를 실측값으로 다시 그리기
-2. (선택) 케이블 실험으로 25 ms 분리
-3. CP2로 넘어가기 전 정리: 오디오 스레드의 잠금(시계 모델 Mutex)을 잠금 없는 스냅샷으로 바꾸기
+CP1 (Windows 공유 모드)은 끝났다. 실측 데이터: `results/cp1_wasapi_shared.json` (`python -I tools\export_cp1.py`로 다시 만든다).
+
+1. CP1-2: ASIO에서 다시 재기. 출력 경로에 따라 달라질 결론만 (즉시 재생의 들쭉날쭉 바닥, 언더런 때 밀림 vs 빠짐, 위치 보고 톱니). Steinberg ASIO SDK가 필요하다.
+2. CP2로 넘어가기 전 정리: 오디오 스레드의 잠금(시계 모델 Mutex)을 잠금 없는 스냅샷으로 바꾸기
+3. (선택) 케이블 실험으로 25 ms 분리
 
 근거 문서: [../design/만약 리듬게임을 개발한다면.md](../design/만약%20리듬게임을%20개발한다면.md), [../research/BMS_player_timing_policy.md](../research/BMS_player_timing_policy.md)

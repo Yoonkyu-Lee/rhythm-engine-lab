@@ -43,7 +43,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("새 기준점: 5 ms 벗어남 ×3회", ClockPolicy { jump_ms: 5.0, jump_count: 3, ..Default::default() }),
         ("새 기준점: 10 ms 벗어남 ×5회", ClockPolicy { jump_ms: 10.0, jump_count: 5, ..Default::default() }),
     ];
-    for (name, pol) in policies {
+    for (pi, (name, pol)) in policies.into_iter().enumerate() {
         let mut m = ClockModel::new(rate, pol);
         let mut errs: Vec<(f64, f64)> = Vec::new(); // (시각 s, 오차 ms)
         let mut epochs: Vec<f64> = Vec::new();
@@ -56,6 +56,15 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         println!("\n  [{name}] 새 기준점 {}회: {:?}", epochs.len(), epochs.iter().map(|x| format!("{x:.2}초")).collect::<Vec<_>>());
+        {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(fs::File::create(run.join(format!("clockjump_{pi}.csv")))?);
+            writeln!(f, "# {name}; epochs={}", epochs.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>().join(" "))?;
+            writeln!(f, "t_s,err_ms")?;
+            for (t, e) in &errs {
+                writeln!(f, "{t:.4},{e:.4}")?;
+            }
+        }
         // 고장 시각 = 오디오 시간. 관측 시각 축으로는 앞선 고장들의 밀림만큼 뒤에 있다 → 프레임으로 찾는다.
         let fts: Vec<f64> = faults.iter().map(|&(at, _)| {
             let i0 = obs.iter().position(|&(f, _)| f as f64 >= at * rate).unwrap_or(0);

@@ -116,6 +116,12 @@ def analyze(run):
     after = np.array([r for r in res if faults and r[1] > faults[-1][1] + faults[-1][2] / 1e3 + 1.2])
     if len(after):
         print(f"  마지막 고장 뒤 {len(after)}개: 지연 평균 {after[:, 2].mean():6.2f} ms, σ {after[:, 2].std():.2f}")
+    return {
+        "run": run.name, "label": label, "mode": meta["mode"], "late": meta.get("late"), "sound": meta.get("sound"),
+        "faults": [{"kind": k, "at_s": at, "ms": ms} for k, at, ms in faults],
+        "stream_shift": [{"from_s": round(f0 / rate, 3), "ms": round((o - changes[0][1]) / rate * 1e3, 2)} for f0, o in changes],
+        "events": [{"t_s": round(float(r[1]), 3), "lag_ms": round(float(r[2]), 2), "remain": round(float(max(r[3], 0)), 3)} for r in res],
+    }
 
 
 if __name__ == "__main__":
