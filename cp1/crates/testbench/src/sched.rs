@@ -1,6 +1,11 @@
 //! 2번 단계: 예약기 정책 비교.
 //!
 //!   testbench sched --mode sample|immediate [--fps 60] [--secs 60] [--lookahead-ms 100] [--late cut|whole]
+//!                   [--sound click|noise] [--faults A@10:50,B@30:300]
+//!
+//! 고장 주입 (`--faults`, 시각은 오디오 시간 초, 길이는 ms):
+//!   A@t:ms  렌더(오디오) 스레드가 t초에 ms 동안 버퍼를 채우지 않는다 → 언더런.
+//!   B@t:ms  게임 스레드가 t초에 ms 동안 멈춘다.
 //!
 //! 왼쪽 채널: 시험 이벤트. 게임 스레드가 정책에 따라 예약기로 보낸다.
 //!   sample    : 이벤트 시각보다 lookahead 만큼 앞서 "프레임 N에서 시작"(At)을 보낸다.
@@ -32,6 +37,47 @@ const PILOT_START_S: f64 = 1.25;
 const PILOT_PERIOD_S: f64 = 0.5;
 const CLICK: [f32; 3] = [0.25; 3];
 
+/// 50 ms 결정적 노이즈 버스트 (양끝 1 ms 페이드). 앞부분이 잘려도 남은 부분의 위치를 상호상관으로 잴 수 있다.
+fn noise_burst(rate: f64) -> Vec<f32> {
+    let n = (0.05 * rate) as usize;
+    let fade = (0.001 * rate) as usize;
+    let mut x: u32 = 0x1234_5678;
+    (0..n)
+        .map(|i| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let v = (x as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            let g = if i < fade { i as f32 / fade as f32 } else if i + fade > n { (n - i) as f32 / fade as f32 } else { 1.0 };
+            0.2 * v * g
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct Fault {
+    kind: char,
+    at_s: f64,
+    ms: u64,
+}
+
+fn parse_faults(s: &str) -> Result<Vec<Fault>, String> {
+    if s.is_empty() {
+        return Ok(vec![]);
+    }
+    s.split(',')
+        .map(|f| {
+            let (k, rest) = f.split_once('@').ok_or(format!("고장 형식: {f}"))?;
+            let (t, ms) = rest.split_once(':').ok_or(format!("고장 형식: {f}"))?;
+            Ok(Fault {
+                kind: k.trim().chars().next().unwrap_or('?'),
+                at_s: t.parse().map_err(|_| f.to_string())?,
+                ms: ms.parse().map_err(|_| f.to_string())?,
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Sample,
@@ -51,11 +97,13 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "whole" => LatePolicy::PlayWhole,
         _ => LatePolicy::CutFront,
     };
+    let noise = arg(args, "--sound", "click") == "noise";
+    let faults = parse_faults(&arg(args, "--faults", ""))?;
     let render_name = arg(args, "--render", "Playback 1/2");
     let capture_name = arg(args, "--capture", "Loopback 1/2");
     let unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let tag = match mode {
-        Mode::Sample => format!("sample-la{lookahead_ms:.0}"),
+        Mode::Sample => format!("sample-la{lookahead_ms:.0}-{}", if late == LatePolicy::CutFront { "cut" } else { "whole" }),
         Mode::Immediate => format!("immediate-{fps:.0}fps"),
     };
     let out: PathBuf = Path::new(&arg(args, "--out", "runs")).join(format!("sched-{tag}-{unix}"));
@@ -77,9 +125,11 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let render_done = Arc::new(AtomicBool::new(false));
     let ren = {
         let (out, name, clock, rate_cell, done) = (out.clone(), render_name.clone(), clock.clone(), rate_cell.clone(), render_done.clone());
-        thread::spawn(move || render_loop(&name, &out, secs, late, rx, clock, rate_cell, done))
+        let fa: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'A').collect();
+        thread::spawn(move || render_loop(&name, &out, secs, late, noise, fa, rx, clock, rate_cell, done))
     };
-    let game = game_loop(&out, mode, fps, secs, lookahead_ms, tx, clock, rate_cell, render_done.clone());
+    let fb: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'B').collect();
+    let game = game_loop(&out, mode, fps, secs, lookahead_ms, fb, tx, clock, rate_cell, render_done.clone());
 
     let rmeta = ren.join().map_err(|_| "렌더 스레드 패닉")??;
     game?;
@@ -96,11 +146,13 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut f = File::create(out.join("meta.json"))?;
     writeln!(
         f,
-        "{{\"mode\": \"{}\", \"fps\": {fps}, \"lookahead_ms\": {lookahead_ms}, \"late\": \"{}\", \"secs\": {secs}, \"qpc_freq\": {}, \
+        "{{\"mode\": \"{}\", \"fps\": {fps}, \"lookahead_ms\": {lookahead_ms}, \"late\": \"{}\", \"sound\": \"{}\", \"faults\": \"{}\", \"secs\": {secs}, \"qpc_freq\": {}, \
          \"event\": {{\"start_s\": {EVENT_START_S}, \"period_s\": {EVENT_PERIOD_S}}}, \"pilot\": {{\"start_s\": {PILOT_START_S}, \"period_s\": {PILOT_PERIOD_S}}}, \
          \"render\": {}, \"capture\": {}}}",
         if mode == Mode::Sample { "sample" } else { "immediate" },
         if late == LatePolicy::CutFront { "cut" } else { "whole" },
+        if noise { "noise" } else { "click" },
+        arg(args, "--faults", ""),
         qpc::frequency(), m(&rmeta), m(&cmeta)
     )?;
     println!("기록: {}", out.display());
@@ -123,7 +175,7 @@ fn events(rate: f64, secs: f64) -> Vec<u64> {
 
 #[allow(clippy::too_many_arguments)]
 fn game_loop(
-    out: &Path, mode: Mode, fps: f64, secs: f64, lookahead_ms: f64, tx: Sender<Cmd>,
+    out: &Path, mode: Mode, fps: f64, secs: f64, lookahead_ms: f64, faults: Vec<Fault>, tx: Sender<Cmd>,
     clock: Arc<Mutex<Option<ClockModel>>>, rate_cell: Arc<Mutex<u32>>, render_done: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     unsafe { timeBeginPeriod(1) };
@@ -147,7 +199,19 @@ fn game_loop(
     let period = Duration::from_secs_f64(1.0 / fps);
     let mut next = Instant::now();
     let mut k = 0usize;
+    let mut fired = vec![false; faults.len()];
+    let mut flog = BufWriter::new(File::create(out.join("faults_game.csv"))?);
+    writeln!(flog, "kind,at_s,ms,qpc_before,qpc_after,frame_before")?;
     while k < ev.len() && !render_done.load(Ordering::Acquire) {
+        let q = qpc::now();
+        let now_frame = clock.lock().unwrap().as_ref().map(|m| m.frame_at((q as f64 * 1e7 / qf) as i64)).unwrap_or(0.0);
+        for (i, f) in faults.iter().enumerate() {
+            if !fired[i] && now_frame >= f.at_s * rate {
+                fired[i] = true;
+                thread::sleep(Duration::from_millis(f.ms)); // 고장 B: 게임 스레드 멈춤
+                writeln!(flog, "B,{},{},{q},{},{now_frame:.1}", f.at_s, f.ms, qpc::now())?;
+            }
+        }
         let q = qpc::now();
         let now_frame = clock.lock().unwrap().as_ref().map(|m| m.frame_at((q as f64 * 1e7 / qf) as i64)).unwrap_or(0.0);
         while k < ev.len() {
@@ -177,12 +241,13 @@ fn game_loop(
     }
     unsafe { timeEndPeriod(1) };
     log.flush()?;
+    flog.flush()?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn render_loop(
-    name: &str, out: &Path, secs: f64, late: LatePolicy, rx: Receiver<Cmd>,
+    name: &str, out: &Path, secs: f64, late: LatePolicy, noise: bool, faults: Vec<Fault>, rx: Receiver<Cmd>,
     clock: Arc<Mutex<Option<ClockModel>>>, rate_cell: Arc<Mutex<u32>>, done: Arc<AtomicBool>,
 ) -> Result<Meta, String> {
     let r = (|| -> Result<Meta, Box<dyn std::error::Error>> {
@@ -203,7 +268,17 @@ fn render_loop(
         let total = (secs * rate as f64).round() as u64;
         let pilot_start = (PILOT_START_S * rate as f64).round() as u64;
         let pilot_period = (PILOT_PERIOD_S * rate as f64).round() as u64;
-        let mut mixer = Mixer::new(vec![CLICK.to_vec()], late);
+        let sound0 = if noise { noise_burst(s.rate as f64) } else { CLICK.to_vec() };
+        {
+            let mut f = BufWriter::new(File::create(out.join("sound0.f32"))?);
+            for v in &sound0 {
+                f.write_all(&v.to_le_bytes())?;
+            }
+        }
+        let mut mixer = Mixer::new(vec![sound0], late);
+        let mut fired = vec![false; faults.len()];
+        let mut flog = BufWriter::new(File::create(out.join("faults_render.csv"))?);
+        writeln!(flog, "kind,at_s,ms,qpc_before,qpc_after,written")?;
         let mut scratch = vec![0.0f32; s.buffer_frames as usize * ch];
 
         let mut pilots = BufWriter::new(File::create(out.join("pilots.csv"))?);
@@ -240,6 +315,14 @@ fn render_loop(
         writeln!(rlog, "qpc,written_before,padding,frames,clock_pos,clock_qpc100ns")?;
         while written < total + rate / 2 {
             unsafe { WaitForSingleObject(s.event, 2000) };
+            for (i, f) in faults.iter().enumerate() {
+                if !fired[i] && written as f64 >= f.at_s * rate as f64 {
+                    fired[i] = true;
+                    let q0 = qpc::now();
+                    thread::sleep(Duration::from_millis(f.ms)); // 고장 A: 버퍼를 채우지 않고 잠듦 → 언더런
+                    writeln!(flog, "A,{},{},{q0},{},{written}", f.at_s, f.ms, qpc::now())?;
+                }
+            }
             let now = qpc::now();
             let pad = unsafe { s.client.GetCurrentPadding()? };
             let n = s.buffer_frames - pad;
@@ -260,6 +343,7 @@ fn render_loop(
         }
         done.store(true, Ordering::Release);
         rlog.flush()?;
+        flog.flush()?;
         let mut slog = BufWriter::new(File::create(out.join("starts.csv"))?);
         writeln!(slog, "sound,requested,start,block")?;
         for l in &mixer.log {
