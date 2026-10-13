@@ -1,7 +1,8 @@
 //! 2번 단계: 예약기 정책 비교.
 //!
 //!   testbench sched --mode sample|immediate [--fps 60] [--secs 60] [--lookahead-ms 100] [--late cut|whole]
-//!                   [--sound click|noise] [--faults A@10:50,B@30:300]
+//!                   [--sound click|noise|long] [--event-period-s 0.5007] [--faults A@10:50,B@30:300]
+//!   noise = 50 ms 노이즈 버스트, long = 1초 노이즈 (늦은 긴 소리의 앞부분 자르기 확인용)
 //!
 //! 고장 주입 (`--faults`, 시각은 오디오 시간 초, 길이는 ms):
 //!   A@t:ms  렌더(오디오) 스레드가 t초에 ms 동안 버퍼를 채우지 않는다 → 언더런.
@@ -32,14 +33,14 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 use crate::{arg, capture_loop, Meta};
 
 const EVENT_START_S: f64 = 1.0;
-const EVENT_PERIOD_S: f64 = 0.5007; // 게임 프레임 주기와 맞물리지 않게
+const EVENT_PERIOD_S: f64 = 0.5007; // 기본값. 게임 프레임 주기와 맞물리지 않게
 const PILOT_START_S: f64 = 1.25;
 const PILOT_PERIOD_S: f64 = 0.5;
 const CLICK: [f32; 3] = [0.25; 3];
 
 /// 50 ms 결정적 노이즈 버스트 (양끝 1 ms 페이드). 앞부분이 잘려도 남은 부분의 위치를 상호상관으로 잴 수 있다.
-fn noise_burst(rate: f64) -> Vec<f32> {
-    let n = (0.05 * rate) as usize;
+fn noise_burst(rate: f64, secs: f64) -> Vec<f32> {
+    let n = (secs * rate) as usize;
     let fade = (0.001 * rate) as usize;
     let mut x: u32 = 0x1234_5678;
     (0..n)
@@ -97,7 +98,9 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "whole" => LatePolicy::PlayWhole,
         _ => LatePolicy::CutFront,
     };
-    let noise = arg(args, "--sound", "click") == "noise";
+    let sound_kind = arg(args, "--sound", "click");
+    let noise_s = match sound_kind.as_str() { "noise" => 0.05, "long" => 1.0, _ => 0.0 };
+    let event_period: f64 = arg(args, "--event-period-s", &EVENT_PERIOD_S.to_string()).parse()?;
     let faults = parse_faults(&arg(args, "--faults", ""))?;
     let render_name = arg(args, "--render", "Playback 1/2");
     let capture_name = arg(args, "--capture", "Loopback 1/2");
@@ -126,10 +129,10 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let ren = {
         let (out, name, clock, rate_cell, done) = (out.clone(), render_name.clone(), clock.clone(), rate_cell.clone(), render_done.clone());
         let fa: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'A').collect();
-        thread::spawn(move || render_loop(&name, &out, secs, late, noise, fa, rx, clock, rate_cell, done))
+        thread::spawn(move || render_loop(&name, &out, secs, late, noise_s, fa, rx, clock, rate_cell, done))
     };
     let fb: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'B').collect();
-    let game = game_loop(&out, mode, fps, secs, lookahead_ms, fb, tx, clock, rate_cell, render_done.clone());
+    let game = game_loop(&out, mode, fps, secs, lookahead_ms, event_period, fb, tx, clock, rate_cell, render_done.clone());
 
     let rmeta = ren.join().map_err(|_| "렌더 스레드 패닉")??;
     game?;
@@ -147,11 +150,11 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     writeln!(
         f,
         "{{\"mode\": \"{}\", \"fps\": {fps}, \"lookahead_ms\": {lookahead_ms}, \"late\": \"{}\", \"sound\": \"{}\", \"faults\": \"{}\", \"secs\": {secs}, \"qpc_freq\": {}, \
-         \"event\": {{\"start_s\": {EVENT_START_S}, \"period_s\": {EVENT_PERIOD_S}}}, \"pilot\": {{\"start_s\": {PILOT_START_S}, \"period_s\": {PILOT_PERIOD_S}}}, \
+         \"event\": {{\"start_s\": {EVENT_START_S}, \"period_s\": {event_period}}}, \"pilot\": {{\"start_s\": {PILOT_START_S}, \"period_s\": {PILOT_PERIOD_S}}}, \
          \"render\": {}, \"capture\": {}}}",
         if mode == Mode::Sample { "sample" } else { "immediate" },
         if late == LatePolicy::CutFront { "cut" } else { "whole" },
-        if noise { "noise" } else { "click" },
+        sound_kind,
         arg(args, "--faults", ""),
         qpc::frequency(), m(&rmeta), m(&cmeta)
     )?;
@@ -159,11 +162,11 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn events(rate: f64, secs: f64) -> Vec<u64> {
+fn events(rate: f64, secs: f64, period: f64) -> Vec<u64> {
     let mut v = Vec::new();
     let mut k = 0;
     loop {
-        let t = EVENT_START_S + k as f64 * EVENT_PERIOD_S;
+        let t = EVENT_START_S + k as f64 * period;
         if t > secs - 0.5 {
             break;
         }
@@ -175,7 +178,7 @@ fn events(rate: f64, secs: f64) -> Vec<u64> {
 
 #[allow(clippy::too_many_arguments)]
 fn game_loop(
-    out: &Path, mode: Mode, fps: f64, secs: f64, lookahead_ms: f64, faults: Vec<Fault>, tx: Sender<Cmd>,
+    out: &Path, mode: Mode, fps: f64, secs: f64, lookahead_ms: f64, event_period: f64, faults: Vec<Fault>, tx: Sender<Cmd>,
     clock: Arc<Mutex<Option<ClockModel>>>, rate_cell: Arc<Mutex<u32>>, render_done: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     unsafe { timeBeginPeriod(1) };
@@ -191,7 +194,7 @@ fn game_loop(
         }
         thread::sleep(Duration::from_millis(1));
     };
-    let ev = events(rate, secs);
+    let ev = events(rate, secs, event_period);
     let lookahead = lookahead_ms * 1e-3 * rate;
     let qf = qpc::frequency() as f64;
     let mut log = BufWriter::new(File::create(out.join("game_sends.csv"))?);
@@ -247,7 +250,7 @@ fn game_loop(
 
 #[allow(clippy::too_many_arguments)]
 fn render_loop(
-    name: &str, out: &Path, secs: f64, late: LatePolicy, noise: bool, faults: Vec<Fault>, rx: Receiver<Cmd>,
+    name: &str, out: &Path, secs: f64, late: LatePolicy, noise_s: f64, faults: Vec<Fault>, rx: Receiver<Cmd>,
     clock: Arc<Mutex<Option<ClockModel>>>, rate_cell: Arc<Mutex<u32>>, done: Arc<AtomicBool>,
 ) -> Result<Meta, String> {
     let r = (|| -> Result<Meta, Box<dyn std::error::Error>> {
@@ -268,7 +271,7 @@ fn render_loop(
         let total = (secs * rate as f64).round() as u64;
         let pilot_start = (PILOT_START_S * rate as f64).round() as u64;
         let pilot_period = (PILOT_PERIOD_S * rate as f64).round() as u64;
-        let sound0 = if noise { noise_burst(s.rate as f64) } else { CLICK.to_vec() };
+        let sound0 = if noise_s > 0.0 { noise_burst(s.rate as f64, noise_s) } else { CLICK.to_vec() };
         {
             let mut f = BufWriter::new(File::create(out.join("sound0.f32"))?);
             for v in &sound0 {

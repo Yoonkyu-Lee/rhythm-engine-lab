@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod clockjump;
 mod input;
 mod sched;
 
@@ -41,6 +42,7 @@ fn main() {
         "clockeval" => clockeval(&args),
         "sched" => sched::run(&args),
         "input" => input::run(&args),
+        "clockjump" => clockjump::run(&args),
         _ => {
             eprintln!("사용법: testbench list | testbench step0 [--secs 20] [--render 이름] [--capture 이름] [--out runs]");
             Ok(())

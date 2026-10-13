@@ -29,8 +29,10 @@ impl Default for ClockPolicy {
     /// USB 프레임 하나(1 ms)만큼 쌓이면 1 ms를 한 번에 고친다 (약 135초마다, 재생·녹음 동시에).
     /// 보고값은 실제 시계를 중심으로 0–1 ms 톱니(σ 0.29 ms)를 그리므로, 톱니 여러 주기를 덮는 긴 창의 직선이
     /// 실제 시계에 가장 가깝다. 한 주기(약 135초)가 쌓이기 전에는 기울기를 명목값으로 둔다.
+    /// 점프 감지 2 ms × 2회: 언더런 계단을 0.14초 만에 새 기준점으로 잡는다 (3-3 단계). 이 장치의 정상 흔들림
+    /// (톱니 계단 1 ms, 혼자 튀는 값 0.3 ms)보다 커서 오탐이 없었다. 다른 장치에서는 톱니 크기를 먼저 재고 정한다.
     fn default() -> Self {
-        ClockPolicy { window_s: 600.0, min_slope_span_s: 150.0, jump_ms: 5.0, jump_count: 3, median_intercept: false }
+        ClockPolicy { window_s: 600.0, min_slope_span_s: 150.0, jump_ms: 2.0, jump_count: 2, median_intercept: false }
     }
 }
 
