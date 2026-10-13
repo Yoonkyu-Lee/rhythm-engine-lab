@@ -21,6 +21,10 @@ pub struct ClockPolicy {
     pub jump_count: u32,
     /// 기울기를 명목값으로 둘 때 절편을 평균 대신 중앙값으로 잡는다. 혼자 튀는 보고값(약 1%, 0.1–0.3 ms)을 무시한다.
     pub median_intercept: bool,
+    /// 관측을 이 간격(초, 프레임 수로 환산)보다 촘촘하면 솎는다 (점프 감지는 모든 관측으로 한다). 창 안 관측 수에 상한을 두어
+    /// 다시 맞추는 계산량을 묶는다. ASIO 버퍼 64는 초당 689개가 오는데, 솎지 않으면 600초 창에 40만 개가 쌓여
+    /// 콜백 처리 시간이 분마다 늘었다 (CP1-3). WASAPI(10 ms마다)는 그대로.
+    pub keep_interval_s: f64,
 }
 
 impl Default for ClockPolicy {
@@ -32,7 +36,7 @@ impl Default for ClockPolicy {
     /// 점프 감지 2 ms × 2회: 언더런 계단을 0.14초 만에 새 기준점으로 잡는다 (3-3 단계). 이 장치의 정상 흔들림
     /// (톱니 계단 1 ms, 혼자 튀는 값 0.3 ms)보다 커서 오탐이 없었다. 다른 장치에서는 톱니 크기를 먼저 재고 정한다.
     fn default() -> Self {
-        ClockPolicy { window_s: 600.0, min_slope_span_s: 150.0, jump_ms: 2.0, jump_count: 2, median_intercept: false }
+        ClockPolicy { window_s: 600.0, min_slope_span_s: 150.0, jump_ms: 2.0, jump_count: 2, median_intercept: false, keep_interval_s: 0.01 }
     }
 }
 
@@ -125,6 +129,12 @@ impl ClockModel {
             }
         }
         self.suspects = 0;
+        // 솎기는 프레임 간격으로 한다: 시각에는 흔들림이 섞여 있어서, 시각 간격으로 고르면 늦게 찍힌 관측이 더 자주 남아 치우친다.
+        if let Some(&(_, ly)) = self.obs.back() {
+            if y - ly < self.policy.keep_interval_s * self.nominal_rate * 0.95 {
+                return Observe::Accepted;
+            }
+        }
         self.obs.push_back((x, y));
         while let Some(&(fx, _)) = self.obs.front() {
             if x - fx > self.policy.window_s {

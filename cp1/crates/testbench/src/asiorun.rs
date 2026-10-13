@@ -64,7 +64,8 @@ struct State {
     cblog: Vec<CbLog>,
     fault_log: Vec<(f64, u64, i64, i64, u64)>,
     messages: Vec<(i32, i32, i64)>,
-    clock: Arc<Mutex<Option<ClockModel>>>,
+    /// 시계 관측은 채널로 넘기기만 한다. 다시 맞추는 계산은 시계 스레드가 한다 (콜백에서 제한 없는 작업 금지).
+    clock_tx: std::sync::mpsc::Sender<(u64, i64)>,
     done: Arc<AtomicBool>,
 }
 
@@ -160,10 +161,7 @@ extern "C" fn buffer_switch(index: i32, _direct: i32) {
         output_ready(st.driver);
     }
     CB_STAGE.store(5, Ordering::Relaxed);
-    // 시험용: 콜백에서 잠금을 잡는다 (CP2 전 잠금 없는 스냅샷으로 바꿀 것).
-    if let Some(m) = st.clock.lock().unwrap().as_mut() {
-        m.observe(frame, to_100ns(q_in));
-    }
+    let _ = st.clock_tx.send((frame, to_100ns(q_in)));
     if st.cblog.len() < st.cblog.capacity() {
         st.cblog.push(CbLog { qpc_in: q_in, qpc_out: qpc::now(), spos, systime_ns: sys, frame, index });
     }
@@ -264,6 +262,50 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let (tx, rx) = channel::<Cmd>();
     let clock: Arc<Mutex<Option<ClockModel>>> = Arc::new(Mutex::new(Some(ClockModel::new(rate, ClockPolicy::default()))));
+    // 시계 스레드: 콜백이 넘긴 관측으로 모델을 갱신한다. 게임 스레드와만 잠금을 나눈다.
+    let (clock_tx, clock_rx) = channel::<(u64, i64)>();
+    let clock_thread = {
+        let clock = clock.clone();
+        thread::spawn(move || {
+            while let Ok((f, t)) = clock_rx.recv() {
+                let mut g = clock.lock().unwrap();
+                if let Some(m) = g.as_mut() {
+                    m.observe(f, t);
+                    while let Ok((f, t)) = clock_rx.try_recv() {
+                        m.observe(f, t);
+                    }
+                }
+            }
+        })
+    };
+    // 노트북 맥박 탐침: 오디오와 무관한 최고 우선순위 스레드가 1 ms마다 깬다. ASIO가 멈춘 순간에 이것도 못 깼으면
+    // 노트북 전체가 멈춘 것, 멀쩡했으면 USB 오디오 경로 쪽이다.
+    let probe_stop = Arc::new(AtomicBool::new(false));
+    let probe = {
+        let stop = probe_stop.clone();
+        thread::spawn(move || {
+            use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
+            unsafe {
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+                windows::Win32::Media::timeBeginPeriod(1);
+            }
+            let qf = qpc::frequency() as f64;
+            let mut gaps: Vec<(i64, f64)> = Vec::with_capacity(100_000);
+            let (mut wakes, mut last) = (0u64, qpc::now());
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(1));
+                let now = qpc::now();
+                let g = (now - last) as f64 * 1e3 / qf;
+                if g > 4.0 && gaps.len() < gaps.capacity() {
+                    gaps.push((last, g));
+                }
+                last = now;
+                wakes += 1;
+            }
+            unsafe { windows::Win32::Media::timeEndPeriod(1) };
+            (wakes, gaps)
+        })
+    };
     let rate_cell: Arc<Mutex<u32>> = Arc::new(Mutex::new(rate as u32));
     let done = Arc::new(AtomicBool::new(false));
     let total = (secs * rate).round() as u64;
@@ -293,7 +335,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         cblog: Vec::with_capacity(((secs + 2.0) * rate / buffer as f64) as usize + 1024),
         fault_log: Vec::new(),
         messages: Vec::with_capacity(1024),
-        clock: clock.clone(),
+        clock_tx,
         done: done.clone(),
     });
     unsafe {
@@ -335,6 +377,8 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let _ = drv.stop();
     let _ = drv.dispose_buffers();
     STATE.store(std::ptr::null_mut(), Ordering::Release);
+    probe_stop.store(true, Ordering::Release);
+    let (wakes, gaps) = probe.join().map_err(|_| "탐침 스레드 패닉")?;
     game.map_err(|e| e.to_string())?;
 
     // 기록 (sched와 같은 형식)
@@ -374,6 +418,13 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         writeln!(fl, "A,{at},{ms},{q0},{q1},{w}")?;
     }
     fl.flush()?;
+    let mut pg = BufWriter::new(File::create(out.join("probe_gaps.csv"))?);
+    writeln!(pg, "qpc_before,gap_ms")?;
+    for (q, g) in &gaps {
+        writeln!(pg, "{q},{g:.3}")?;
+    }
+    pg.flush()?;
+    drop(st.clock_tx.clone());
     let mut ml = BufWriter::new(File::create(out.join("asio_messages.csv"))?);
     writeln!(ml, "selector,value,qpc")?;
     for (s, v, q) in &st.messages {
@@ -394,6 +445,9 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         if by_position { "position" } else { "callback" },
         st.output_ready, st.callbacks
     ))?;
-    println!("기록: {}  (콜백 {}회, outputReady {}, 메시지 {}개)", out.display(), st.callbacks, st.output_ready, st.messages.len());
+    println!("기록: {}  (콜백 {}회, outputReady {}, 메시지 {}개, 탐침 깨어남 {}회 중 4 ms 넘는 공백 {}회)", out.display(), st.callbacks, st.output_ready, st.messages.len(), wakes, gaps.len());
+    // 시계 스레드는 콜백 쪽 송신기가 사라지면 끝난다.
+    drop(st);
+    let _ = clock_thread.join();
     Ok(())
 }
