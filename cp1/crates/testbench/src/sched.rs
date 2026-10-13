@@ -32,14 +32,14 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 
 use crate::{arg, capture_loop, Meta};
 
-const EVENT_START_S: f64 = 1.0;
-const EVENT_PERIOD_S: f64 = 0.5007; // 기본값. 게임 프레임 주기와 맞물리지 않게
-const PILOT_START_S: f64 = 1.25;
-const PILOT_PERIOD_S: f64 = 0.5;
-const CLICK: [f32; 3] = [0.25; 3];
+pub(crate) const EVENT_START_S: f64 = 1.0;
+pub(crate) const EVENT_PERIOD_S: f64 = 0.5007; // 기본값. 게임 프레임 주기와 맞물리지 않게
+pub(crate) const PILOT_START_S: f64 = 1.25;
+pub(crate) const PILOT_PERIOD_S: f64 = 0.5;
+pub(crate) const CLICK: [f32; 3] = [0.25; 3];
 
 /// 50 ms 결정적 노이즈 버스트 (양끝 1 ms 페이드). 앞부분이 잘려도 남은 부분의 위치를 상호상관으로 잴 수 있다.
-fn noise_burst(rate: f64, secs: f64) -> Vec<f32> {
+pub(crate) fn noise_burst(rate: f64, secs: f64) -> Vec<f32> {
     let n = (secs * rate) as usize;
     let fade = (0.001 * rate) as usize;
     let mut x: u32 = 0x1234_5678;
@@ -56,13 +56,13 @@ fn noise_burst(rate: f64, secs: f64) -> Vec<f32> {
 }
 
 #[derive(Clone, Copy)]
-struct Fault {
-    kind: char,
-    at_s: f64,
-    ms: u64,
+pub(crate) struct Fault {
+    pub kind: char,
+    pub at_s: f64,
+    pub ms: u64,
 }
 
-fn parse_faults(s: &str) -> Result<Vec<Fault>, String> {
+pub(crate) fn parse_faults(s: &str) -> Result<Vec<Fault>, String> {
     if s.is_empty() {
         return Ok(vec![]);
     }
@@ -80,7 +80,7 @@ fn parse_faults(s: &str) -> Result<Vec<Fault>, String> {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Mode {
+pub(crate) enum Mode {
     Sample,
     Immediate,
 }
@@ -177,7 +177,7 @@ fn events(rate: f64, secs: f64, period: f64) -> Vec<u64> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn game_loop(
+pub(crate) fn game_loop(
     out: &Path, mode: Mode, fps: f64, secs: f64, lookahead_ms: f64, event_period: f64, faults: Vec<Fault>, tx: Sender<Cmd>,
     clock: Arc<Mutex<Option<ClockModel>>>, rate_cell: Arc<Mutex<u32>>, render_done: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
