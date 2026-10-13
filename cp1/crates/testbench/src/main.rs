@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod sched;
+
 use synchronizer::qpc;
 use synchronizer::wasapi::{self, IAudioCaptureClient, IAudioClock, IAudioRenderClient, Stream};
 use windows::Win32::Media::Audio::AUDCLNT_BUFFERFLAGS_SILENT;
@@ -25,7 +27,7 @@ const CLICK_PERIOD_S: f64 = 0.5;
 const CLICK_LEN: u64 = 3;
 const CLICK_AMP: f32 = 0.25;
 
-fn arg(args: &[String], key: &str, default: &str) -> String {
+pub(crate) fn arg(args: &[String], key: &str, default: &str) -> String {
     args.iter().position(|a| a == key).and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| default.to_string())
 }
 
@@ -36,6 +38,7 @@ fn main() {
         "list" => list(),
         "step0" => step0(&args),
         "clockeval" => clockeval(&args),
+        "sched" => sched::run(&args),
         _ => {
             eprintln!("사용법: testbench list | testbench step0 [--secs 20] [--render 이름] [--capture 이름] [--out runs]");
             Ok(())
@@ -166,15 +169,15 @@ fn list() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct Meta {
-    name: String,
-    rate: u32,
-    channels: u16,
-    bits: u16,
-    buffer_frames: u32,
-    default_period_100ns: i64,
-    clock_freq: u64,
-    mmcss: bool,
+pub(crate) struct Meta {
+    pub name: String,
+    pub rate: u32,
+    pub channels: u16,
+    pub bits: u16,
+    pub buffer_frames: u32,
+    pub default_period_100ns: i64,
+    pub clock_freq: u64,
+    pub mmcss: bool,
 }
 
 fn step0(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -191,7 +194,7 @@ fn step0(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // 녹음을 먼저 시작해 첫 클릭을 놓치지 않는다.
     let cap = {
         let (stop, started, out, name) = (stop.clone(), started.clone(), out.clone(), capture_name.clone());
-        thread::spawn(move || capture_loop(&name, &out, stop, started))
+        thread::spawn(move || capture_loop(&name, &out, stop, started, false))
     };
     while !started.load(Ordering::Acquire) {
         if cap.is_finished() {
@@ -293,7 +296,7 @@ fn render_loop(name: &str, out: &Path, secs: f64, stop: Arc<AtomicBool>) -> Resu
     r.map_err(|e| format!("렌더: {e}"))
 }
 
-fn capture_loop(name: &str, out: &Path, stop: Arc<AtomicBool>, started: Arc<AtomicBool>) -> Result<Meta, String> {
+pub(crate) fn capture_loop(name: &str, out: &Path, stop: Arc<AtomicBool>, started: Arc<AtomicBool>, stereo: bool) -> Result<Meta, String> {
     let r = (|| -> Result<Meta, Box<dyn std::error::Error>> {
         wasapi::com_init()?;
         let mmcss = wasapi::mmcss_pro_audio();
@@ -308,7 +311,8 @@ fn capture_loop(name: &str, out: &Path, stop: Arc<AtomicBool>, started: Arc<Atom
         let ch = s.channels as usize;
         let mut log = BufWriter::new(File::create(out.join("capture_packets.csv"))?);
         writeln!(log, "qpc,device_pos,qpc100ns,frames,flags")?;
-        let mut wav = BufWriter::new(File::create(out.join("capture_ch0.f32"))?);
+        let mut wav = BufWriter::new(File::create(out.join(if stereo { "capture_2ch.f32" } else { "capture_ch0.f32" }))?);
+        let keep = if stereo { ch } else { 1 };
         unsafe { s.client.Start()? };
         started.store(true, Ordering::Release);
         while !stop.load(Ordering::Acquire) {
@@ -324,8 +328,10 @@ fn capture_loop(name: &str, out: &Path, stop: Arc<AtomicBool>, started: Arc<Atom
                 let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
                 let p = data as *const f32;
                 for i in 0..frames as usize {
-                    let v = if silent { 0.0 } else { unsafe { *p.add(i * ch) } };
-                    wav.write_all(&v.to_le_bytes())?;
+                    for c in 0..keep {
+                        let v = if silent { 0.0 } else { unsafe { *p.add(i * ch + c) } };
+                        wav.write_all(&v.to_le_bytes())?;
+                    }
                 }
                 unsafe { cc.ReleaseBuffer(frames)? };
                 writeln!(log, "{now},{dpos},{qpos},{frames},{flags}")?;
