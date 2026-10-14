@@ -19,6 +19,7 @@ mod asiorun;
 mod clockjump;
 mod input;
 mod sched;
+mod watch;
 
 use synchronizer::qpc;
 use synchronizer::wasapi::{self, IAudioCaptureClient, IAudioClock, IAudioRenderClient, Stream};
@@ -47,6 +48,7 @@ fn main() {
         "clockjump" => clockjump::run(&args),
         "asioprobe" => asioprobe::run(&args),
         "asiorun" => asiorun::run(&args),
+        "watch" => watch::run(&args),
         _ => {
             eprintln!("사용법: testbench list | testbench step0 [--secs 20] [--render 이름] [--capture 이름] [--out runs]");
             Ok(())

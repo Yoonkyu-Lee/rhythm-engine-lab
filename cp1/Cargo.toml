@@ -26,6 +26,7 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_Registry",
     "Win32_System_Performance",
+    "Win32_System_Power",
 ] }
 
 [profile.release]

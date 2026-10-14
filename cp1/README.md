@@ -250,6 +250,8 @@ Windows 시계 자체(NTP 보정)의 점프는 실험하지 않았다: 시스템
 
 전원(충전기, 100%, 균형), 서비스 상태는 같았다. 배터리 보고서상 그동안 절전·방전 없음. → 87 ms DPC는 G-Helper와 무관하게 오후 한때만 나타난 간헐적 상태 (원인 미상). 평소 AML 명령: 온도 `_TMP` (WUDFHost, 약 0.5초마다), EC 이벤트 `EC0._QAE` → `ATKD._WED` (약 12초마다), 배터리 `_BST`, NVIDIA `NPCF._DSM`.
 
+**상주 감시** `testbench watch [--hours 0] [--gap-ms 4] [--every-s 5] [--alert-ms 50]` (관리자 권한·오디오 장치 불필요): 1 ms 탐침의 공백을 현지 시각과 함께 `gaps.csv`에, 5초마다 CPU 사용률·온도 센서·충전기·배터리·CPU 상위 프로세스 5개를 `context.csv`에 남긴다. 87 ms 멈춤이 다시 나타나는 시각과 조건을 잡기 위한 것. 끝내기: Ctrl+C 또는 출력 폴더에 `stop` 파일.
+
 장치 트리: 독 연결 = E2x2 → 독의 Generic USB Hub → USB 3.0 Root Hub → 노트북 Intel xHCI. 직결 = 허브 단계만 빠짐 (같은 컨트롤러).
 
 수정: 시계 모델이 관측마다 창 전체를 다시 계산해 버퍼 64에서 콜백이 분마다 무거워졌다 → `ClockPolicy::keep_interval_s` (프레임 간격 10 ms로 솎기), `asiorun`은 관측을 채널로 시계 스레드에 넘김, 1 ms 탐침 스레드(`probe_gaps.csv`) 추가.
