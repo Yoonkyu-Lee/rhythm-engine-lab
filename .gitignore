@@ -7,8 +7,8 @@ converter/out_soflan/
 converter/logs/
 
 # 다른 프로젝트의 소스 복제본 (분석 보고서 _analysis/ 만 우리 것)
-research/third_party/beatoraja/
-research/third_party/lunaticvibesf/
+cp0/third_party/beatoraja/
+cp0/third_party/lunaticvibesf/
 
 # 개인 환경 정보
 HANDOFF_PROMPT.md
@@ -21,7 +21,7 @@ __pycache__/
 .gstack/
 
 # IIDX 역공학 문서와 도구 — 비공개
-research/IIDX_vs_BMS.md
-research/IIDX_timing_policy.md
-converter/tools/re_disasm_index.py
-research/third_party/_partial_copy_beatoraja/
+cp0/IIDX_vs_BMS.md
+cp0/IIDX_timing_policy.md
+cp0/tools/re_disasm_index.py
+cp0/third_party/_partial_copy_beatoraja/

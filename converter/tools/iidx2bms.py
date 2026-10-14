@@ -8,7 +8,7 @@ python -I tools\iidx2bms.py 33131 --no-audio     # 채보만 (빠른 검증)
       + 곡 DB music_data.bin / music_omni.bin (차분별 소리 묶음 접미사 +0x684)
 출력: out\<곡ID> <제목>\  (BMS 파일, 소리, 미리듣기, report.json)
 
-근거 (확인한 사실, IIDX_vs_BMS.md / IIDX_timing_policy.md / tools\iidx_survey.py):
+근거 (확인한 사실, cp0\IIDX_vs_BMS.md / cp0\IIDX_timing_policy.md / cp0\tools\iidx_survey.py):
   - .1 칸 0..4 = SP H,N,A,B,L / 6..10 = DP H,N,A,B,L
   - 이벤트 8B (u32 ms, u8 type, u8 param, u16 value), 시각 0x7FFFFFFF = 끝 표식
   - type 0/1 노트 (1P/2P, param 0..6 건반, 7 스크래치, 107 특수 스크래치), value = 롱노트 길이(ms)

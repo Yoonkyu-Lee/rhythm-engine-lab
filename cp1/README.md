@@ -264,4 +264,4 @@ CP1 (Windows 공유 모드)은 끝났다. 실측 데이터: `results/cp1_wasapi_
 2. CP2로 넘어가기 전 정리: 오디오 스레드의 잠금(시계 모델 Mutex)을 잠금 없는 스냅샷으로 바꾸기
 3. (선택) 케이블 실험으로 25 ms 분리
 
-근거 문서: [../design/만약 리듬게임을 개발한다면.md](../design/만약%20리듬게임을%20개발한다면.md), [../research/BMS_player_timing_policy.md](../research/BMS_player_timing_policy.md)
+근거 문서: [../design/만약 리듬게임을 개발한다면.md](../design/만약%20리듬게임을%20개발한다면.md), [../cp0/BMS_player_timing_policy.md](../cp0/BMS_player_timing_policy.md)

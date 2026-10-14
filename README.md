@@ -4,10 +4,10 @@ beatmania IIDX 데이터 분석에서 시작해, IIDX → BMS 컨버터를 완�
 
 | 폴더 | 내용 | 상태 |
 |---|---|---|
-| [converter/](converter/) | IIDX → BMS 컨버터와 보조 도구 | 완료 (2026-10-11) |
-| [research/](research/) | 분석 문서: IIDX 형식과 타이밍, BMS 구동기(beatoraja, Lunatic Vibes F) 소스 분석 | 사실 기록 |
+| [cp0/](cp0/) | 번외편: 기존 게임 분석 (IIDX 형식과 타이밍, BMS 구동기 beatoraja · Lunatic Vibes F 소스 분석, 분석 도구). [리포트](cp0/REPORT.md) | 완료 |
+| [converter/](converter/) | IIDX → BMS 컨버터와 검증 도구 | 완료 (2026-10-11) |
 | [design/](design/) | 게임 설계 구상: 타이밍 설계, 곡 데이터 형식, 세미 게임 레이어 | 구상 |
-| [cp1/](cp1/) | 엔진 Checkpoint 1: 싱크로나이저와 테스트벤치 (Rust) | 진행 예정 |
+| [cp1/](cp1/) | 엔진 Checkpoint 1: 싱크로나이저와 테스트벤치 (Rust). [리포트](cp1/REPORT.md) | 완료 (CP1-3 렉 조사는 보류) |
 | `HANDOFF_PROMPT.md` | 원본 데이터 환경과 폴더 규칙 (인수인계) | 로컬 전용 |
 
 게임 데이터(변환 결과, 추출 음원, 커뮤니티 변환본), 다른 프로젝트의 소스 복제본, IIDX 역공학 문서와 도구는 저장소에 올리지 않습니다 (`.gitignore`). 그래서 일부 문서의 IIDX 분석 링크는 저장소에서 열리지 않습니다.
@@ -17,7 +17,7 @@ beatmania IIDX 데이터 분석에서 시작해, IIDX → BMS 컨버터를 완�
 | 경로 | 내용 |
 |---|---|
 | `tools/iidx2bms.py` | 변환기 본체. 출력 기본값은 `converter/out` |
-| `tools/` 나머지 | 분석·검증 도구 (BMS 렌더러, 미리듣기 비교, `.1` 열람, 역어셈블 색인 등), 시스템 BGM 추출, 난이도 테이블 생성, FLAC→WAV 이전 |
+| `tools/` 나머지 | 검증 도구 (독립 BMS 렌더러, 변환본 비교, 미리듣기 비교), 시스템 BGM 추출, 난이도 테이블 생성, FLAC→WAV 이전. `.1`·BMS 열람과 전수 조사 도구는 [cp0/tools/](cp0/tools/) |
 | `system_bgm/` | 추출한 시스템 BGM |
 | `out/`, `out_charts/`, `out_soflan/` | 시험 변환 출력 |
 | `logs/` | 전곡 변환·이전 로그 |
@@ -25,14 +25,9 @@ beatmania IIDX 데이터 분석에서 시작해, IIDX → BMS 컨버터를 완�
 
 변환 결과 라이브러리는 이 폴더가 아니라 `D:\Games\BMS\IIDX converted SP`, `... DP`, 난이도 테이블은 `D:\Games\BMS\IIDX tables`에 있습니다.
 
-## research/
+## cp0/
 
-| 문서 | 내용 |
-|---|---|
-| `IIDX_vs_BMS.md` | `.1` 채보 형식과 BMS 비교 (로컬 전용) |
-| `IIDX_timing_policy.md` | `bm2dx.dll` 정적 분석: 고정 틱, 반주 동기화, 주사율 재추정 (로컬 전용) |
-| `BMS_player_timing_policy.md` | beatoraja · LVF 소스 분석과 정책 공간(측정 축) |
-| `third_party/_analysis/` | beatoraja · LVF 축별 분석 보고서 (소스 복제본은 올리지 않음: beatoraja `8320241`, lunaticvibesf `3e8a655`) |
+분석 문서와 도구 목록은 [cp0/README.md](cp0/README.md), 결론은 [cp0/REPORT.md](cp0/REPORT.md).
 
 ## 엔진 계획 (요약)
 
