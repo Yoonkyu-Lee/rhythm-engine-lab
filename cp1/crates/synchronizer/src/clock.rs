@@ -186,6 +186,19 @@ impl ClockModel {
         let x = (frame - self.f0 - self.a) / self.b;
         self.t0 as f64 + x * 1e7
     }
+
+    /// 지금 직선을 다른 스레드에 넘길 값으로 꺼낸다 (`shared_clock::SharedClock`).
+    pub fn snapshot(&self) -> crate::shared_clock::ClockSnapshot {
+        crate::shared_clock::ClockSnapshot {
+            valid: self.is_valid(),
+            epoch: self.epoch,
+            nominal_rate: self.nominal_rate,
+            t0: self.t0,
+            f0: self.f0,
+            a: self.a,
+            b: self.b,
+        }
+    }
 }
 
 #[cfg(test)]

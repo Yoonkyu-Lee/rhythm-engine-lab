@@ -16,12 +16,13 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use synchronizer::asio::{self, AsioBufferInfo, AsioCallbacks, Driver, ASIOST_INT32_LSB};
-use synchronizer::clock::{ClockModel, ClockPolicy};
+use synchronizer::clock::ClockPolicy;
+use synchronizer::shared_clock::{obs_ring, spawn_clock_thread, ObsProducer, SharedClock};
 use synchronizer::qpc;
 use synchronizer::scheduler::{Cmd, LatePolicy, Mixer};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -64,8 +65,8 @@ struct State {
     cblog: Vec<CbLog>,
     fault_log: Vec<(f64, u64, i64, i64, u64)>,
     messages: Vec<(i32, i32, i64)>,
-    /// 시계 관측은 채널로 넘기기만 한다. 다시 맞추는 계산은 시계 스레드가 한다 (콜백에서 제한 없는 작업 금지).
-    clock_tx: std::sync::mpsc::Sender<(u64, i64)>,
+    /// 시계 관측은 링에 넣기만 한다 (잠금·할당 없음). 다시 맞추는 계산은 시계 스레드가 한다.
+    obs: ObsProducer,
     done: Arc<AtomicBool>,
 }
 
@@ -161,7 +162,7 @@ extern "C" fn buffer_switch(index: i32, _direct: i32) {
         output_ready(st.driver);
     }
     CB_STAGE.store(5, Ordering::Relaxed);
-    let _ = st.clock_tx.send((frame, to_100ns(q_in)));
+    st.obs.push(frame, to_100ns(q_in));
     if st.cblog.len() < st.cblog.capacity() {
         st.cblog.push(CbLog { qpc_in: q_in, qpc_out: qpc::now(), spos, systime_ns: sys, frame, index });
     }
@@ -261,23 +262,10 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let (tx, rx) = channel::<Cmd>();
-    let clock: Arc<Mutex<Option<ClockModel>>> = Arc::new(Mutex::new(Some(ClockModel::new(rate, ClockPolicy::default()))));
-    // 시계 스레드: 콜백이 넘긴 관측으로 모델을 갱신한다. 게임 스레드와만 잠금을 나눈다.
-    let (clock_tx, clock_rx) = channel::<(u64, i64)>();
-    let clock_thread = {
-        let clock = clock.clone();
-        thread::spawn(move || {
-            while let Ok((f, t)) = clock_rx.recv() {
-                let mut g = clock.lock().unwrap();
-                if let Some(m) = g.as_mut() {
-                    m.observe(f, t);
-                    while let Ok((f, t)) = clock_rx.try_recv() {
-                        m.observe(f, t);
-                    }
-                }
-            }
-        })
-    };
+    // 시계 스레드: 콜백이 링에 넣은 관측으로 모델을 갱신하고 스냅샷을 공개한다. 게임 스레드는 잠금 없이 읽는다.
+    let clock = Arc::new(SharedClock::new());
+    let (obs, obs_rx) = obs_ring(8192);
+    let clock_thread = spawn_clock_thread(rate, ClockPolicy::default(), obs_rx, clock.clone());
     // 노트북 맥박 탐침: 오디오와 무관한 최고 우선순위 스레드가 1 ms마다 깬다. ASIO가 멈춘 순간에 이것도 못 깼으면
     // 노트북 전체가 멈춘 것, 멀쩡했으면 USB 오디오 경로 쪽이다.
     let probe_stop = Arc::new(AtomicBool::new(false));
@@ -306,7 +294,6 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             (wakes, gaps)
         })
     };
-    let rate_cell: Arc<Mutex<u32>> = Arc::new(Mutex::new(rate as u32));
     let done = Arc::new(AtomicBool::new(false));
     let total = (secs * rate).round() as u64;
     let null = std::ptr::null_mut();
@@ -335,13 +322,15 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         cblog: Vec::with_capacity(((secs + 2.0) * rate / buffer as f64) as usize + 1024),
         fault_log: Vec::new(),
         messages: Vec::with_capacity(1024),
-        clock_tx,
+        obs,
         done: done.clone(),
     });
     unsafe {
         drv.create_buffers(&mut st.bufs, buffer, &CALLBACKS).map_err(|e| format!("createBuffers 실패 {e} ({})", asio::error_name(e)))?;
     }
     st.output_ready = drv.output_ready().is_ok();
+    // 지연은 버퍼 크기에 따라 달라질 수 있어서, 버퍼를 만든 뒤에 다시 묻는다 (만들기 전 값과 둘 다 기록).
+    let (in_lat_buf, out_lat_buf) = drv.latencies().unwrap_or((0, 0));
     STATE.store(&mut *st as *mut State, Ordering::Release);
     drv.start().map_err(|e| format!("start 실패 {e}"))?;
 
@@ -350,7 +339,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let fb: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'B').collect();
     let game_thread = {
         let (out, done) = (out.clone(), done.clone());
-        thread::spawn(move || game_loop(&out, mode, fps, secs, lookahead_ms, event_period, fb, tx, clock, rate_cell, done).map_err(|e| e.to_string()))
+        thread::spawn(move || game_loop(&out, mode, fps, secs, lookahead_ms, event_period, fb, tx, clock, done).map_err(|e| e.to_string()))
     };
     // 콜백이 2초 넘게 멈추면 어느 단계에서 멈췄는지 알린다 (진단).
     let (mut last_report, mut last_in) = (std::time::Instant::now(), 0u64);
@@ -424,7 +413,6 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         writeln!(pg, "{q},{g:.3}")?;
     }
     pg.flush()?;
-    drop(st.clock_tx.clone());
     let mut ml = BufWriter::new(File::create(out.join("asio_messages.csv"))?);
     writeln!(ml, "selector,value,qpc")?;
     for (s, v, q) in &st.messages {
@@ -437,7 +425,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     );
     fs::write(out.join("meta.json"), format!(
         "{{\"path\": \"ASIO\", \"mode\": \"{}\", \"fps\": {fps}, \"lookahead_ms\": {lookahead_ms}, \"late\": \"{}\", \"sound\": \"{sound_kind}\", \"faults\": \"{}\", \"secs\": {secs}, \"qpc_freq\": {qf}, \
-         \"index\": \"{}\", \"asio_latency\": {{\"input\": {in_lat}, \"output\": {out_lat}}}, \"output_ready\": {}, \"callbacks\": {}, \
+         \"index\": \"{}\", \"asio_latency\": {{\"input\": {in_lat}, \"output\": {out_lat}}}, \"asio_latency_after_create\": {{\"input\": {in_lat_buf}, \"output\": {out_lat_buf}}}, \"output_ready\": {}, \"callbacks\": {}, \
          \"event\": {{\"start_s\": 1.0, \"period_s\": {event_period}}}, \"pilot\": {{\"start_s\": {PILOT_START_S}, \"period_s\": {PILOT_PERIOD_S}}}, \"render\": {m}, \"capture\": {m}}}\n",
         if mode == Mode::Sample { "sample" } else { "immediate" },
         if late == LatePolicy::CutFront { "cut" } else { "whole" },
@@ -446,8 +434,9 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         st.output_ready, st.callbacks
     ))?;
     println!("기록: {}  (콜백 {}회, outputReady {}, 메시지 {}개, 탐침 깨어남 {}회 중 4 ms 넘는 공백 {}회)", out.display(), st.callbacks, st.output_ready, st.messages.len(), wakes, gaps.len());
-    // 시계 스레드는 콜백 쪽 송신기가 사라지면 끝난다.
+    // 시계 스레드는 콜백 쪽 생산자가 사라지고 링이 비면 끝난다.
     drop(st);
-    let _ = clock_thread.join();
+    let cs = clock_thread.join().map_err(|_| "시계 스레드 패닉")?;
+    println!("  시계: 관측 {}개, 공개 {}회, 새 기준점 {}회, 버린 관측 {}개, 지연(만들기 전 → 후) 입력 {in_lat} → {in_lat_buf}, 출력 {out_lat} → {out_lat_buf}", cs.observed, cs.published, cs.new_epochs, cs.dropped);
     Ok(())
 }

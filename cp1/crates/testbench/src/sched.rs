@@ -19,11 +19,12 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use synchronizer::clock::{ClockModel, ClockPolicy};
+use synchronizer::clock::ClockPolicy;
+use synchronizer::shared_clock::{obs_ring, spawn_clock_thread, SharedClock};
 use synchronizer::qpc;
 use synchronizer::scheduler::{Cmd, LatePolicy, Mixer};
 use synchronizer::wasapi::{self, IAudioClock, IAudioRenderClient, Stream};
@@ -122,17 +123,17 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(Duration::from_millis(5));
     }
 
-    let clock: Arc<Mutex<Option<ClockModel>>> = Arc::new(Mutex::new(None));
-    let rate_cell: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    // 시계 스냅샷: 렌더 스레드가 띄운 시계 스레드가 쓰고, 게임 스레드가 잠금 없이 읽는다.
+    let clock = Arc::new(SharedClock::new());
     let (tx, rx) = channel::<Cmd>();
     let render_done = Arc::new(AtomicBool::new(false));
     let ren = {
-        let (out, name, clock, rate_cell, done) = (out.clone(), render_name.clone(), clock.clone(), rate_cell.clone(), render_done.clone());
+        let (out, name, clock, done) = (out.clone(), render_name.clone(), clock.clone(), render_done.clone());
         let fa: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'A').collect();
-        thread::spawn(move || render_loop(&name, &out, secs, late, noise_s, fa, rx, clock, rate_cell, done))
+        thread::spawn(move || render_loop(&name, &out, secs, late, noise_s, fa, rx, clock, done))
     };
     let fb: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'B').collect();
-    let game = game_loop(&out, mode, fps, secs, lookahead_ms, event_period, fb, tx, clock, rate_cell, render_done.clone());
+    let game = game_loop(&out, mode, fps, secs, lookahead_ms, event_period, fb, tx, clock, render_done.clone());
 
     let rmeta = ren.join().map_err(|_| "렌더 스레드 패닉")??;
     game?;
@@ -179,14 +180,14 @@ fn events(rate: f64, secs: f64, period: f64) -> Vec<u64> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn game_loop(
     out: &Path, mode: Mode, fps: f64, secs: f64, lookahead_ms: f64, event_period: f64, faults: Vec<Fault>, tx: Sender<Cmd>,
-    clock: Arc<Mutex<Option<ClockModel>>>, rate_cell: Arc<Mutex<u32>>, render_done: Arc<AtomicBool>,
+    clock: Arc<SharedClock>, render_done: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     unsafe { timeBeginPeriod(1) };
-    // 시계가 생길 때까지 기다린다.
+    // 시계가 생길 때까지 기다린다 (첫 관측이 반영된 스냅샷).
     let rate = loop {
-        let r = *rate_cell.lock().unwrap();
-        if r > 0 && clock.lock().unwrap().as_ref().is_some_and(|m| m.is_valid()) {
-            break r as f64;
+        let s = clock.load();
+        if s.valid {
+            break s.nominal_rate;
         }
         if render_done.load(Ordering::Acquire) {
             unsafe { timeEndPeriod(1) };
@@ -207,7 +208,7 @@ pub(crate) fn game_loop(
     writeln!(flog, "kind,at_s,ms,qpc_before,qpc_after,frame_before")?;
     while k < ev.len() && !render_done.load(Ordering::Acquire) {
         let q = qpc::now();
-        let now_frame = clock.lock().unwrap().as_ref().map(|m| m.frame_at((q as f64 * 1e7 / qf) as i64)).unwrap_or(0.0);
+        let now_frame = clock.load().frame_at((q as f64 * 1e7 / qf) as i64);
         for (i, f) in faults.iter().enumerate() {
             if !fired[i] && now_frame >= f.at_s * rate {
                 fired[i] = true;
@@ -216,7 +217,7 @@ pub(crate) fn game_loop(
             }
         }
         let q = qpc::now();
-        let now_frame = clock.lock().unwrap().as_ref().map(|m| m.frame_at((q as f64 * 1e7 / qf) as i64)).unwrap_or(0.0);
+        let now_frame = clock.load().frame_at((q as f64 * 1e7 / qf) as i64);
         while k < ev.len() {
             let due = match mode {
                 Mode::Sample => ev[k] as f64 <= now_frame + lookahead,
@@ -251,7 +252,7 @@ pub(crate) fn game_loop(
 #[allow(clippy::too_many_arguments)]
 fn render_loop(
     name: &str, out: &Path, secs: f64, late: LatePolicy, noise_s: f64, faults: Vec<Fault>, rx: Receiver<Cmd>,
-    clock: Arc<Mutex<Option<ClockModel>>>, rate_cell: Arc<Mutex<u32>>, done: Arc<AtomicBool>,
+    clock: Arc<SharedClock>, done: Arc<AtomicBool>,
 ) -> Result<Meta, String> {
     let r = (|| -> Result<Meta, Box<dyn std::error::Error>> {
         wasapi::com_init()?;
@@ -266,8 +267,9 @@ fn render_loop(
         let clock_freq = unsafe { ac.GetFrequency()? };
         let rate = s.rate as u64;
         let ch = s.channels as usize;
-        *clock.lock().unwrap() = Some(ClockModel::new(s.rate as f64, ClockPolicy::default()));
-        *rate_cell.lock().unwrap() = s.rate;
+        // 관측은 링에 넣기만 하고, 다시 맞추는 계산은 시계 스레드가 한다 (오디오 스레드에서 잠금·할당 없음).
+        let (mut obs, obs_rx) = obs_ring(4096);
+        let clock_thread = spawn_clock_thread(s.rate as f64, ClockPolicy::default(), obs_rx, clock.clone());
         let total = (secs * rate as f64).round() as u64;
         let pilot_start = (PILOT_START_S * rate as f64).round() as u64;
         let pilot_period = (PILOT_PERIOD_S * rate as f64).round() as u64;
@@ -337,14 +339,16 @@ fn render_loop(
             unsafe { ac.GetPosition(&mut pos, Some(&mut qpos))? };
             let frame = (pos as f64 * rate as f64 / clock_freq as f64).round() as u64;
             if frame > rate / 20 {
-                // 시험용: 오디오 스레드에서 잠금을 잡는다. 제품 경로에서는 잠금 없는 스냅샷으로 바꿀 것.
-                if let Some(m) = clock.lock().unwrap().as_mut() {
-                    m.observe(frame, qpos as i64);
-                }
+                obs.push(frame, qpos as i64);
             }
             writeln!(rlog, "{now},{before},{pad},{n},{pos},{qpos}")?;
         }
         done.store(true, Ordering::Release);
+        drop(obs);
+        let cs = clock_thread.join().map_err(|_| "시계 스레드 패닉")?;
+        if cs.dropped > 0 {
+            println!("  경고: 관측 링이 가득 차서 관측 {}개를 버림", cs.dropped);
+        }
         rlog.flush()?;
         flog.flush()?;
         let mut slog = BufWriter::new(File::create(out.join("starts.csv"))?);
