@@ -221,6 +221,23 @@ Windows 시계 자체(NTP 보정)의 점프는 실험하지 않았다: 시스템
 
 해석 (추정, 근거 강함): 노트북의 어떤 드라이버가 CPU 코어 하나를 약 88 ms 붙잡는다(긴 DPC/ISR). 그 코어에 있던 스레드만 멈추므로, 오디오 처리가 그 코어에 있을 때만 ASIO가 멈춘다. 오인페 자체의 문제로 보이지 않는다.
 
+**커널 DPC/ISR 기록 (xperf, `tools/xperf_record.ps1`)과 대조** — 직결 + 64, 10분:
+
+| 기록 시각 | 드라이버 | DPC 길이 | 같은 순간 우리 측정 |
+|---|---|---|---|
+| 108.51초 | ACPI.sys (CPU 12) | 87.2 ms | ASIO 88.4 ms 멈춤 |
+| 171.72초 | ACPI.sys (CPU 10) | 87.3 ms | 탐침 88.9 ms 공백 |
+| 229.56초 | ACPI.sys (CPU 12) | 87.3 ms | ASIO 87.5 ms 멈춤 + 탐침 88.4 ms |
+| 288.62초 | ACPI.sys (CPU 12) | 87.3 ms | 탐침 87.7 ms 공백 |
+| 338.77초 | storport.sys (CPU 12) | 25.3 ms | ASIO 26.1 ms 멈춤 |
+| 346.00초 | ACPI.sys (CPU 5) | 87.4 ms | 영향 없음 (다른 코어) |
+| 452.49초 | ACPI.sys (CPU 11) | 87.3 ms | ASIO 88.9 ms 멈춤 + 탐침 88.4 ms |
+| 522.29초 | ACPI.sys (CPU 12) | 87.2 ms | 탐침 87.6 ms 공백 |
+
+전체 10분 DPC 264만 개 중 65 ms 넘는 것 8개 (ACPI.sys 7, storport.sys 1). 오인페 드라이버(ToppingProUsbAudio.sys)는 긴 DPC 없음.
+상태: 충전기 연결, 전원 계획 균형 조정, Armoury Crate 서비스 중지, G-Helper 실행 중, ASUS System Control Interface v3 3.1.70.0, BIOS GU605MZ.329.
+결론: 88 ms 멈춤 = ACPI.sys DPC 87.3 ms (노트북 펌웨어의 ACPI 명령), 작은 멈춤 = storport.sys. 오인페는 원인이 아니다.
+
 장치 트리: 독 연결 = E2x2 → 독의 Generic USB Hub → USB 3.0 Root Hub → 노트북 Intel xHCI. 직결 = 허브 단계만 빠짐 (같은 컨트롤러).
 
 수정: 시계 모델이 관측마다 창 전체를 다시 계산해 버퍼 64에서 콜백이 분마다 무거워졌다 → `ClockPolicy::keep_interval_s` (프레임 간격 10 ms로 솎기), `asiorun`은 관측을 채널로 시계 스레드에 넘김, 1 ms 탐침 스레드(`probe_gaps.csv`) 추가.
@@ -229,7 +246,7 @@ Windows 시계 자체(NTP 보정)의 점프는 실험하지 않았다: 시스템
 
 CP1 (Windows 공유 모드)은 끝났다. 실측 데이터: `results/cp1_wasapi_shared.json` (`python -I tools\export_cp1.py`로 다시 만든다).
 
-1. CP1-3 이어서: 고친 도구로 직결 + 64 재측정 → 멈춤이 남으면 탐침으로 노트북 전체인지 USB 경로인지 가르고, 이벤트 로그 대조 · 전원 설정 · Realtek ASIO 비교 · 다른 PC 비교 순으로
+1. CP1-3 이어서: G-Helper를 끄고 같은 기록(xperf + ASIO 10분) 반복 → ACPI 87 ms DPC가 사라지는지. 남으면 BIOS·EC 쪽 (BIOS 업데이트, 전원 모드, 배터리 조회)
 2. CP2로 넘어가기 전 정리: 오디오 스레드의 잠금(시계 모델 Mutex)을 잠금 없는 스냅샷으로 바꾸기
 3. (선택) 케이블 실험으로 25 ms 분리
 
