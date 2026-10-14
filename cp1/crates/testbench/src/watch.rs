@@ -12,7 +12,8 @@
 //!    wasapi는 공유 모드라 다른 프로그램(유튜브 등)과 장치를 같이 쓴다. asio는 장치를 잡으므로 ASIO 게임과 충돌할 수 있다.
 //!    both는 둘을 동시에 돌려, 같은 멈춤에 두 경로가 각각 끊겼는지 비교한다.
 //!    멈춤이 났던 측정(asiorun)과 조건을 맞춘다: ASIO 입력 2채널(루프백 4/5)도 켜고, 출력 2/3(Playback 3/4, 믹스 B에서
-//!    막혀 들리지 않음)에는 −60 dBFS 잡음을 낸다 (출력 0/1은 무음). 오디오를 켜면 게임 루프처럼 --fps마다 깨는 스레드도 돈다.
+//!    막혀 들리지 않음)에는 −60 dBFS 잡음을 낸다. 출력 0/1(Playback 1/2)은 건드리지 않는다: 윈도우 소리와 같은 채널이라,
+//!    드라이버가 ASIO와 WASAPI를 더하지 않고 덮어쓰면 윈도우 소리가 막힐 수 있다. USB 전송량은 채널 선택과 무관하다. 오디오를 켜면 게임 루프처럼 --fps마다 깨는 스레드도 돈다.
 //! 끝내기: --hours가 지나거나, 출력 폴더에 stop 파일을 만들거나, Ctrl+C (기록은 줄마다 바로 쓴다).
 
 use std::fs::{self, File};
@@ -44,8 +45,8 @@ use crate::asiorun::pump_messages;
 
 /// ASIO 콜백 상태. 콜백은 무음을 쓰고, 간격이 문턱을 넘으면 링에 (간격 µs, 이전 QPC)를 넣기만 한다.
 struct AsioWatch {
-    /// 출력 0/1 (무음), 출력 2/3 (작은 잡음), 입력 4/5 (켜기만 함).
-    bufs: [AsioBufferInfo; 6],
+    /// 출력 2/3 (작은 잡음), 입력 4/5 (켜기만 함).
+    bufs: [AsioBufferInfo; 4],
     noise: u32,
     frames: usize,
     limit_qpc: i64,
@@ -64,9 +65,6 @@ extern "C" fn watch_switch(index: i32, _direct: i32) {
     }
     let st = unsafe { &mut *p };
     for b in &st.bufs[..2] {
-        unsafe { std::ptr::write_bytes(b.buffers[index as usize] as *mut i32, 0, st.frames) };
-    }
-    for b in &st.bufs[2..4] {
         let p = b.buffers[index as usize] as *mut i32;
         for i in 0..st.frames {
             st.noise = st.noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -124,8 +122,6 @@ fn start_asio(driver: &str, buffer: i32) -> Result<Audio, Box<dyn std::error::Er
     let null = std::ptr::null_mut();
     let mut st = Box::new(AsioWatch {
         bufs: [
-            AsioBufferInfo { is_input: 0, channel_num: 0, buffers: [null; 2] },
-            AsioBufferInfo { is_input: 0, channel_num: 1, buffers: [null; 2] },
             AsioBufferInfo { is_input: 0, channel_num: 2, buffers: [null; 2] },
             AsioBufferInfo { is_input: 0, channel_num: 3, buffers: [null; 2] },
             AsioBufferInfo { is_input: 1, channel_num: 4, buffers: [null; 2] },
@@ -141,7 +137,7 @@ fn start_asio(driver: &str, buffer: i32) -> Result<Audio, Box<dyn std::error::Er
     unsafe { drv.create_buffers(&mut st.bufs, buffer, &WATCH_CALLBACKS).map_err(|e| format!("createBuffers 실패 {e} ({})", asio::error_name(e)))? };
     ASIO_WATCH.store(&mut *st as *mut AsioWatch, Ordering::Release);
     drv.start().map_err(|e| format!("start 실패 {e}"))?;
-    println!("오디오 유지: ASIO {} 버퍼 {buffer} ({period_ms:.2} ms), 출력 0/1 무음 · 2/3 잡음 −60 dBFS · 입력 4/5, 콜백 간격 > {:.2} ms 기록", entry.name, period_ms + 4.0);
+    println!("오디오 유지: ASIO {} 버퍼 {buffer} ({period_ms:.2} ms), 출력 2/3 잡음 −60 dBFS (Playback 1/2는 건드리지 않음) · 입력 4/5, 콜백 간격 > {:.2} ms 기록", entry.name, period_ms + 4.0);
     Ok(Audio::Asio { drv, st, rx, period_ms })
 }
 
