@@ -238,6 +238,8 @@ Windows 시계 자체(NTP 보정)의 점프는 실험하지 않았다: 시스템
 상태: 충전기 연결, 전원 계획 균형 조정, Armoury Crate 서비스 중지, G-Helper 실행 중, ASUS System Control Interface v3 3.1.70.0, BIOS GU605MZ.329.
 결론: 88 ms 멈춤 = ACPI.sys DPC 87.3 ms (노트북 펌웨어의 ACPI 명령), 작은 멈춤 = storport.sys. 오인페는 원인이 아니다.
 
+**G-Helper를 끄고 반복** (같은 조건, 10분): ACPI.sys DPC 87.0–87.6 ms가 6번 (117.6, 232.6, 296.6, 346.9, 412.8, 532.6초) → **G-Helper는 원인이 아님**. storport.sys DPC 24–33 ms 5번 + 617 ms 1번 (ASIO 707 ms 멈춤, 드라이버가 kAsioResetRequest 2번 보냄; xperf 기록 쓰기가 영향을 줬을 수 있음). ASIO 멈춤 4번, 탐침 공백 9번 모두 이 DPC들과 시각이 맞음.
+
 장치 트리: 독 연결 = E2x2 → 독의 Generic USB Hub → USB 3.0 Root Hub → 노트북 Intel xHCI. 직결 = 허브 단계만 빠짐 (같은 컨트롤러).
 
 수정: 시계 모델이 관측마다 창 전체를 다시 계산해 버퍼 64에서 콜백이 분마다 무거워졌다 → `ClockPolicy::keep_interval_s` (프레임 간격 10 ms로 솎기), `asiorun`은 관측을 채널로 시계 스레드에 넘김, 1 ms 탐침 스레드(`probe_gaps.csv`) 추가.
@@ -246,7 +248,7 @@ Windows 시계 자체(NTP 보정)의 점프는 실험하지 않았다: 시스템
 
 CP1 (Windows 공유 모드)은 끝났다. 실측 데이터: `results/cp1_wasapi_shared.json` (`python -I tools\export_cp1.py`로 다시 만든다).
 
-1. CP1-3 이어서: G-Helper를 끄고 같은 기록(xperf + ASIO 10분) 반복 → ACPI 87 ms DPC가 사라지는지. 남으면 BIOS·EC 쪽 (BIOS 업데이트, 전원 모드, 배터리 조회)
+1. CP1-3 이어서: 어떤 ACPI 명령인지 특정 (ACPI ETW 공급자 기록), 충전기 분리·배터리 장치·BIOS 버전으로 가르기. xperf 기록 파일은 다른 드라이브에 써서 측정 영향을 줄이기
 2. CP2로 넘어가기 전 정리: 오디오 스레드의 잠금(시계 모델 Mutex)을 잠금 없는 스냅샷으로 바꾸기
 3. (선택) 케이블 실험으로 25 ms 분리
 
