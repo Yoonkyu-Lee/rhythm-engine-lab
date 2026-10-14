@@ -1,7 +1,7 @@
 //! CP1-3: 노트북 멈춤 상주 감시. 관리자 권한이 필요 없으므로 몇 시간씩 켜 둘 수 있다.
 //!
 //!   testbench watch [--hours 0] [--out runs] [--gap-ms 4] [--every-s 5] [--alert-ms 50]
-//!                   [--audio none|wasapi|asio] [--render "Playback 1/2"] [--driver TOPPING] [--buffer 64]
+//!                   [--audio none|wasapi|asio|both] [--render "Playback 1/2"] [--driver TOPPING] [--buffer 64] [--fps 144]
 //!
 //! 1. 탐침: 최고 우선순위 스레드가 1 ms마다 깬다. 못 깬 공백(--gap-ms 초과)을 시각과 함께 gaps.csv에 남긴다.
 //!    ACPI 87 ms DPC 같은 드라이버의 CPU 독점이 있으면 여기에 그 길이로 찍힌다.
@@ -10,6 +10,9 @@
 //! 3. 오디오 유지 (--audio): 87 ms 멈춤은 오디오가 돌 때만 관찰됐다 (CP1-3). 무음을 계속 내보내며 오디오 주기
 //!    (ASIO 콜백, WASAPI 이벤트) 간격이 벌어진 때를 audio_gaps.csv에 남긴다. 탐침 공백과 같은 시각축.
 //!    wasapi는 공유 모드라 다른 프로그램(유튜브 등)과 장치를 같이 쓴다. asio는 장치를 잡으므로 ASIO 게임과 충돌할 수 있다.
+//!    both는 둘을 동시에 돌려, 같은 멈춤에 두 경로가 각각 끊겼는지 비교한다.
+//!    멈춤이 났던 측정(asiorun)과 조건을 맞춘다: ASIO 입력 2채널(루프백 4/5)도 켜고, 출력 2/3(Playback 3/4, 믹스 B에서
+//!    막혀 들리지 않음)에는 −60 dBFS 잡음을 낸다 (출력 0/1은 무음). 오디오를 켜면 게임 루프처럼 --fps마다 깨는 스레드도 돈다.
 //! 끝내기: --hours가 지나거나, 출력 폴더에 stop 파일을 만들거나, Ctrl+C (기록은 줄마다 바로 쓴다).
 
 use std::fs::{self, File};
@@ -41,7 +44,9 @@ use crate::asiorun::pump_messages;
 
 /// ASIO 콜백 상태. 콜백은 무음을 쓰고, 간격이 문턱을 넘으면 링에 (간격 µs, 이전 QPC)를 넣기만 한다.
 struct AsioWatch {
-    bufs: [AsioBufferInfo; 2],
+    /// 출력 0/1 (무음), 출력 2/3 (작은 잡음), 입력 4/5 (켜기만 함).
+    bufs: [AsioBufferInfo; 6],
+    noise: u32,
     frames: usize,
     limit_qpc: i64,
     last: i64,
@@ -58,8 +63,16 @@ extern "C" fn watch_switch(index: i32, _direct: i32) {
         return;
     }
     let st = unsafe { &mut *p };
-    for b in &st.bufs {
+    for b in &st.bufs[..2] {
         unsafe { std::ptr::write_bytes(b.buffers[index as usize] as *mut i32, 0, st.frames) };
+    }
+    for b in &st.bufs[2..4] {
+        let p = b.buffers[index as usize] as *mut i32;
+        for i in 0..st.frames {
+            st.noise = st.noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            // −60 dBFS 정도: 전체 범위(2^31)의 1/1000
+            unsafe { *p.add(i) = (st.noise as i32) >> 10 };
+        }
     }
     if st.last != 0 && q - st.last > st.limit_qpc {
         let us = ((q - st.last) as i128 * 1_000_000 / qpc::frequency() as i128) as u64;
@@ -96,7 +109,6 @@ type AudioGap = (String, &'static str, i64, f64);
 
 /// 켜 둔 오디오 경로. 끝낼 때 정리한다.
 enum Audio {
-    None,
     Asio { drv: Driver, st: Box<AsioWatch>, rx: ObsConsumer, period_ms: f64 },
     Wasapi { stop: Arc<AtomicBool>, th: thread::JoinHandle<Result<u64, String>>, period_ms: f64 },
 }
@@ -114,7 +126,12 @@ fn start_asio(driver: &str, buffer: i32) -> Result<Audio, Box<dyn std::error::Er
         bufs: [
             AsioBufferInfo { is_input: 0, channel_num: 0, buffers: [null; 2] },
             AsioBufferInfo { is_input: 0, channel_num: 1, buffers: [null; 2] },
+            AsioBufferInfo { is_input: 0, channel_num: 2, buffers: [null; 2] },
+            AsioBufferInfo { is_input: 0, channel_num: 3, buffers: [null; 2] },
+            AsioBufferInfo { is_input: 1, channel_num: 4, buffers: [null; 2] },
+            AsioBufferInfo { is_input: 1, channel_num: 5, buffers: [null; 2] },
         ],
+        noise: 12345,
         frames: buffer as usize,
         limit_qpc: ((period_ms + 4.0) * 1e-3 * qpc::frequency() as f64) as i64,
         last: 0,
@@ -124,7 +141,7 @@ fn start_asio(driver: &str, buffer: i32) -> Result<Audio, Box<dyn std::error::Er
     unsafe { drv.create_buffers(&mut st.bufs, buffer, &WATCH_CALLBACKS).map_err(|e| format!("createBuffers 실패 {e} ({})", asio::error_name(e)))? };
     ASIO_WATCH.store(&mut *st as *mut AsioWatch, Ordering::Release);
     drv.start().map_err(|e| format!("start 실패 {e}"))?;
-    println!("오디오 유지: ASIO {} 버퍼 {buffer} ({period_ms:.2} ms), 콜백 간격 > {:.2} ms 기록", entry.name, period_ms + 4.0);
+    println!("오디오 유지: ASIO {} 버퍼 {buffer} ({period_ms:.2} ms), 출력 0/1 무음 · 2/3 잡음 −60 dBFS · 입력 4/5, 콜백 간격 > {:.2} ms 기록", entry.name, period_ms + 4.0);
     Ok(Audio::Asio { drv, st, rx, period_ms })
 }
 
@@ -274,11 +291,43 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let (atx, arx) = channel::<AudioGap>();
-    let mut audio = match audio_kind.as_str() {
-        "none" => Audio::None,
-        "asio" => start_asio(&arg(args, "--driver", "TOPPING"), arg(args, "--buffer", "64").parse()?)?,
-        "wasapi" => start_wasapi(&arg(args, "--render", "Playback 1/2"), atx.clone())?,
-        k => return Err(format!("--audio 는 none, wasapi, asio: {k}").into()),
+    let (want_asio, want_wasapi) = match audio_kind.as_str() {
+        "none" => (false, false),
+        "asio" => (true, false),
+        "wasapi" => (false, true),
+        "both" => (true, true),
+        k => return Err(format!("--audio 는 none, wasapi, asio, both: {k}").into()),
+    };
+    let mut audios: Vec<Audio> = Vec::new();
+    if want_asio {
+        audios.push(start_asio(&arg(args, "--driver", "TOPPING"), arg(args, "--buffer", "64").parse()?)?);
+    }
+    if want_wasapi {
+        audios.push(start_wasapi(&arg(args, "--render", "Playback 1/2"), atx.clone())?);
+    }
+    // 게임 루프 흉내: 측정(sched/asiorun)의 게임 스레드처럼 --fps마다 깨기만 한다 (CPU가 깨어나는 패턴을 맞춤).
+    let game = if audios.is_empty() {
+        None
+    } else {
+        let fps: f64 = arg(args, "--fps", "144").parse()?;
+        let stop = stop.clone();
+        println!("게임 루프 흉내: {fps} fps");
+        Some(thread::spawn(move || {
+            let period = Duration::from_secs_f64(1.0 / fps);
+            let mut next = Instant::now();
+            let mut frames = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                next += period;
+                let now = Instant::now();
+                if next > now {
+                    thread::sleep(next - now);
+                } else {
+                    next = now;
+                }
+                frames += 1;
+            }
+            frames
+        }))
     };
     let mut aw = BufWriter::new(File::create(out.join("audio_gaps.csv"))?);
     writeln!(aw, "local_time,kind,qpc_before,gap_ms")?;
@@ -303,9 +352,11 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         while t0.elapsed().as_secs_f64() < every_s {
             // ASIO 드라이버를 만든 이 스레드(STA)는 메시지를 처리해야 콜백이 계속 온다.
             pump_messages();
-            if let Audio::Asio { rx, .. } = &mut audio {
-                while let Some((us, q)) = rx.pop() {
-                    let _ = atx.send((local_time(), "asio", q, us as f64 * 1e-3));
+            for a in audios.iter_mut() {
+                if let Audio::Asio { rx, .. } = a {
+                    while let Some((us, q)) = rx.pop() {
+                        let _ = atx.send((local_time(), "asio", q, us as f64 * 1e-3));
+                    }
                 }
             }
             while let Ok((lt, kind, q, g)) = arx.try_recv() {
@@ -356,21 +407,26 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     stop.store(true, Ordering::Release);
     let wakes = probe.join().map_err(|_| "탐침 스레드 패닉")?;
-    let audio_note = match audio {
-        Audio::None => String::new(),
-        Audio::Asio { drv, st, period_ms, .. } => {
-            let _ = drv.stop();
-            ASIO_WATCH.store(std::ptr::null_mut(), Ordering::Release);
-            thread::sleep(Duration::from_millis(20));
-            let _ = drv.dispose_buffers();
-            format!(", ASIO 콜백 {}회 (주기 {period_ms:.2} ms)", st.callbacks)
-        }
-        Audio::Wasapi { stop, th, period_ms } => {
-            stop.store(true, Ordering::Release);
-            let w = th.join().map_err(|_| "WASAPI 스레드 패닉")??;
-            format!(", WASAPI 이벤트 {w}회 (주기 {period_ms:.2} ms)")
-        }
-    };
+    let mut audio_note = String::new();
+    if let Some(g) = game {
+        audio_note += &format!(", 게임 루프 {}프레임", g.join().map_err(|_| "게임 루프 스레드 패닉")?);
+    }
+    for a in audios {
+        audio_note += &match a {
+            Audio::Asio { drv, st, period_ms, .. } => {
+                let _ = drv.stop();
+                ASIO_WATCH.store(std::ptr::null_mut(), Ordering::Release);
+                thread::sleep(Duration::from_millis(20));
+                let _ = drv.dispose_buffers();
+                format!(", ASIO 콜백 {}회 (주기 {period_ms:.2} ms)", st.callbacks)
+            }
+            Audio::Wasapi { stop, th, period_ms } => {
+                stop.store(true, Ordering::Release);
+                let w = th.join().map_err(|_| "WASAPI 스레드 패닉")??;
+                format!(", WASAPI 이벤트 {w}회 (주기 {period_ms:.2} ms)")
+            }
+        };
+    }
     println!("끝: {}  (탐침 깨어남 {wakes}회, 공백 {n_gaps}회, {alert_ms} ms 이상 {n_alert}회, 오디오 간격 이상 {n_audio}회{audio_note})", out.display());
     Ok(())
 }

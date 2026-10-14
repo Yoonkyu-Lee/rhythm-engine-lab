@@ -283,14 +283,14 @@ Windows 시계 자체(NTP 보정)의 점프는 실험하지 않았다: 시스템
 
 입력은 두 경우 모두 버퍼 + 66 샘플. `meta.json`에 `asio_latency`(만들기 전)와 `asio_latency_after_create`(만든 뒤)를 둘 다 남긴다. 이전 버퍼 256 기록의 `asio_latency`는 만들기 전 값이다.
 
-CP1-3 상주 감시: 2026-10-13 21:24 ~ 10-14 01:58 (4시간 반, Ghidra 분석으로 CPU 고부하·온도 92°C 포함) 동안 4 ms 넘는 공백 1번, 87 ms 멈춤 0번. 다만 오디오를 재생하지 않았다. 87 ms 멈춤은 지금까지 모두 오디오 재생 중에 나왔으므로(17:44 대기 기록도 무음), 감시에 `--audio asio|wasapi|none`을 넣었다: 무음을 계속 내보내며 ASIO 콜백 간격(주기 + 4 ms 초과)이나 WASAPI 이벤트 간격(주기 × 2 + 5 ms 초과)·언더런을 `audio_gaps.csv`에 남긴다. wasapi는 공유 모드라 다른 프로그램과 장치를 같이 쓰고, asio는 장치를 잡는다. 2026-10-14 02:24부터 `--audio asio`로 상주.
+CP1-3 상주 감시: 2026-10-13 21:24 ~ 10-14 01:58 (4시간 반, Ghidra 분석으로 CPU 고부하·온도 92°C 포함) 동안 4 ms 넘는 공백 1번, 87 ms 멈춤 0번. 다만 오디오를 재생하지 않았다. 87 ms 멈춤은 지금까지 모두 오디오 재생 중에 나왔으므로(17:44 대기 기록도 무음), 감시에 `--audio asio|wasapi|none`을 넣었다: 무음을 계속 내보내며 ASIO 콜백 간격(주기 + 4 ms 초과)이나 WASAPI 이벤트 간격(주기 × 2 + 5 ms 초과)·언더런을 `audio_gaps.csv`에 남긴다. wasapi는 공유 모드라 다른 프로그램과 장치를 같이 쓰고, asio는 장치를 잡는다. `--audio both`는 ASIO와 WASAPI를 동시에 돌려 같은 멈춤에 두 경로가 각각 끊겼는지 비교한다. 멈춤이 났던 측정과 조건을 맞추려고 ASIO 입력 4/5도 켜고, 출력 2/3(Playback 3/4, 믹스 B에서 막힘)에 −60 dBFS 잡음을 내고, 144 fps로 깨는 게임 루프 흉내 스레드를 함께 돌린다. 지금까지 87 ms 멈춤은 ASIO 측정(10-13 오후)에서만 잡혔고, WASAPI 측정(10-12)에서는 없었지만 날짜가 달라 비교가 안 된다. 2026-10-14 03:19부터 `--audio both`로 상주.
 
 ## 다음
 
 CP1 (Windows 공유 모드)은 끝났다. 실측 데이터: `results/cp1_wasapi_shared.json` (`python -I tools\export_cp1.py`로 다시 만든다).
 
 1. CP2: 캐논 코어 + 최소 게임 (범위는 시작 전에 정함)
-2. CP1-3 보류: 상주 감시(`testbench_watch.exe watch --audio asio`)를 켜 두고, 87 ms가 다시 나타나면 그때 xperf로 ACPI 명령 이름을 잡기
+2. CP1-3 보류: 상주 감시(`testbench_watch.exe watch --audio both`)를 켜 두고, 87 ms가 다시 나타나면 그때 xperf로 ACPI 명령 이름을 잡기
 3. (선택) 케이블 실험으로 25 ms 분리
 
 근거 문서: [../design/만약 리듬게임을 개발한다면.md](../design/만약%20리듬게임을%20개발한다면.md), [../cp0/BMS_player_timing_policy.md](../cp0/BMS_player_timing_policy.md)
