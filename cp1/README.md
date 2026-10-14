@@ -238,7 +238,17 @@ Windows 시계 자체(NTP 보정)의 점프는 실험하지 않았다: 시스템
 상태: 충전기 연결, 전원 계획 균형 조정, Armoury Crate 서비스 중지, G-Helper 실행 중, ASUS System Control Interface v3 3.1.70.0, BIOS GU605MZ.329.
 결론: 88 ms 멈춤 = ACPI.sys DPC 87.3 ms (노트북 펌웨어의 ACPI 명령), 작은 멈춤 = storport.sys. 오인페는 원인이 아니다.
 
-**G-Helper를 끄고 반복** (같은 조건, 10분): ACPI.sys DPC 87.0–87.6 ms가 6번 (117.6, 232.6, 296.6, 346.9, 412.8, 532.6초) → **G-Helper는 원인이 아님**. storport.sys DPC 24–33 ms 5번 + 617 ms 1번 (ASIO 707 ms 멈춤, 드라이버가 kAsioResetRequest 2번 보냄; xperf 기록 쓰기가 영향을 줬을 수 있음). ASIO 멈춤 4번, 탐침 공백 9번 모두 이 DPC들과 시각이 맞음.
+**G-Helper를 끄고 반복** (같은 조건, 10분): ACPI.sys DPC 87.0–87.6 ms가 6번 (117.6, 232.6, 296.6, 346.9, 412.8, 532.6초) → G-Helper를 끈 직후에도 남음. storport.sys DPC 24–33 ms 5번 + 617 ms 1번 (ASIO 707 ms 멈춤, 드라이버가 kAsioResetRequest 2번 보냄; xperf 기록 쓰기가 영향을 줬을 수 있음). ASIO 멈춤 4번, 탐침 공백 9번 모두 이 DPC들과 시각이 맞음.
+
+**ACPI 명령 이름까지 기록** (`tools/xperf_acpi.ps1`: DPC/ISR + 1 ms CPU 샘플링 스택 + Kernel-Acpi `AmlMethodTrace` 등 사용자 공급자). 세 번 모두 87 ms DPC 0번:
+
+| 기록 | 조건 | 87 ms ACPI DPC | 탐침 공백 | 가장 긴 AML 명령 |
+|---|---|---|---|---|
+| 17:44, 5분 반 | 대기, G-Helper 끔 | 0 | (없음) | `\_SB.NPCF._DSM` 0.75 ms |
+| 20:42, 10분 | ASIO 64, G-Helper 끔 | 0 | 0 (최대 콜백 간격 3.8 ms) | 0.76 ms |
+| 21:01, 10분 | ASIO 64, G-Helper 켬 (`\_SB.ATKD.WMNB` 972번) | 0 | 0 | 0.76 ms |
+
+전원(충전기, 100%, 균형), 서비스 상태는 같았다. 배터리 보고서상 그동안 절전·방전 없음. → 87 ms DPC는 G-Helper와 무관하게 오후 한때만 나타난 간헐적 상태 (원인 미상). 평소 AML 명령: 온도 `_TMP` (WUDFHost, 약 0.5초마다), EC 이벤트 `EC0._QAE` → `ATKD._WED` (약 12초마다), 배터리 `_BST`, NVIDIA `NPCF._DSM`.
 
 장치 트리: 독 연결 = E2x2 → 독의 Generic USB Hub → USB 3.0 Root Hub → 노트북 Intel xHCI. 직결 = 허브 단계만 빠짐 (같은 컨트롤러).
 
@@ -248,7 +258,7 @@ Windows 시계 자체(NTP 보정)의 점프는 실험하지 않았다: 시스템
 
 CP1 (Windows 공유 모드)은 끝났다. 실측 데이터: `results/cp1_wasapi_shared.json` (`python -I tools\export_cp1.py`로 다시 만든다).
 
-1. CP1-3 이어서: 어떤 ACPI 명령인지 특정 (ACPI ETW 공급자 기록), 충전기 분리·배터리 장치·BIOS 버전으로 가르기. xperf 기록 파일은 다른 드라이브에 써서 측정 영향을 줄이기
+1. CP1-3 이어서: 가벼운 멈춤 탐침을 몇 시간 켜 두고, 87 ms가 다시 나타나는 시각과 그때의 상태(온도, 부하, 실행 중 프로그램)를 잡기. 필요하면 xperf를 메모리 순환 버퍼로 켜 두고 멈춤 순간에만 저장
 2. CP2로 넘어가기 전 정리: 오디오 스레드의 잠금(시계 모델 Mutex)을 잠금 없는 스냅샷으로 바꾸기
 3. (선택) 케이블 실험으로 25 ms 분리
 
