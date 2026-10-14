@@ -205,7 +205,7 @@ fn to_100ns(q: i64) -> i64 {
     (q as i128 * 10_000_000 / qpc::frequency() as i128) as i64
 }
 
-fn pump_messages() {
+pub(crate) fn pump_messages() {
     use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE};
     let mut msg = MSG::default();
     unsafe {
