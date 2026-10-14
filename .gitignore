@@ -25,3 +25,9 @@ cp0/IIDX_vs_BMS.md
 cp0/IIDX_timing_policy.md
 cp0/tools/re_disasm_index.py
 cp0/third_party/_partial_copy_beatoraja/
+
+# DJMAX RESPECT V 분석 — 비공개
+cp0/djmax/
+
+# 로컬 도구 등록 (rea MCP)
+.mcp.json
