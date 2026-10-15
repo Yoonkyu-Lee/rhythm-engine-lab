@@ -252,6 +252,8 @@ Windows 시계 자체(NTP 보정)의 점프는 실험하지 않았다: 시스템
 
 **상주 감시** `testbench watch [--hours 0] [--gap-ms 4] [--every-s 5] [--alert-ms 50]` (관리자 권한·오디오 장치 불필요): 1 ms 탐침의 공백을 현지 시각과 함께 `gaps.csv`에, 5초마다 CPU 사용률·온도 센서·충전기·배터리·CPU 상위 프로세스 5개를 `context.csv`에 남긴다. 87 ms 멈춤이 다시 나타나는 시각과 조건을 잡기 위한 것. 끝내기: Ctrl+C 또는 출력 폴더에 `stop` 파일.
 
+**루프백 녹음만** `testbench record [--secs 300] [--capture "Loopback 1/2"] [--out runs]`: 다른 프로그램(다른 게임 등)의 출력을 루프백으로 녹음해 `runs/record-<시각>/`에 같은 형식(`capture_2ch.f32`, `capture_packets.csv`, `meta.json`)으로 남긴다. 끝내기: 시간 경과 또는 출력 폴더에 `stop` 파일.
+
 장치 트리: 독 연결 = E2x2 → 독의 Generic USB Hub → USB 3.0 Root Hub → 노트북 Intel xHCI. 직결 = 허브 단계만 빠짐 (같은 컨트롤러).
 
 수정: 시계 모델이 관측마다 창 전체를 다시 계산해 버퍼 64에서 콜백이 분마다 무거워졌다 → `ClockPolicy::keep_interval_s` (프레임 간격 10 ms로 솎기), `asiorun`은 관측을 채널로 시계 스레드에 넘김, 1 ms 탐침 스레드(`probe_gaps.csv`) 추가.
@@ -289,8 +291,8 @@ CP1-3 상주 감시: 2026-10-13 21:24 ~ 10-14 01:58 (4시간 반, Ghidra 분석�
 
 CP1 (Windows 공유 모드)은 끝났다. 실측 데이터: `results/cp1_wasapi_shared.json` (`python -I tools\export_cp1.py`로 다시 만든다).
 
-1. CP2: 캐논 코어 + 최소 게임 (범위는 시작 전에 정함)
-2. CP1-3 보류: 상주 감시(`testbench_watch.exe watch --audio both`)를 켜 두고, 87 ms가 다시 나타나면 그때 xperf로 ACPI 명령 이름을 잡기
+1. CP2: 플레이 코어와 정책 시험장 ([../cp2/README.md](../cp2/README.md))
+2. CP1-3은 닫았다 (원인: 노트북 ACPI DPC, 재현 안 됨). 87 ms가 다시 의심되면 `testbench_watch.exe watch --audio both`로 감시하고 xperf로 ACPI 명령 이름을 잡는다
 3. (선택) 케이블 실험으로 25 ms 분리
 
 근거 문서: [../design/만약 리듬게임을 개발한다면.md](../design/만약%20리듬게임을%20개발한다면.md), [../cp0/BMS_player_timing_policy.md](../cp0/BMS_player_timing_policy.md)

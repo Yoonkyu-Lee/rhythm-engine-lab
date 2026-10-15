@@ -49,6 +49,7 @@ fn main() {
         "asioprobe" => asioprobe::run(&args),
         "asiorun" => asiorun::run(&args),
         "watch" => watch::run(&args),
+        "record" => record(&args),
         _ => {
             eprintln!("사용법: testbench list | testbench step0 [--secs 20] [--render 이름] [--capture 이름] [--out runs]");
             Ok(())
@@ -356,4 +357,35 @@ pub(crate) fn capture_loop(name: &str, out: &Path, stop: Arc<AtomicBool>, starte
         started.store(true, Ordering::Release);
     }
     r.map_err(|e| format!("녹음: {e}"))
+}
+
+/// 루프백 녹음만 한다 (다른 프로그램의 출력 측정용). --secs 초가 지나거나 출력 폴더에 stop 파일이 생기면 끝.
+///   testbench record [--secs 300] [--capture "Loopback 1/2"] [--out runs]
+fn record(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let secs: f64 = arg(args, "--secs", "300").parse()?;
+    let name = arg(args, "--capture", "Loopback 1/2");
+    let unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let out = PathBuf::from(arg(args, "--out", "runs")).join(format!("record-{unix}"));
+    fs::create_dir_all(&out)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicBool::new(false));
+    let cap = {
+        let (stop, started, out) = (stop.clone(), started.clone(), out.clone());
+        thread::spawn(move || capture_loop(&name, &out, stop, started, true))
+    };
+    while !started.load(Ordering::Acquire) && !cap.is_finished() {
+        thread::sleep(Duration::from_millis(5));
+    }
+    println!("녹음 시작: {}  ({secs}초, 끝내려면 {} 파일)", out.display(), out.join("stop").display());
+    let t0 = std::time::Instant::now();
+    while t0.elapsed().as_secs_f64() < secs && !out.join("stop").exists() && !cap.is_finished() {
+        thread::sleep(Duration::from_millis(100));
+    }
+    stop.store(true, Ordering::Release);
+    let m = cap.join().map_err(|_| "녹음 스레드 패닉")??;
+    fs::write(out.join("meta.json"), format!("{{\"capture\": {{\"name\": \"{}\", \"rate\": {}, \"channels\": {}}}, \"qpc_freq\": {}}}
+",
+        m.name.replace('"', "'"), m.rate, m.channels, qpc::frequency()))?;
+    println!("녹음 끝: {} ({:.1}초)", out.display(), t0.elapsed().as_secs_f64());
+    Ok(())
 }
