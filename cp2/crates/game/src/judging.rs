@@ -4,7 +4,10 @@
 //!   장치 시계는 `SharedClock`(오디오 스레드의 위치 관측으로 맞춘 직선)이다. 화면·프레임과 무관하다.
 //! - 키음: 입력 순간의 스트림 프레임을 목표로 오디오 스레드에 요청한다. 오디오 스레드가 받을 때는 이미 지났으므로
 //!   믹서가 "가장 이른 안전한 프레임"에 낸다 (최소 지연 모드, 설계안 8-3). 지각량은 믹서 사건에 남는다.
-//! - MISS 확정은 입력 스레드의 watermark가 지나간 뒤에만 한다.
+//! - MISS 확정은 입력 스레드의 watermark가 지나간 뒤에만 한다. 누름을 판정하기 직전에도 그 누름 시각까지 확정한다
+//!   (입력은 도착 순서대로 처리하므로 그보다 이른 입력은 이미 다 봤다). 안 그러면 늦은 창이 지난 노트가 "다음 노트"로 남아
+//!   그 뒤 노트를 노린 누름을 빈 누름으로 만든다 (CP2 2-6 리플레이를 만들며 발견).
+//! - 리플레이용으로 처리한 키 입력마다 kind 8 행(청취 곡 시각, 누름/뗌, 상태)을 남긴다.
 //! - 결과는 SPSC 링으로 기록 스레드에, 집계는 화면용 공유 상태(`JudgeShared`)에 올린다.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
@@ -14,7 +17,7 @@ use std::time::Duration;
 
 use rcore::judge::{Grade, Judged, Lane, Tally, Windows};
 use rcore::ring::{Consumer, Producer};
-use rcore::runtime::Compiled;
+use rcore::runtime::{Compiled, Note};
 use synchronizer::input::KeyEvent;
 use synchronizer::qpc;
 use synchronizer::shared_clock::SharedClock;
@@ -25,7 +28,8 @@ use crate::audio::KeyReq;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JudgeLog {
     /// 0 노트, 1 빈 누름, 2 MISS, 3 롱노트 끝(성공), 4 롱노트 끊김, 5 뗌, 6 watermark 위반(이미 지난 시각의 입력),
-    /// 7 무효(재동기화 중의 노트 판정·MISS: grade는 원래 받았을 등급)
+    /// 7 무효(재동기화 중의 노트 판정·MISS: grade는 원래 받았을 등급),
+    /// 8 입력 원본(리플레이용: grade = 1 누름 / 0 뗌, t_ns = 청취 곡 시각, state = 처리할 때 상태)
     pub kind: u8,
     pub note: u32,
     /// 0 PERFECT 1 GREAT 2 GOOD 3 BAD 4 MISS
@@ -91,6 +95,28 @@ pub struct JudgeCfg {
 }
 
 const STATE_RESYNCING: u8 = 2;
+
+/// `upto`(청취 곡 시각)까지 MISS·롱노트 완료를 확정해 집계·기록한다. 재동기화 중의 MISS는 무효.
+#[allow(clippy::too_many_arguments)]
+fn confirm(lane: &mut Lane, notes: &[Note], cfg: &JudgeCfg, upto: i64, q: i64, state: u8, tally: &mut Tally, log: &mut Producer<JudgeLog>, lost: &mut u64) {
+    let q_proc = qpc::now();
+    lane.advance(notes, &cfg.windows, upto, &mut |j| {
+        let void = cfg.resync_void && matches!(j, Judged::Miss { .. }) && state == STATE_RESYNCING;
+        if void {
+            tally.void += 1;
+        } else {
+            tally.add(&j);
+        }
+        let l = match j {
+            Judged::Miss { note } => JudgeLog { kind: if void { 7 } else { 2 }, note, grade: Grade::Miss as u8, t_ns: upto, q_in: q, q_proc, key_frame: -1, state, ..Default::default() },
+            Judged::LongEnd { note, ok, err } => JudgeLog { kind: if ok { 3 } else { 4 }, note, err_ns: err, t_ns: upto, q_in: q, q_proc, key_frame: -1, state, ..Default::default() },
+            _ => return,
+        };
+        if !log.push(l) {
+            *lost += 1;
+        }
+    });
+}
 
 /// QPC 틱 → 청취 곡 시간 (ns). 시계가 아직 없으면 None.
 pub fn song_ns(clock: &SharedClock, q: i64, origin: i64, rate: u32, offset_ns: i64) -> Option<(i64, f64)> {
@@ -170,13 +196,16 @@ pub fn spawn(
                         sh.violations.fetch_add(1, Ordering::Relaxed);
                         emit(&mut log, &mut lost, JudgeLog { kind: 6, t_ns: t, q_in, q_proc, vkey: ev.vkey, key_frame: -1, ..Default::default() });
                     }
+                    let st = monitor.state.load(Ordering::Relaxed);
+                    emit(&mut log, &mut lost, JudgeLog { kind: 8, grade: ev.down as u8, t_ns: t, q_in, q_proc, vkey: ev.vkey, key_frame: -1, ..Default::default() });
                     if ev.down {
                         if pressed {
                             continue; // 키 반복
                         }
                         pressed = true;
+                        confirm(&mut lane, notes, &cfg, t, q_in, st, &mut tally, &mut log, &mut lost);
                         let j = lane.press(notes, &cfg.windows, t);
-                        let void = cfg.resync_void && matches!(j, Judged::Hit { .. }) && monitor.state.load(Ordering::Relaxed) == STATE_RESYNCING;
+                        let void = cfg.resync_void && matches!(j, Judged::Hit { .. }) && st == STATE_RESYNCING;
                         if void {
                             tally.void += 1;
                         } else {
@@ -217,25 +246,8 @@ pub fn spawn(
                             last_wm_song = wm_song;
                             last_wm_q = wm_q;
                             sh.watermark_song_ns.store(wm_song, Ordering::Release);
-                            let q_proc = qpc::now();
                             let st = monitor.state.load(Ordering::Relaxed);
-                            lane.advance(notes, &cfg.windows, wm_song, &mut |j| {
-                                let void = cfg.resync_void && matches!(j, Judged::Miss { .. }) && st == STATE_RESYNCING;
-                                if void {
-                                    tally.void += 1;
-                                } else {
-                                    tally.add(&j);
-                                }
-                                let l = match j {
-                                    Judged::Miss { note } => JudgeLog { kind: if void { 7 } else { 2 }, note, grade: Grade::Miss as u8, t_ns: wm_song, q_in: wm_q, q_proc, key_frame: -1, ..Default::default() },
-                                    Judged::LongEnd { note, ok, err } => JudgeLog { kind: if ok { 3 } else { 4 }, note, err_ns: err, t_ns: wm_song, q_in: wm_q, q_proc, key_frame: -1, ..Default::default() },
-                                    _ => return,
-                                };
-                                let l = JudgeLog { state: monitor.state.load(Ordering::Relaxed), ..l };
-                                if !log.push(l) {
-                                    lost += 1;
-                                }
-                            });
+                            confirm(&mut lane, notes, &cfg, wm_song, wm_q, st, &mut tally, &mut log, &mut lost);
                         }
                     }
                 }

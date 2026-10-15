@@ -167,6 +167,19 @@ impl FrameLogic {
                 return;
             }
             self.pressed = true;
+            // 누름 직전에 그 시각까지 MISS를 확정한다 (늦은 창이 지난 노트가 다음 누름을 가로막지 않게)
+            let mut outs: Vec<Judged> = Vec::new();
+            self.lane.advance(notes, &self.w, t, &mut |j| outs.push(j));
+            for j in outs {
+                self.tally.add(&j);
+                let l = match j {
+                    Judged::Miss { note } => JudgeLog { kind: 2, note, grade: Grade::Miss as u8, t_ns: t, q_in: q_proc, q_proc, key_frame: -1, state, ..Default::default() },
+                    Judged::LongEnd { note, ok, err } => JudgeLog { kind: if ok { 3 } else { 4 }, note, err_ns: err, t_ns: t, q_in: q_proc, q_proc, key_frame: -1, state, ..Default::default() },
+                    _ => continue,
+                };
+                self.emit(l);
+            }
+            let notes = &self.chart.chart.lanes[0].notes;
             let j = self.lane.press(notes, &self.w, t);
             self.tally.add(&j);
             let (kind, note, grade, err, sound_note) = match j {
