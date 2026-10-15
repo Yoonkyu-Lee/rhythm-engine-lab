@@ -6,7 +6,7 @@ beatmania IIDX 데이터 분석에서 시작해, IIDX → BMS 컨버터를 완�
 |---|---|---|
 | [cp0/](cp0/) | 번외편: 기존 게임 분석 (IIDX 형식과 타이밍, BMS 구동기 beatoraja · Lunatic Vibes F 소스 분석, 분석 도구). [리포트](cp0/REPORT.md) | 완료 |
 | [cp0/bms/converter/](cp0/bms/converter/) | IIDX → BMS 컨버터와 검증 도구. [사용법](cp0/BMS_CONVERTER.md) | 완료 (2026-10-11) |
-| [design/](design/) | 게임 설계 구상: 타이밍 설계, 곡 데이터 형식, 세미 게임 레이어 | 구상 |
+| [design/](design/) | 게임 설계 구상: 타이밍 설계, 기록 시계 설계, 곡 데이터 형식, 세미 게임 레이어 | 구상 |
 | [cp1/](cp1/) | 엔진 Checkpoint 1: 싱크로나이저와 테스트벤치 (Rust). [리포트](cp1/REPORT.md) | 완료 (CP1-3 렉 조사는 2026-10-15 닫음) |
 | [cp2/](cp2/) | 엔진 Checkpoint 2: 플레이 코어와 정책 시험장 (건반 하나짜리 게임, 구동 프로필 비교). [리포트](cp2/REPORT.md) | 진행 중 |
 | `HANDOFF_PROMPT.md` | 원본 데이터 환경과 폴더 규칙 (인수인계) | 로컬 전용 |
