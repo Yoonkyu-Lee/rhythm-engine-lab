@@ -7,7 +7,9 @@ python -I -X utf8 cp2/tools/analyze_run.py <runs/...> [--no-audio]
 3. 키음: 입력(보낸 순간) → 그 키음의 첫 프레임이 장치 기준점을 지나는 시각(장치 시계) = M8 근사. 믹서 지각량(프레임)도.
    (장치 기준점 → 실제 귀까지의 고정 지연은 경로 교정값이라 별도. 루프백 왕복으로 잰다.)
 4. 화면: 프레임 간격, present 시간, DXGI 통계 유무, 고장 주입 흔적.
-5. 오디오 출력 무결성: analyze_play.py (믹서 사건 로그로 재구성한 스트림 ↔ 루프백).
+5. 고장 구간: 고장마다 그 뒤 3초 동안 차트↔오디오 어긋남(기준 대비 최대·5초 뒤 잔여), 자동재생 발음 오차의 변화, 판정 등급.
+   오디오 쪽 곡 시각 = 블록마다 (써 넣은 프레임 − 남은 패딩) — 스트림 기준이라 언더런 동안 멈춘 것까지 그대로 담는다.
+6. 오디오 출력 무결성: analyze_play.py (믹서 사건 로그로 재구성한 스트림 ↔ 루프백).
 결과: <run>/report.json
 """
 import argparse, json, pathlib, subprocess, sys
@@ -45,7 +47,40 @@ def main():
         t100 = ck["t0"] + x * 1e7
         return t100 * qf / 1e7
 
-    rep = {"run": run.name, "profile": meta.get("profile"), "tally": meta.get("tally")}
+    origin = meta["origin"]
+    out_off = meta.get("out_offset_ns", 0)
+
+    def qpc_to_song_ns(q):  # 장치 시계(마지막 직선)로 QPC → 청취 곡 시각
+        t100 = q * 1e7 / qf
+        frame = ck["f0"] + ck["a"] + ck["b"] * (t100 - ck["t0"]) * 1e-7
+        return (frame - origin) / rate * 1e9 + out_off
+
+    # 스트림 기준 청취 곡 시각: 블록마다 (써 넣은 프레임 − 남은 패딩)를 QPC로 보간 + 상수 (마지막 15초에서 장치 시계의 마지막 직선과 맞춘 값).
+    # 마지막 시계 직선 하나로는 오디오 고장(시계 점프) 앞뒤를 같이 잴 수 없다.
+    ab = load(run / "audio_blocks.csv")
+    ab = ab[ab["written"] > 0]
+    ab_pos = (ab["written"] - ab["padding"]).astype(np.float64)
+    ab_q = ab["qpc_wake"].astype(np.float64)
+    _qs = ab_q[ab_q > ab_q[-1] - 15 * qf]
+    _c = float(np.median([qpc_to_song_ns(q) - ((np.interp(q, ab_q, ab_pos) - origin) / rate * 1e9 + out_off) for q in _qs])) if len(_qs) else 0.0
+
+    def heard_ns(q):  # QPC → 청취 곡 시각 (스트림 기준, 고장 앞뒤 모두)
+        return (np.interp(q, ab_q, ab_pos) - origin) / rate * 1e9 + out_off + _c
+
+    rep = {"run": run.name, "profile": meta.get("profile"), "slew": meta.get("slew"), "tally": meta.get("tally")}
+    # 자동재생 발음 오차 (M1): 예정 프레임 vs 믹서가 실제로 놓은 프레임 (순서대로 짝)
+    exp_path = pathlib.Path(meta["chart"])
+    exp_path = (exp_path if exp_path.is_absolute() else HERE.parent / exp_path).parent / "expected.json"
+    if exp_path.exists():
+        exp = json.loads(exp_path.read_text(encoding="utf-8"))["events"]
+        auto_t = [t for t, s, g, src in exp if src == "auto"]
+        mm = np.genfromtxt(run / "mix_events.csv", delimiter=",", names=True, dtype=None, encoding="utf-8")
+        st = mm[(mm["kind"] == "start") & (mm["player"] == 0)]["start"].astype(np.int64)
+        n = min(len(st), len(auto_t))
+        want = np.array([origin + int(np.floor(t * rate / 1e9 + 0.5)) for t in auto_t[:n]])
+        rep["autoplay_err_ms"] = pct((st[:n] - want) * 1e3 / rate, (50, 99, 99.9))
+        m1 = (np.array(auto_t[:n]) / 1e9, (st[:n] - want) * 1e3 / rate)
+
     j = load(run / "judgments.csv")
     hits = j[j["kind"] == 0]
     rep["judge_err_ms"] = pct(hits["err_ns"] / 1e6)
@@ -77,6 +112,25 @@ def main():
                 lat_frames.append(s - d)
                 m8.append((frame_to_qpc(s) - sent_by_frame[d]) * 1e3 / qf)
         rep["keysound_mixer_late_ms"] = pct(np.array(lat_frames) * 1e3 / rate)
+        # 실제로 누른 시각의 오차(장치 시계 기준) vs 프로필이 매긴 오차 → 프로필의 판정 시각 오차
+        notes_t = {}
+        exp_path = pathlib.Path(meta["chart"]).parent / "expected.json"
+        exp_path = exp_path if exp_path.is_absolute() else HERE.parent / exp_path
+        hit_rows = j[j["kind"] == 0]
+        sent_by_note = {int(o["note"]): int(o["q_sent"]) for o in downs}
+        true_err, judged_err = [], []
+        for r in hit_rows:
+            q = sent_by_note.get(int(r["note"]))
+            if q is None:
+                continue
+            judged_err.append(r["err_ns"] / 1e6)
+            note_t = r["t_ns"] - r["err_ns"]
+            true_err.append((heard_ns(q) - note_t) / 1e6)
+        if true_err:
+            te, je = np.array(true_err), np.array(judged_err)
+            rep["press_true_err_ms"] = pct(te)
+            rep["judging_error_ms"] = pct(je - te)
+
         rep["keysound_sent_to_device_ms"] = pct(m8)
 
     f = load(run / "frames.csv")
@@ -122,12 +176,56 @@ def main():
             else:
                 m.update(detected=False)
             matches.append(m)
+        # 프레임 구동 프로필은 판정이 화면 스레드에 있다: 화면 멈춤과 판정 멈춤은 같은 멈춤을 두 심장박동이 본 것 (오탐 아님)
+        if rep["profile"] not in (None, "ours"):
+            for i, e in enumerate(ev):
+                if e[0] in (3, 4) and i not in used:
+                    if any(x[0] in (3, 4) and x is not e and abs(x[1] - e[1]) < qf // 10 for x in ev) or any(
+                            abs(int(ln.split(",")[3]) - e[1]) < qf // 10 for ln in rep["faults"] if ln.split(",")[0] in ("Render", "Judge")):
+                        used.add(i)
         stalls = [i for i, e in enumerate(ev) if e[0] in (0, 3, 4, 5) and i not in used]
         states = [e for e in ev if e[0] == 6]
         rep["lag"] = {"matches": matches, "unmatched_stalls": [{"kind": names[ev[i][0]], "ms": round(ev[i][4] / 1e3, 1)} for i in stalls],
                       "state_changes": len(states)}
         jstate = j["state"] if "state" in j.dtype.names else np.zeros(len(j), int)
         rep["judgments_not_running"] = int(np.sum(jstate != 0))
+
+    # 고장 구간
+    if rep["faults"]:
+        qref = f["q_display"] if rep["profile"] in (None, "ours") else f["q_wait_end"]
+        ok = np.abs(f["song_ns"]) < 10**15
+        aud = heard_ns(qref)
+        desync = np.where(ok, (f["song_ns"] - aud) / 1e6, np.nan)  # 차트 − 오디오 (ms, +면 차트가 앞섬)
+        chart_s = f["song_ns"] / 1e9
+        base_mask = ok & (chart_s > 5) & (chart_s < 15)
+        base = float(np.nanmedian(desync[base_mask])) if base_mask.any() else 0.0
+        rep["desync_base_ms"] = round(base, 2)
+        first_at = min(float(ln.split(",")[1]) for ln in rep["faults"])
+        m1_base = float(np.median(m1[1][m1[0] < first_at])) if "m1" in locals() and np.any(m1[0] < first_at) else None
+        wins = []
+        for ln in rep["faults"]:
+            kind, at_s, ms_, q, src = ln.split(",")
+            q, at_s = int(q), float(at_s)
+            w = (qref >= q) & (qref < q + 3 * qf) & ok
+            after = (qref >= q + 3 * qf) & (qref < q + 5 * qf) & ok
+            d = desync[w] - base
+            r = {"kind": kind, "ms": int(ms_), "at_s": at_s}
+            if d.size:
+                i = int(np.nanargmax(np.abs(d)))
+                r["desync_peak_ms"] = round(float(d[i]), 1)
+            if after.any():
+                r["desync_after_ms"] = round(float(np.nanmedian(desync[after]) - base), 1)
+            if m1_base is not None:
+                mw = (m1[0] >= at_s) & (m1[0] < at_s + 3)
+                if mw.any():
+                    dm = m1[1][mw] - m1_base
+                    r["m1_peak_ms"] = round(float(dm[np.argmax(np.abs(dm))]), 1)
+                    r["m1_off_5ms"] = int(np.sum(np.abs(dm) > 5))
+            jw = j[(j["q_proc"] >= q) & (j["q_proc"] < q + 3 * qf)]
+            g = jw[jw["kind"] == 0]["grade"]
+            r["grades"] = [int(np.sum(g == k)) for k in range(4)] + [int(np.sum(jw["kind"] == 2))]
+            wins.append(r)
+        rep["fault_windows"] = wins
 
     if not a.no_audio and (run / "capture_2ch.f32").exists():
         r = subprocess.run([sys.executable, "-I", "-X", "utf8", str(HERE / "analyze_play.py"), str(run)], capture_output=True, text=True, encoding="utf-8")
@@ -151,6 +249,16 @@ def main():
             else:
                 print(f"렉 {m['kind']} {m['injected_ms']} ms @ {m['at_song_s']:.1f}s: 감지 못함")
         print(f"  짝 없는 감지(오탐 후보) {rep['lag']['unmatched_stalls']}, 상태 변화 {rep['lag']['state_changes']}회, Running 아닌 동안의 판정 {rep['judgments_not_running']}")
+    if "autoplay_err_ms" in rep:
+        print(f"자동재생 발음 오차(M1): {fmt(rep['autoplay_err_ms'])}")
+    if "judging_error_ms" in rep:
+        print(f"실제 누른 시각 오차 {fmt(rep['press_true_err_ms'])} → 프로필 판정 시각 오차 {fmt(rep['judging_error_ms'])}")
+    if "fault_windows" in rep:
+        print(f"고장 구간 (기준 어긋남 {rep['desync_base_ms']} ms 대비, 차트 − 오디오, +면 차트가 앞섬):")
+        for r in rep["fault_windows"]:
+            g = r["grades"]
+            print(f"  {r['kind']} {r['ms']} ms @ {r['at_s']:.0f}s: 어긋남 최대 {r.get('desync_peak_ms')} → 5초 뒤 {r.get('desync_after_ms')} ms | "
+                  f"자동재생 오차 변화 최대 {r.get('m1_peak_ms')} ms (5 ms 넘음 {r.get('m1_off_5ms')}개) | 3초 판정 P{g[0]} G{g[1]} Good{g[2]} Bad{g[3]} Miss{g[4]}")
     print(f"화면: {rep['fps_mean']} fps, 프레임 간격 {fmt(rep['frame_interval_ms'])}, present {fmt(rep['present_ms'])}, DXGI 통계 {rep['dxgi_stats_frames']}/{len(we)} 프레임")
 
 

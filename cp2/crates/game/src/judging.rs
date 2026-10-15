@@ -61,6 +61,17 @@ pub struct JudgeShared {
     pub inject_stall_ms: AtomicU32,
 }
 
+impl JudgeShared {
+    pub fn new(lanes: usize) -> Arc<JudgeShared> {
+        Arc::new(JudgeShared {
+            view: Mutex::new(JudgeView { next_note: vec![0; lanes], ..Default::default() }),
+            watermark_song_ns: AtomicI64::new(i64::MIN),
+            violations: AtomicU32::new(0),
+            inject_stall_ms: AtomicU32::new(0),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct JudgeFault {
     pub at_s: f64,
@@ -168,7 +179,7 @@ pub fn spawn(
                         };
                         let key_frame = if let Some(n) = sound_note {
                             let f = frame.round() as i64;
-                            let _ = key_out.push(KeyReq { frame: f, lane: 0, note: n });
+                            let _ = key_out.push(KeyReq::note(f, 0, n));
                             f
                         } else {
                             -1

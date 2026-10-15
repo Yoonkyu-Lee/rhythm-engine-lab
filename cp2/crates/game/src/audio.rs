@@ -21,12 +21,27 @@ use synchronizer::shared_clock::{obs_ring, spawn_clock_thread, SharedClock};
 use synchronizer::wasapi::{self, IAudioClock, IAudioRenderClient, Stream};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-/// 판정 스레드 → 오디오: "노트 (lane, note)의 소리를 스트림 프레임 frame에 내라".
+/// 게임 로직 → 오디오 요청.
+/// - 노트 소리: "노트 (lane, note)의 소리를 스트림 프레임 frame에 내라" (판정 스레드의 플레이어 키음).
+/// - 소리 하나: 프레임에서 소리를 내는 구동 방식의 자동재생·키음 (frame = mixer::NOW면 즉시).
 #[derive(Clone, Copy, Debug)]
 pub struct KeyReq {
     pub frame: i64,
     pub lane: u16,
     pub note: u32,
+    /// u32::MAX면 노트 소리, 아니면 이 소리 하나.
+    pub sound: u32,
+    pub gain: f32,
+    pub player: bool,
+}
+
+impl KeyReq {
+    pub fn note(frame: i64, lane: u16, note: u32) -> KeyReq {
+        KeyReq { frame, lane, note, sound: u32::MAX, gain: 1.0, player: true }
+    }
+    pub fn sound(frame: i64, sound: u32, gain: f32, player: bool) -> KeyReq {
+        KeyReq { frame, lane: 0, note: 0, sound, gain, player }
+    }
 }
 
 /// 오디오 블록 하나의 기록.
@@ -64,6 +79,10 @@ pub struct AudioCfg {
     pub late: LatePolicy,
     /// 노트 소리도 제때 자동으로 낸다 (입력 없이 정답과 비교할 때).
     pub autoplay_notes: bool,
+    /// 자동재생을 믹서가 실행 데이터에서 직접 훑는가 (우리 방식 true, 프레임 구동 방식 false).
+    pub auto_from_chart: bool,
+    /// 같은 소리를 다시 울리면 앞 소리를 끊는가 (BMS식).
+    pub cut_same: bool,
     pub faults: Vec<AudioFault>,
 }
 
@@ -172,6 +191,8 @@ pub fn spawn(
                 let (mut obs, obs_rx) = obs_ring(4096);
                 let clock_thread = spawn_clock_thread(s.rate as f64, ClockPolicy::default(), obs_rx, clock2.clone());
                 let mut mixer = Mixer::new(&chart, origin, cfg.late, 4096);
+                mixer.set_auto_from_chart(cfg.auto_from_chart);
+                mixer.set_cut_same(cfg.cut_same);
                 let mut scratch = vec![0.0f32; s.buffer_frames as usize * ch];
                 // 노트 자동 연주 커서 (레인별)
                 let lanes = chart.chart.lanes.len();
@@ -186,7 +207,11 @@ pub fn spawn(
                     buf.fill(0.0);
                     let blk_end = *written + n as i64;
                     while let Some(k) = keys.pop() {
-                        mixer.play_note(k.lane as usize, k.note as usize, k.frame);
+                        if k.sound == u32::MAX {
+                            mixer.play_note(k.lane as usize, k.note as usize, k.frame);
+                        } else {
+                            mixer.play_sound(k.sound, k.gain, k.frame, k.player);
+                        }
                     }
                     if cfg.autoplay_notes {
                         for (l, cur) in note_cur.iter_mut().enumerate() {

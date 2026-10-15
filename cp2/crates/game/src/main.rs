@@ -14,6 +14,7 @@ mod game;
 mod input;
 mod judging;
 mod monitor;
+mod profiles;
 mod render;
 
 use std::fs::{self, File};
@@ -119,6 +120,8 @@ fn play(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         master_gain: gain,
         late: LatePolicy::DEFAULT,
         autoplay_notes: flag(args, "--autoplay-notes"),
+        auto_from_chart: true,
+        cut_same: false,
         faults: faults.clone(),
     };
     let autoplay = cfg.autoplay_notes;
@@ -153,6 +156,7 @@ fn play(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 MixEvent::Start { sound, due, start, block, late, player, gain } => writeln!(fm, "start,{sound},{due},{start},{block},{late},{},{gain}", player as u8)?,
                 MixEvent::Dropped { sound, due, block, player } => writeln!(fm, "dropped,{sound},{due},,{block},,{},", player as u8)?,
                 MixEvent::Overflow { sound, due, player } => writeln!(fm, "overflow,{sound},{due},,,,{},", player as u8)?,
+                        MixEvent::Cut { sound, at } => writeln!(fm, "cut,{sound},{at},,,,,")?,
             }
         }
         if finished {

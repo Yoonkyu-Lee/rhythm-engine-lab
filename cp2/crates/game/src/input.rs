@@ -34,7 +34,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const WM_STALL: u32 = WM_APP + 1;
 
 pub struct Input {
+    /// Raw Input 스레드 ID (폴링이면 0).
     pub thread_id: u32,
+    /// 폴링 스레드용 정지 요청 (ms).
+    poll_stall: Arc<std::sync::atomic::AtomicU32>,
     /// QPC 틱. 0이면 아직 없음.
     pub watermark: Arc<AtomicI64>,
     pub lost: Arc<AtomicU64>,
@@ -63,11 +66,60 @@ impl Input {
             })
             .map_err(|e| e.to_string())?;
         let thread_id = id_rx.recv().map_err(|_| "입력 스레드가 시작하지 못함".to_string())??;
-        Ok(Input { thread_id, watermark, lost, stop, join: Some(join) })
+        Ok(Input { thread_id, poll_stall: Arc::new(std::sync::atomic::AtomicU32::new(0)), watermark, lost, stop, join: Some(join) })
+    }
+
+    /// BMS 구동기식 입력: 1 kHz로 키 상태를 폴링하고, 바뀐 것을 본 폴링 시각을 입력 시각으로 쓴다.
+    /// 폴링 사이(최대 1 ms)에 누르고 뗀 짧은 입력은 놓친다 (CP1 3-2). watermark = 마지막 폴링 시각.
+    pub fn spawn_poll(mut tx: Producer<KeyEvent>, keys: Vec<u16>) -> Result<Input, String> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+        let watermark = Arc::new(AtomicI64::new(0));
+        let lost = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let poll_stall = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (wm, lo, st, ps) = (watermark.clone(), lost.clone(), stop.clone(), poll_stall.clone());
+        let join = thread::Builder::new()
+            .name("input-poll".into())
+            .spawn(move || {
+                let freq = qpc::frequency();
+                let mut down = vec![false; keys.len()];
+                let mut next = qpc::now();
+                while !st.load(Ordering::Relaxed) {
+                    let req = ps.swap(0, Ordering::AcqRel);
+                    if req > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(req as u64));
+                    }
+                    let q = qpc::now();
+                    for (i, &k) in keys.iter().enumerate() {
+                        let d = unsafe { GetAsyncKeyState(k as i32) } as u16 & 0x8000 != 0;
+                        if d != down[i] {
+                            down[i] = d;
+                            let t = (q * 1000 / freq) as u32;
+                            if !tx.push(KeyEvent { vkey: k, down: d, qpc: q, msg_time_ms: t, tick_ms: t }) {
+                                lo.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    wm.store(q, Ordering::Release);
+                    next += freq / 1000;
+                    let now = qpc::now();
+                    if next > now {
+                        std::thread::sleep(std::time::Duration::from_micros(((next - now) * 1_000_000 / freq) as u64));
+                    } else {
+                        next = now;
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Input { thread_id: 0, poll_stall, watermark, lost, stop, join: Some(join) })
     }
 
     /// 입력 스레드를 `ms` 동안 재운다 (고장 C).
     pub fn stall(&self, ms: u32) {
+        if self.thread_id == 0 {
+            self.poll_stall.store(ms, Ordering::Release);
+            return;
+        }
         unsafe {
             let _ = PostThreadMessageW(self.thread_id, WM_STALL, WPARAM(ms as usize), LPARAM(0));
         }
@@ -75,8 +127,10 @@ impl Input {
 
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Release);
-        unsafe {
-            let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+        if self.thread_id != 0 {
+            unsafe {
+                let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
         }
         if let Some(j) = self.join.take() {
             let _ = j.join();

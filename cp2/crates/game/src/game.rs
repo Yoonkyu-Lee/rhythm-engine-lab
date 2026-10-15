@@ -37,6 +37,7 @@ use crate::audio::{self, AudioCfg};
 use crate::bot::{self, BotCfg, BotLog, BOT_KEY};
 use crate::judging::{self, JudgeCfg, JudgeLog};
 use crate::monitor::{self, Heartbeats, LagEvent, MonitorShared, LAG_NAMES, STATE_NAMES};
+use crate::profiles::{FrameLogic, Profile};
 use crate::render::{D3D11Renderer, DrawList, FrameTiming, Renderer, Rgba};
 use crate::{arg, capture, flag};
 
@@ -127,7 +128,7 @@ fn create_window() -> windows::core::Result<HWND> {
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
-            w!("CP2 시험장 — 우리 방식"),
+            w!("CP2 시험장"),
             style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -179,6 +180,7 @@ fn spawn_logger(dir: PathBuf, mut l: Logs, stop: Arc<AtomicBool>) -> thread::Joi
                         MixEvent::Start { sound, due, start, block, late, player, gain } => writeln!(fm, "start,{sound},{due},{start},{block},{late},{},{gain}", player as u8)?,
                         MixEvent::Dropped { sound, due, block, player } => writeln!(fm, "dropped,{sound},{due},,{block},,{},", player as u8)?,
                         MixEvent::Overflow { sound, due, player } => writeln!(fm, "overflow,{sound},{due},,,,{},", player as u8)?,
+                        MixEvent::Cut { sound, at } => writeln!(fm, "cut,{sound},{at},,,,,")?,
                     }
                 }
                 while let Some(j) = l.judge.pop() {
@@ -231,6 +233,8 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let out_offset_ns = (arg(args, "--out-offset-ms", "0").parse::<f64>()? * 1e6) as i64;
     let vsync = !flag(args, "--no-vsync");
     let use_bot = flag(args, "--bot");
+    let profile = Profile::parse(&arg(args, "--profile", "ours"))?;
+    let keys = vec![BOT_KEY, 0x20, b'J' as u16, b'F' as u16];
     let unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let tag = arg(args, "--tag", "run");
     let dir = PathBuf::from(arg(args, "--out", "runs")).join(format!("{tag}-{unix}"));
@@ -264,31 +268,38 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let a = audio::spawn(
         chart.clone(),
-        AudioCfg { render: render_name, lead_in_s: 2.0, tail_s: 1.0, master_gain: gain, late: LatePolicy::DEFAULT, autoplay_notes: false, faults: vec![] },
+        AudioCfg { render: render_name, lead_in_s: 2.0, tail_s: 1.0, master_gain: gain, late: LatePolicy::DEFAULT, autoplay_notes: false, auto_from_chart: profile == Profile::Ours, cut_same: profile == Profile::Bms, faults: vec![] },
         key_rx,
         blk_tx,
         mix_tx,
     )?;
     let (origin, rate) = (a.info.origin, a.info.rate);
-    let input = crate::input::Input::spawn(kev_tx)?;
+    // 입력: BMS식은 1 kHz 폴링, 나머지는 Raw Input
+    let input = if profile == Profile::Bms { crate::input::Input::spawn_poll(kev_tx, keys.clone())? } else { crate::input::Input::spawn(kev_tx)? };
     let stop = Arc::new(AtomicBool::new(false));
     let beats = Arc::new(Heartbeats::default());
     let mon = Arc::new(MonitorShared::default());
     let monitor_join = monitor::spawn(mon.clone(), a.monitor.clone(), a.clock.clone(), input.watermark.clone(), beats.clone(), lag_tx, stop.clone());
-    let keys = vec![BOT_KEY, 0x20, b'J' as u16, b'F' as u16];
     let windows_cfg = Windows::CP2;
-    let (judge, judge_join) = judging::spawn(
-        chart.clone(),
-        JudgeCfg { origin, rate, out_offset_ns, windows: windows_cfg, keys, faults: vec![] },
-        a.clock.clone(),
-        input.watermark.clone(),
-        kev_rx,
-        key_tx,
-        jl_tx,
-        stop.clone(),
-        beats.clone(),
-        mon.clone(),
-    );
+    // 우리 방식: 판정 스레드. 나머지: 화면 프레임에서 도는 로직 (판정 스레드 없음, 화면용 공유 상태만 둔다)
+    let (judge, judge_join, mut logic) = if profile == Profile::Ours {
+        let (j, h) = judging::spawn(
+            chart.clone(),
+            JudgeCfg { origin, rate, out_offset_ns, windows: windows_cfg, keys: keys.clone(), faults: vec![] },
+            a.clock.clone(),
+            input.watermark.clone(),
+            kev_rx,
+            key_tx,
+            jl_tx,
+            stop.clone(),
+            beats.clone(),
+            mon.clone(),
+        );
+        (j, Some(h), None)
+    } else {
+        let l = FrameLogic::new(profile, chart.clone(), windows_cfg, keys.clone(), origin, rate, out_offset_ns, kev_rx, key_tx, jl_tx);
+        (judging::JudgeShared::new(1), None, Some(l))
+    };
     let bot_join = use_bot.then(|| {
         let cfg = BotCfg {
             origin,
@@ -312,7 +323,8 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let px_per_beat = (JUDGE_Y as f64) / (VISIBLE_S * chart.chart.reference_bpm / 60.0);
     let mut fired = vec![false; faults.len()];
     let mut period_q = qf / 60; // 표시 주기 추정 (DXGI 통계로 갱신)
-    let (mut last_sync_q, mut last_sync_r) = (0i64, 0u32);
+    let (mut last_sync_q, mut _last_sync_r) = (0i64, 0u32);
+    let mut first_sync: Option<(i64, u32)> = None;
     let mut fps_frames = 0u32;
     let mut fps_t0 = qpc::now();
     let (mut fps, mut max_gap_ms, mut cur_max_gap) = (0.0, 0.0, 0.0f64);
@@ -353,7 +365,15 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             now + period_q
         };
-        let song = judging::song_ns(&a.clock, q_display, origin, rate, out_offset_ns).map(|x| x.0);
+        // 우리 방식: 장치 시계로 본 다음 vblank의 청취 곡 시각. 프레임 구동 방식: 그 프로필의 시계 (표시 예측 없음, 프레임 시작 시각)
+        let state_now = mon.state.load(Ordering::Relaxed);
+        let song = match logic.as_mut() {
+            None => judging::song_ns(&a.clock, q_display, origin, rate, out_offset_ns).map(|x| x.0),
+            Some(l) => {
+                beats.judge.store(qpc::now(), Ordering::Release);
+                l.frame(we, period_q, &a.clock, state_now)
+            }
+        };
         let song_s = song.unwrap_or(i64::MIN) as f64 / NS_PER_S as f64;
 
         // 고장 주입: 예약 + 단축키
@@ -362,7 +382,12 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             writeln!(flog, "{k:?},{song_s:.3},{ms},{},{src}", qpc::now())?;
             match k {
                 FaultKind::Audio => a.monitor.inject_stall_ms.store(ms, Ordering::Release),
-                FaultKind::Judge => judge.inject_stall_ms.store(ms, Ordering::Release),
+                FaultKind::Judge if logic.is_none() => judge.inject_stall_ms.store(ms, Ordering::Release),
+                FaultKind::Judge => {
+                    // 프레임 구동 방식은 판정이 화면 스레드에 있다: 화면 스레드를 재운다
+                    thread::sleep(Duration::from_millis(ms as u64));
+                    injected += ms as u16;
+                }
                 FaultKind::Input => input.stall(ms),
                 FaultKind::Render => {
                     thread::sleep(Duration::from_millis(ms as u64));
@@ -391,7 +416,10 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         list.cmds.clear();
         list.clear = Some(Rgba(0.04, 0.04, 0.06, 1.0));
         list.rect(LANE_X, 0.0, LANE_W, H as f32, Rgba(0.10, 0.10, 0.14, 1.0));
-        let view = judge.view.lock().map(|v| v.clone()).unwrap_or_default();
+        let view = match logic.as_ref() {
+            Some(l) => l.view(),
+            None => judge.view.lock().map(|v| v.clone()).unwrap_or_default(),
+        };
         if view.pressed {
             list.rect(LANE_X, JUDGE_Y - 240.0, LANE_W, 240.0, Rgba(0.25, 0.35, 0.6, 0.35));
         }
@@ -419,7 +447,10 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let t = &view.tally;
         let hud = Rgba(0.8, 0.85, 0.9, 1.0);
         let lines = [
-            format!("프로필: 우리 방식 (오디오 장치 시계 · 샘플 예약 · 입력 도장+watermark)"),
+            match logic.as_ref() {
+                Some(l) if profile == Profile::Iidx => format!("프로필: {} | slew 오차 {:+.1} ms, 틱 추가 {} · 쉼 {}", profile.title(), l.slew_err_ns as f64 / 1e6, l.slew_extra, l.slew_hold),
+                _ => format!("프로필: {}", profile.title()),
+            },
             format!("곡 {:.2} s | 화면 {fps:.1} fps, 최근 1초 최대 프레임 간격 {max_gap_ms:.1} ms | vsync {}", song_s.max(0.0), vsync),
             format!(
                 "오디오: 블록 {} · 언더런 의심 {} · 최대 깨어남 간격 {audio_gap_ms:.1} ms · 보이스 {} · 늦은 키음 {}",
@@ -470,15 +501,23 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         rend.draw(&list)?;
         let ft = rend.present(vsync);
-        if ft.sync_qpc > 0 && ft.sync_refresh > last_sync_r && last_sync_q > 0 {
-            let p = (ft.sync_qpc - last_sync_q) / (ft.sync_refresh - last_sync_r) as i64;
-            if p > qf / 1000 && p < qf / 20 {
-                period_q = p;
+        // 화면 주기: 첫 vblank부터의 긴 기준선 (프레임마다 짧게 재면 출렁여 평균이 1% 넘게 길게 치우친다 — IIDX 틱 길이가 틀어짐)
+        if ft.sync_qpc > 0 {
+            if first_sync.is_none() {
+                first_sync = Some((ft.sync_qpc, ft.sync_refresh));
+            }
+            if let Some((q0, r0)) = first_sync {
+                if ft.sync_refresh >= r0 + 60 {
+                    let p = (ft.sync_qpc - q0) / (ft.sync_refresh - r0) as i64;
+                    if p > qf / 1000 && p < qf / 20 {
+                        period_q = p;
+                    }
+                }
             }
         }
         if ft.sync_qpc > 0 {
             last_sync_q = ft.sync_qpc;
-            last_sync_r = ft.sync_refresh;
+            _last_sync_r = ft.sync_refresh;
         }
         let _ = fr_tx.push(FrameLog { t: ft, song_ns: song.unwrap_or(i64::MIN), q_display, notes_drawn: drawn, injected_ms: injected });
         if a.done.load(Ordering::Acquire) && flag(args, "--quit-at-end") {
@@ -492,7 +531,10 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     a.stop.store(true, Ordering::Release);
     stop.store(true, Ordering::Release);
     let st = a.join.join().map_err(|_| "오디오 스레드 패닉")??;
-    let judge_lost = judge_join.join().map_err(|_| "판정 스레드 패닉")?;
+    let judge_lost = match judge_join {
+        Some(h) => h.join().map_err(|_| "판정 스레드 패닉")?,
+        None => logic.as_ref().map(|l| l.log_lost).unwrap_or(0),
+    };
     let _ = monitor_join.join();
     if let Some(b) = bot_join {
         let _ = b.join();
@@ -506,14 +548,20 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         Some(h) => Some(h.join().map_err(|_| "녹음 스레드 패닉")??),
         None => None,
     };
-    let view = judge.view.lock().map(|v| v.clone()).unwrap_or_default();
+    let view = match logic.as_ref() {
+        Some(l) => l.view(),
+        None => judge.view.lock().map(|v| v.clone()).unwrap_or_default(),
+    };
     let t = &view.tally;
     let snap = a.clock.load();
     let meta = format!(
-        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"ours\",\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"origin\": {origin}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"lag_counts\": [{}],\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
+        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"{}\", \"slew\": [{}, {}],\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"origin\": {origin}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"lag_counts\": [{}],\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
         path.replace('\\', "/"),
         chart.hash,
         chart.chart.title,
+        profile.name(),
+        logic.as_ref().map(|l| l.slew_extra).unwrap_or(0),
+        logic.as_ref().map(|l| l.slew_hold).unwrap_or(0),
         a.info.device,
         rate,
         a.info.buffer_frames,

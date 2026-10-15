@@ -57,7 +57,13 @@ pub enum MixEvent {
     Dropped { sound: u32, due: i64, block: i64, player: bool },
     /// 보이스 풀이 가득 차서 올리지 못했다.
     Overflow { sound: u32, due: i64, player: bool },
+    /// 같은 소리를 다시 울려서 앞 소리를 프레임 `at`에서 끊었다 (재트리거 끊기 정책).
+    Cut { sound: u32, at: i64 },
 }
+
+/// "지금 울려": 예정 프레임 대신 이 값을 주면 요청을 받은 블록의 맨 앞에서 시작한다 (늦음으로 치지 않음).
+/// 프레임에서 소리를 내는 구동 방식(BMS·DJMAX·IIDX식)의 즉시 재생이다.
+pub const NOW: i64 = i64::MIN;
 
 pub struct Mixer<'a> {
     c: &'a Compiled,
@@ -65,8 +71,12 @@ pub struct Mixer<'a> {
     late: LatePolicy,
     cursor: usize,
     voices: Vec<Voice>,
-    /// 요청 대기열 (목표 프레임, 소리, 이득). 실시간에서는 SPSC 링이 이 자리를 채운다.
-    pending: Vec<(i64, u32, f32)>,
+    /// 요청 대기열 (목표 프레임 또는 NOW, 소리, 이득, 플레이어?). 실시간에서는 SPSC 링이 이 자리를 채운다.
+    pending: Vec<(i64, u32, f32, bool)>,
+    /// 자동재생을 믹서가 실행 데이터에서 직접 훑는가 (우리 방식). 끄면 프레임 쪽 로직이 요청으로 울린다.
+    auto_from_chart: bool,
+    /// 같은 소리를 다시 울리면 앞 소리를 끊는가 (P9: BMS 구동기 방식).
+    cut_same: bool,
     events: Vec<MixEvent>,
     events_cap: usize,
     pub overflows: u64,
@@ -82,7 +92,9 @@ impl<'a> Mixer<'a> {
             late,
             cursor: 0,
             voices: Vec::with_capacity(c.voice_budget as usize),
-            pending: Vec::with_capacity(64),
+            pending: Vec::with_capacity(256),
+            auto_from_chart: true,
+            cut_same: false,
             events: Vec::with_capacity(events_cap),
             events_cap,
             overflows: 0,
@@ -94,15 +106,34 @@ impl<'a> Mixer<'a> {
         self.voices.len()
     }
 
-    /// 플레이어 키음 요청: 노트 `note`(레인 `lane`)의 소리들을 스트림 프레임 `frame`에서 낸다.
+    /// 자동재생을 실행 데이터에서 직접 훑을지 (끄면 `play_sound`로만 울린다).
+    pub fn set_auto_from_chart(&mut self, on: bool) {
+        self.auto_from_chart = on;
+    }
+
+    /// 같은 소리를 다시 울릴 때 앞 소리를 끊을지.
+    pub fn set_cut_same(&mut self, on: bool) {
+        self.cut_same = on;
+    }
+
+    /// 플레이어 키음 요청: 노트 `note`(레인 `lane`)의 소리들을 스트림 프레임 `frame`(또는 NOW)에서 낸다.
     pub fn play_note(&mut self, lane: usize, note: usize, frame: i64) {
         let n = self.c.chart.lanes[lane].notes[note];
         for s in &self.c.chart.note_sounds[n.sounds_start as usize..n.sounds_start as usize + n.sounds_len as usize] {
             if self.pending.len() < self.pending.capacity() {
-                self.pending.push((frame, s.sound, s.gain));
+                self.pending.push((frame, s.sound, s.gain, true));
             } else {
                 self.overflows += 1;
             }
+        }
+    }
+
+    /// 소리 하나를 프레임 `frame`(또는 NOW)에서 낸다. `player`면 플레이어 키음의 늦음 정책을 따른다.
+    pub fn play_sound(&mut self, sound: u32, gain: f32, frame: i64, player: bool) {
+        if self.pending.len() < self.pending.capacity() {
+            self.pending.push((frame, sound, gain, player));
+        } else {
+            self.overflows += 1;
         }
     }
 
@@ -156,6 +187,17 @@ impl<'a> Mixer<'a> {
             self.log(MixEvent::Dropped { sound, due, block, player });
             return;
         }
+        if self.cut_same {
+            let at = start.max(block);
+            let mut cut = false;
+            for v in self.voices.iter_mut().filter(|v| v.sound == sound && v.end > at) {
+                v.end = at;
+                cut = true;
+            }
+            if cut {
+                self.log(MixEvent::Cut { sound, at });
+            }
+        }
         if self.voices.len() >= self.voices.capacity() {
             self.overflows += 1;
             self.log(MixEvent::Overflow { sound, due, player });
@@ -172,12 +214,18 @@ impl<'a> Mixer<'a> {
         let rate = self.c.chart.bank.rate;
         // 1)·2) 이 블록 안에서 시작하는(또는 이미 늦은) 자동재생 이벤트와 플레이어 키음 요청을 예정 프레임 순으로 올린다
         //      (같은 프레임이면 자동재생 먼저). 출처와 무관하게 순서를 정해야 블록 크기가 결과를 바꾸지 않는다.
+        // NOW 요청은 이 블록 맨 앞으로
+        for p in self.pending.iter_mut() {
+            if p.0 == NOW {
+                p.0 = block;
+            }
+        }
         loop {
-            let auto_due = (self.cursor < self.c.chart.auto.len())
+            let auto_due = (self.auto_from_chart && self.cursor < self.c.chart.auto.len())
                 .then(|| self.origin + ns_to_frame(self.c.chart.auto[self.cursor].t, rate))
                 .filter(|&d| d < end);
             let mut best: Option<(usize, i64)> = None;
-            for (i, &(d, _, _)) in self.pending.iter().enumerate() {
+            for (i, &(d, _, _, _)) in self.pending.iter().enumerate() {
                 if d < end && best.map_or(true, |(_, b)| d < b) {
                     best = Some((i, d));
                 }
@@ -189,8 +237,8 @@ impl<'a> Mixer<'a> {
                     self.admit(e.sound, a, e.gain, block, false);
                 }
                 (_, Some((i, d))) => {
-                    let (_, sound, gain) = self.pending.remove(i);
-                    self.admit(sound, d, gain, block, true);
+                    let (_, sound, gain, player) = self.pending.remove(i);
+                    self.admit(sound, d, gain, block, player);
                 }
                 _ => break,
             }
@@ -217,13 +265,13 @@ impl<'a> Mixer<'a> {
                 }
             }
         }
-        // 4) 끝난 보이스 제거 (순서 유지)
-        self.voices.retain(|v| v.end > end);
+        // 4) 끝난(또는 끊긴) 보이스 제거 (순서 유지)
+        self.voices.retain(|v| v.end > end && v.end > v.start.max(block));
     }
 
     /// 모든 이벤트가 끝나고 울리는 소리도 없는가.
     pub fn finished(&self) -> bool {
-        self.cursor >= self.c.chart.auto.len() && self.voices.is_empty() && self.pending.is_empty()
+        (!self.auto_from_chart || self.cursor >= self.c.chart.auto.len()) && self.voices.is_empty() && self.pending.is_empty()
     }
 }
 
@@ -308,6 +356,26 @@ mod tests {
         assert!(log.iter().all(|e| matches!(e, MixEvent::Start { late, .. } if *late <= 0)));
         // 시작 사건 수 = 자동 3 + 노트 소리 3
         assert_eq!(log.len(), 6);
+    }
+
+    #[test]
+    fn now_and_cut_same() {
+        let c = compile(tiny()).unwrap();
+        let mut m = Mixer::new(&c, 0, LatePolicy::DEFAULT, 64);
+        m.set_auto_from_chart(false);
+        m.set_cut_same(true);
+        let mut out = vec![0f32; 300 * 2];
+        m.play_sound(1, 1.0, NOW, false);
+        m.fill(&mut out[..100 * 2], 2, 0, 100);
+        m.play_sound(1, 1.0, NOW, false); // 같은 소리 다시 → 앞 소리를 100에서 끊음
+        m.fill(&mut out[100 * 2..], 2, 100, 200);
+        let mut log = Vec::new();
+        m.drain_events(&mut log);
+        assert!(log.contains(&MixEvent::Cut { sound: 1, at: 100 }));
+        assert_eq!(log.iter().filter(|e| matches!(e, MixEvent::Start { late: 0, .. })).count(), 2);
+        // 프레임 100의 값 = 두 번째 소리의 첫 샘플만
+        let s1 = c.chart.bank.sounds[1].offset as usize * 2;
+        assert_eq!(out[100 * 2], c.chart.bank.pcm[s1]);
     }
 
     #[test]

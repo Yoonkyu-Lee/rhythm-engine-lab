@@ -19,23 +19,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let src = rtc::decode(&std::fs::read(&a[1])?)?;
     let c = runtime::compile(resample::resample_chart(&src, rate)?)?;
     let bank = &c.chart.bank;
-    let mut starts = Vec::new();
+    // (소리, 시작, 블록, 이득, 끝): 끝은 끊기(cut) 사건이 오면 줄어든다
+    let mut starts: Vec<(u32, i64, i64, f32, i64)> = Vec::new();
     for line in std::io::BufReader::new(std::fs::File::open(&a[2])?).lines().skip(1) {
         let line = line?;
         let f: Vec<&str> = line.split(',').collect();
-        if f[0] != "start" {
-            continue;
+        match f[0] {
+            "start" => {
+                let (sound, start, block, g): (u32, i64, i64, f32) = (f[1].parse()?, f[3].parse()?, f[4].parse()?, f[7].parse()?);
+                starts.push((sound, start, block, g, start + bank.sounds[sound as usize].frames as i64));
+            }
+            "cut" => {
+                let (sound, at): (u32, i64) = (f[1].parse()?, f[2].parse()?);
+                for v in starts.iter_mut().filter(|v| v.0 == sound && v.4 > at) {
+                    v.4 = at;
+                }
+            }
+            _ => {}
         }
-        let (sound, start, block, g): (u32, i64, i64, f32) = (f[1].parse()?, f[3].parse()?, f[4].parse()?, f[7].parse()?);
-        starts.push((sound, start, block, g));
     }
-    let end = starts.iter().map(|&(s, st, _, _)| st + bank.sounds[s as usize].frames as i64).max().unwrap_or(0).max(0) as usize;
+    let end = starts.iter().map(|v| v.4).max().unwrap_or(0).max(0) as usize;
     let mut out = vec![0f32; end * 2];
     // 믹서와 같은 순서(들어온 순서)로 더한다
-    for &(s, start, block, g) in &starts {
+    for &(s, start, block, g, stop) in &starts {
         let snd = bank.sounds[s as usize];
         let lo = start.max(block).max(0);
-        for f in lo..start + snd.frames as i64 {
+        for f in lo..stop {
             let src = (snd.offset as i64 + f - start) as usize * 2;
             out[f as usize * 2] += bank.pcm[src] * g;
             out[f as usize * 2 + 1] += bank.pcm[src + 1] * g;

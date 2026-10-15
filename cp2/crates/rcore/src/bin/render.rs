@@ -72,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             MixEvent::Dropped { .. } => dropped += 1,
             MixEvent::Overflow { .. } => overflow += 1,
+            MixEvent::Cut { .. } => {}
         }
     }
     let peak = pcm.iter().fold(0f32, |m, &x| m.max(x.abs()));
