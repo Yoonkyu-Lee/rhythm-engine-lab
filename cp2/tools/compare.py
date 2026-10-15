@@ -11,8 +11,8 @@ import argparse, json, pathlib, subprocess, sys
 import numpy as np
 
 HERE = pathlib.Path(__file__).resolve().parent
-PROFILES = ["ours", "iidx", "djmax", "bms"]
-PNAME = {"ours": "우리", "iidx": "IIDX 개량", "djmax": "DJMAX식", "bms": "BMS식"}
+PROFILES = ["ours", "iidx", "iidx-fine", "djmax", "bms"]
+PNAME = {"ours": "우리", "iidx": "IIDX 개량", "iidx-fine": "IIDX 미세", "djmax": "DJMAX식", "bms": "BMS식"}
 SCEN = ["clean", "audio150", "render300", "judge500", "input300", "audio50"]
 SNAME = {"clean": "고장 없음", "audio150": "오디오 150 ms", "render300": "화면 300 ms", "judge500": "판정 500 ms", "input300": "입력 300 ms", "audio50": "오디오 50 ms"}
 GRADE = ["P", "G", "Good", "Bad", "Miss"]

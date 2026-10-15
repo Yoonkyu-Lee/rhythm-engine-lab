@@ -9,6 +9,8 @@
 //! - IIDX 개량형 (CP0 0-3 + 설계안 13장): 시계 = 프레임 = 틱(틱 길이 = 측정한 화면 주기). 2프레임마다 장치 시계와 비교해
 //!   17 ms 넘게 늦으면 틱 하나 더(최대 1.5배), 34 ms 넘게 앞서면 틱 하나 쉼(원본은 앞서는 쪽을 고치지 않음 → 개량: 양방향).
 //!   곡 끝 주사율 재추정은 하지 않는다(정지를 진행률로 배우는 문제를 피함). 입력은 프레임에서 그때의 틱 시각으로 판정.
+//! - IIDX 미세 보정형 (`iidx-fine`, CP2 뒤 추가 실험): IIDX 개량형 + 데드밴드 안에서 어긋남에 비례해 틱 길이를 조금(최대 ±5%) 고쳐
+//!   0으로 수렴시킨다 (시정수 0.5초, PLL처럼). 큰 어긋남은 그대로 1.5배/0.5배로 따라잡는다.
 
 use std::sync::Arc;
 
@@ -27,6 +29,7 @@ use crate::judging::{song_ns, JudgeLog, JudgeView};
 pub enum Profile {
     Ours,
     Iidx,
+    IidxFine,
     Djmax,
     Bms,
 }
@@ -36,15 +39,17 @@ impl Profile {
         Ok(match s {
             "ours" => Profile::Ours,
             "iidx" => Profile::Iidx,
+            "iidx-fine" => Profile::IidxFine,
             "djmax" => Profile::Djmax,
             "bms" => Profile::Bms,
-            _ => return Err(format!("프로필: ours | iidx | djmax | bms — {s}")),
+            _ => return Err(format!("프로필: ours | iidx | iidx-fine | djmax | bms — {s}")),
         })
     }
     pub fn name(&self) -> &'static str {
         match self {
             Profile::Ours => "ours",
             Profile::Iidx => "iidx",
+            Profile::IidxFine => "iidx-fine",
             Profile::Djmax => "djmax",
             Profile::Bms => "bms",
         }
@@ -53,6 +58,7 @@ impl Profile {
         match self {
             Profile::Ours => "우리 방식 (오디오 장치 시계 · 샘플 예약 · 입력 도장+watermark)",
             Profile::Iidx => "IIDX 개량형 (프레임=틱 · 오디오로 양방향 slew · 틱에서 발음·판정)",
+            Profile::IidxFine => "IIDX 미세 보정형 (IIDX 개량형 + 데드밴드 안 비례 보정으로 0에 수렴)",
             Profile::Djmax => "DJMAX식 (프레임 시계 0.333초 상한 · 즉시 재생 · 200 Hz 고정 스텝 판정)",
             Profile::Bms => "BMS식 (OS 시계 개방 루프 · 즉시 재생+끊기 · 1 kHz 폴링 입력)",
         }
@@ -63,6 +69,8 @@ const STEP_NS: i64 = 5_000_000; // DJMAX 고정 스텝 200 Hz
 const MAX_DT_NS: i64 = 333_333_333; // Unity maximumDeltaTime
 const SLEW_LATE_NS: i64 = 17_000_000;
 const SLEW_EARLY_NS: i64 = 34_000_000;
+/// 미세 보정의 시정수: 어긋남을 이 시간에 걸쳐 지수적으로 줄인다 (속도 변화 = 어긋남 / 시정수, 최대 ±5%).
+const FINE_TAU_NS: i64 = 500_000_000;
 
 pub struct FrameLogic {
     pub kind: Profile,
@@ -228,7 +236,7 @@ impl FrameLogic {
                 self.last_q = q_now;
                 self.t_frame
             }
-            Profile::Iidx => {
+            Profile::Iidx | Profile::IidxFine => {
                 // 틱 = 화면 갱신(vblank) 한 번. 프레임 수로 세면 안 된다: 이 장비는 vblank보다 프레임을 1% 더 그린다
                 // (33422 프레임 / 33100 vblank) → 차트가 오디오보다 빨리 달려 slew가 계속 잡아당긴다.
                 // 지난 프레임 이후 흐른 vblank 수만큼 틱을 세되, 한 프레임에 최대 1틱 (아케이드: 프레임이 밀리면 그만큼 차트도 늦어지고 slew가 따라잡는다).
@@ -240,16 +248,23 @@ impl FrameLogic {
                 self.vb_acc_q = (self.vb_acc_q - n * period_q).min(period_q); // 멈춤 동안 쌓인 몫은 버린다
                 self.tick += n;
                 self.base_ns += n * self.tick_ns;
-                if self.frame_no % 2 == 0 {
+                let fine = self.kind == Profile::IidxFine;
+                let coarse_turn = self.frame_no % 2 == 0;
+                if coarse_turn || fine {
                     if let Some((a, _)) = song_ns(clock, q_now, self.origin, self.rate, self.out_offset_ns) {
                         let e = self.base_ns - a;
                         self.slew_err_ns = e;
-                        if e < -SLEW_LATE_NS {
+                        if coarse_turn && e < -SLEW_LATE_NS {
                             self.base_ns += self.tick_ns; // 2프레임에 한 틱 더 = 1.5배
                             self.slew_extra += 1;
-                        } else if e > SLEW_EARLY_NS {
+                        } else if coarse_turn && e > SLEW_EARLY_NS {
                             self.base_ns -= self.tick_ns; // 한 틱 쉼 = 0.5배
                             self.slew_hold += 1;
+                        } else if fine && n > 0 && e.abs() <= SLEW_EARLY_NS {
+                            // 데드밴드 안: 이번 틱 길이를 어긋남에 비례해 고친다 (최대 ±5%)
+                            let adj = (-(e as i128) * self.tick_ns as i128 / FINE_TAU_NS as i128) as i64;
+                            let cap = self.tick_ns / 20;
+                            self.base_ns += adj.clamp(-cap, cap);
                         }
                     }
                 }
@@ -290,7 +305,7 @@ impl FrameLogic {
                     }
                 }
             }
-            Profile::Iidx => {
+            Profile::Iidx | Profile::IidxFine => {
                 while let Some(ev) = self.keys_in.pop() {
                     if self.keys.contains(&ev.vkey) {
                         self.judge_event(ev, t, state);

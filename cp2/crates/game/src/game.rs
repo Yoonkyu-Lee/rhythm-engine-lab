@@ -2,7 +2,7 @@
 //!
 //!   cp2game run <곡.rtc> [--bot] [--bot-offset-ms 0] [--bot-jitter-ms 0] [--faults audio@30:150,render@45:300,judge@60:300,input@75:300]
 //!                [--out-offset-ms 0] [--no-vsync] [--no-capture] [--tag run] [--out runs] [--quit-at-end] [--stop-at 곡초]
-//!                [--profile ours|iidx|djmax|bms] [--bot-adapt-ms 0] [--late-drop-ms 100] [--resync-judge void|count]
+//!                [--profile ours|iidx|iidx-fine|djmax|bms] [--bot-adapt-ms 0] [--late-drop-ms 100] [--resync-judge void|count]
 //!
 //! 스레드: 화면(이 스레드) · 오디오 · 입력 · 판정 · 봇 · 녹음 · 기록. 실시간 스레드끼리는 SPSC 링과 원자 변수만 쓴다.
 //! 고장 주입: 곡 시각 예약(--faults) 또는 단축키 F1 오디오 150 ms, F2 화면 300 ms, F3 판정 300 ms, F4 입력 300 ms.
@@ -454,7 +454,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let hud = Rgba(0.8, 0.85, 0.9, 1.0);
         let lines = [
             match logic.as_ref() {
-                Some(l) if profile == Profile::Iidx => format!("프로필: {} | slew 오차 {:+.1} ms, 틱 추가 {} · 쉼 {}", profile.title(), l.slew_err_ns as f64 / 1e6, l.slew_extra, l.slew_hold),
+                Some(l) if matches!(profile, Profile::Iidx | Profile::IidxFine) => format!("프로필: {} | slew 오차 {:+.1} ms, 틱 추가 {} · 쉼 {}", profile.title(), l.slew_err_ns as f64 / 1e6, l.slew_extra, l.slew_hold),
                 _ => format!("프로필: {}", profile.title()),
             },
             format!("곡 {:.2} s | 화면 {fps:.1} fps, 최근 1초 최대 프레임 간격 {max_gap_ms:.1} ms | vsync {}", song_s.max(0.0), vsync),

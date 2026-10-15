@@ -4,7 +4,7 @@
 set -u
 SONG=${1:-content/synth/synth.rtc}
 declare -A SC=([clean]="" [audio150]="audio@10:150" [render300]="render@10:300" [judge500]="judge@10:500" [input300]="input@10:300" [audio50]="audio@10:50")
-[ "${EXTRA_ONLY:-0}" = 1 ] || for p in ours iidx djmax bms; do
+[ "${EXTRA_ONLY:-0}" = 1 ] || for p in ${PROFILES:-ours iidx djmax bms}; do
   for s in clean audio150 render300 judge500 input300 audio50; do
     f=${SC[$s]}
     ./target/release/cp2game.exe run "$SONG" --bot --no-capture --profile $p --stop-at 22 --late-drop-ms 0 --resync-judge count --tag m-$p-$s ${f:+--faults $f} 2>&1 | tail -1 | sed "s/^/$p $s: /"
