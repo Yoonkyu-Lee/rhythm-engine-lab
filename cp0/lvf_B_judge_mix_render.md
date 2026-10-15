@@ -1,6 +1,6 @@
 # Lunatic Vibes F 분석 (Part B): 차트 타이밍 / 판정 / 키음 믹싱 / 노트 렌더링
 
-- 대상: `third_party/lunaticvibesf` (HEAD `3e8a655f`, 2025-03-14), 소스 루트 `src/`
+- 대상: `bms/third_party/lunaticvibesf` (HEAD `3e8a655f`, 2025-03-14), 소스 루트 `src/`
 - 표기: **(확인)** = 코드에서 직접 읽음, **(추정)** = 코드 경로로부터의 추론 또는 외부 지식
 - 경로는 모두 `src/` 기준
 

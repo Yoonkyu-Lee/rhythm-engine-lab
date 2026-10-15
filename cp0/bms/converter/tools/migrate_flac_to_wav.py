@@ -1,15 +1,18 @@
 r"""이미 변환한 라이브러리의 FLAC 키음을 WAV(16비트 PCM)로 바꾸고 채보의 #WAV 참조를 고침.
 
-python -I tools\migrate_flac_to_wav.py [변환 출력 기준 경로] [--procs N]
+python -I cp0\bms\converter\tools\migrate_flac_to_wav.py [변환 출력 기준 경로] [--procs N]
   기본: D:\Games\BMS\IIDX converted (→ "... SP", "... DP")
 
 이유: Qwilight가 FLAC 일부(특히 긴 반주)를 재생하지 못함. iidx2bms.py는 이제 WMA를 바로 WAV로 내보내므로
      새로 변환하면 이 스크립트는 필요 없음. FLAC은 무손실이라 FLAC→WAV 결과는 WMA→WAV와 표본 단위로 같음.
 순서 (곡마다): WAV를 .part로 쓴 뒤 이름 변경 → 채보 참조 교체 → FLAC 삭제. 중간에 끊겨도 다시 돌리면 이어짐.
-※ 채보 바이트가 바뀌므로 끝나면 tools\make_tables.py 로 난이도 테이블을 다시 만들 것.
+※ 채보 바이트가 바뀌므로 끝나면 cp0\bms\converter\tools\make_tables.py 로 난이도 테이블을 다시 만들 것.
 """
 import argparse, os, pathlib, re, subprocess, sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _paths import BMS_LIBRARY_BASE
 
 sys.stdout.reconfigure(encoding="utf-8")
 BATCH = 40  # ffmpeg 한 번에 처리할 파일 수 (명령줄 길이 제한 안쪽)
@@ -60,10 +63,10 @@ def migrate_song(song_dir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("base", nargs="?", default=r"D:\Games\BMS\IIDX converted")
+    ap.add_argument("base", nargs="?", type=pathlib.Path, default=BMS_LIBRARY_BASE)
     ap.add_argument("--procs", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     a = ap.parse_args()
-    base = pathlib.Path(a.base)
+    base = a.base.expanduser().resolve()
     dirs = [d for st in ("SP", "DP") for d in sorted(base.with_name(f"{base.name} {st}").iterdir())
             if d.is_dir() and any(d.glob("*.flac"))]
     print(f"{len(dirs)} song folders with FLAC", flush=True)

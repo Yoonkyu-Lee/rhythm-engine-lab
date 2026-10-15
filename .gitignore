@@ -1,14 +1,12 @@
 # 게임 데이터 (코나미 저작물) — 올리지 않음
-converter/converted example/
-converter/system_bgm/
-converter/out/
-converter/out_charts/
-converter/out_soflan/
-converter/logs/
+cp0/bms/converter/converted example/
+cp0/bms/converter/system_bgm/
+cp0/bms/converter/out*/
+cp0/bms/converter/logs/
 
-# 다른 프로젝트의 소스 복제본 (분석 보고서 _analysis/ 만 우리 것)
-cp0/third_party/beatoraja/
-cp0/third_party/lunaticvibesf/
+# 다른 프로젝트의 소스 복제본 (분석 문서는 cp0 루트에 보관)
+cp0/bms/third_party/beatoraja/
+cp0/bms/third_party/lunaticvibesf/
 
 # 개인 환경 정보
 HANDOFF_PROMPT.md
@@ -23,11 +21,14 @@ __pycache__/
 # IIDX 역공학 문서와 도구 — 비공개
 cp0/IIDX_vs_BMS.md
 cp0/IIDX_timing_policy.md
-cp0/tools/re_disasm_index.py
-cp0/third_party/_partial_copy_beatoraja/
+cp0/iidx/tools/re_disasm_index.py
+cp0/bms/third_party/_partial_copy_beatoraja/
 
-# DJMAX RESPECT V 분석 — 비공개
+# DJMAX RESPECT V 분석 — 비공개 (CP2 시험 콘텐츠 어댑터 중 DJMAX 데이터에 기대는 것 포함)
 cp0/djmax/
+cp0/DJMAX_*.md
+cp2/tools/adapt_djmax.py
+cp2/tools/check_expected.py
 
 # 로컬 도구 등록 (rea MCP)
 .mcp.json

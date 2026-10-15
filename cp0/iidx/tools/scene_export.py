@@ -1,6 +1,6 @@
 r"""IIDX .1 채보의 앞 N소절을 잘라 JSON으로 내보냄 + 같은 장면의 BMS 표현을 계산.
 
-python -I tools\scene_export.py <file.1> <slot> <소절수> > scene.json
+python -I cp0\iidx\tools\scene_export.py <file.1> <slot> <소절수> > scene.json
 
 BMS 변환 가정 (검증 안 됨):
   - 레인 param 0~6 → 채널 11,12,13,14,15,18,19 / 7 → 16 (스크래치)

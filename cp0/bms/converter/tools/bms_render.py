@@ -1,6 +1,6 @@
 r"""BMS 파일을 독립적으로 해석해 "모든 노트를 정확히 친" 오디오로 렌더링 (변환 검증용).
 
-python -I tools\bms_render.py <file.bme> <out.wav> [--sr 44100]
+python -I cp0\bms\converter\tools\bms_render.py <file.bme> <out.wav> [--sr 44100]
 
 변환기(iidx2bms.py)와 코드를 공유하지 않는 별도 해석기. 지원: #WAV, #BPM, #BPMxx, #BASE 62,
 채널 01(자동재생), 02(소절 길이), 03, 08(BPM), 1x/2x(노트), 5x/6x(LNTYPE 1, 시작에서 발음).
@@ -99,7 +99,7 @@ def main():
                 continue
             ln_seen[ch] = True
         final.append((t, i))
-    d = pathlib.Path(src).parent
+    d = pathlib.Path(src).resolve().parent
     cache = {}
     end = max(t for t, _ in final) + 10
     mix = np.zeros((int(end * sr), 2), "f4")

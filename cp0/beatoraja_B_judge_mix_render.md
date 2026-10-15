@@ -1,6 +1,6 @@
 # beatoraja 소스 분석 (Part B): 차트 타이밍 모델 · 판정 · 키음 믹싱 · 노트 렌더링
 
-- 대상: `third_party/beatoraja` (HEAD `8320241d`, 2026-10-07). 경로는 별도 표기가 없으면 `src/bms/player/beatoraja/` 기준입니다.
+- 대상: `bms/third_party/beatoraja` (HEAD `8320241d`, 2026-10-07). 경로는 별도 표기가 없으면 `src/bms/player/beatoraja/` 기준입니다.
 - 차트 모델(`bms.model.*`)은 `lib/jbms-parser.jar`에 들어 있습니다. 디컴파일러가 없어서 직접 만든 class 파일 파서(constant pool, 멤버 시그니처, opcode 나열)로 시그니처·상수·바이트코드 흐름만 확인했습니다. 이 방법으로 확인한 내용은 **(확인-bytecode)**로 따로 표시했습니다.
 - 표기: **(확인)** = 코드에서 직접 읽음, **(추정)** = 정황과 구조로 추론함.
 - 시간 단위: beatoraja 내부 시간은 거의 모두 **µs(long)**입니다. 판정창 표는 ms로 환산해 적었습니다.

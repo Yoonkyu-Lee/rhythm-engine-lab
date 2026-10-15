@@ -1,6 +1,6 @@
 r"""IIDX 데이터 전수 조사: 변환기 설계에 필요한 사실 확인.
 
-python -I tools\iidx_survey.py
+python -I cp0\iidx\tools\iidx_survey.py
 
 확인 항목
   1. music_data.bin 항목 +0x684 의 차분별 소리 묶음 접미사 (게임 코드에서 확인한 필드)
@@ -8,11 +8,11 @@ python -I tools\iidx_survey.py
   3. 소리 번호 범위 ↔ 소리 묶음 파일 수 (0부터/1부터)
   4. 이벤트 종류·파라미터·값 범위, 롱노트(value>0), 레인 범위
 """
-import struct, pathlib, collections, json, sys
+import argparse, os, struct, pathlib, collections, json, sys
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-ROOT = pathlib.Path(r"D:\Arcade\LDJ-010-2026081900")
+ROOT = pathlib.Path(os.environ.get("RHYTHM_IIDX_ROOT", r"D:\Arcade\LDJ-010-2026081900")).expanduser().resolve()
 SOUND = ROOT / "contents" / "data" / "sound"
 EXTRACTED = ROOT / "extracted" / "songs"
 DB_FILES = [ROOT / "contents/data/info/1/music_data.bin", ROOT / "contents/data/info/1/music_omni.bin"]
@@ -45,7 +45,13 @@ def read_chart(p):
     return slots
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=pathlib.Path, default=ROOT)
+    args = parser.parse_args(argv)
+    root = args.root.expanduser().resolve()
+    EXTRACTED = root / "extracted/songs"
+    DB_FILES = [root / "contents/data/info/1/music_data.bin", root / "contents/data/info/1/music_omni.bin"]
     db = {}
     for f in DB_FILES:
         db.update(load_music(f))  # omni 가 기본판을 포함 (나중 값 우선)
@@ -134,4 +140,5 @@ def main():
     print("examples:", snd_examples[:16])
 
 
-main()
+if __name__ == "__main__":
+    main()

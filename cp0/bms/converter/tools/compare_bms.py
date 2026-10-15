@@ -1,6 +1,6 @@
 r"""두 BMS 변환본 비교 (같은 IIDX 차분을 서로 다른 변환기로 만든 것).
 
-python -I tools\compare_bms.py <ours.bme> <theirs.bme> [--sound-map ours|theirs ...]
+python -I cp0\bms\converter\tools\compare_bms.py <ours.bme> <theirs.bme> [--sound-map ours|theirs ...]
 
 비교 항목
   - 헤더 값
@@ -12,7 +12,7 @@ import re, sys, pathlib, collections
 from fractions import Fraction
 
 sys.stdout.reconfigure(encoding="utf-8")
-sys.path.insert(0, str(pathlib.Path(__file__).parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from bms_render import timeline, B62  # noqa: E402
 
 

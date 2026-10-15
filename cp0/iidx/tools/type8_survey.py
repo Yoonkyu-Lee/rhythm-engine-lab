@@ -1,6 +1,6 @@
 """모든 .1 채보의 type 8 이벤트 값 분포 조사.
 
-python -I tools\\type8_survey.py <extracted\\songs 경로>
+python -I cp0\\iidx\\tools\\type8_survey.py <extracted\\songs 경로>
 """
 import sys, struct, pathlib, collections
 

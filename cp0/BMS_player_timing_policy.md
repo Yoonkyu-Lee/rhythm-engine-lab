@@ -36,12 +36,12 @@
 
 축마다 상세 보고서를 따로 썼습니다(파일:줄 근거 포함).
 
-- [beatoraja A — 시계·오디오·입력](third_party/_analysis/beatoraja_A_clock_audio_input.md)
-- [beatoraja B — 판정·믹싱·렌더](third_party/_analysis/beatoraja_B_judge_mix_render.md)
-- [LVF A — 시계·오디오·입력](third_party/_analysis/lvf_A_clock_audio_input.md)
-- [LVF B — 판정·믹싱·렌더](third_party/_analysis/lvf_B_judge_mix_render.md)
+- [beatoraja A — 시계·오디오·입력](beatoraja_A_clock_audio_input.md)
+- [beatoraja B — 판정·믹싱·렌더](beatoraja_B_judge_mix_render.md)
+- [LVF A — 시계·오디오·입력](lvf_A_clock_audio_input.md)
+- [LVF B — 판정·믹싱·렌더](lvf_B_judge_mix_render.md)
 
-이 문서의 코드 경로는 `third_party/beatoraja/src/bms/player/beatoraja/`(이하 `bt/`)와 `third_party/lunaticvibesf/src/`(이하 `lvf/`) 기준입니다.
+이 문서의 코드 경로는 `bms/third_party/beatoraja/src/bms/player/beatoraja/`(이하 `bt/`)와 `bms/third_party/lunaticvibesf/src/`(이하 `lvf/`) 기준입니다.
 
 ---
 
@@ -67,14 +67,14 @@
 ## 3. 기준 시계
 
 ### beatoraja (확인)
-- [TimerManager.java:108-110](third_party/beatoraja/src/bms/player/beatoraja/TimerManager.java#L108-L110): `nowmicrotime = (System.nanoTime() - starttime) / 1000`
+- [TimerManager.java:108-110](bms/third_party/beatoraja/src/bms/player/beatoraja/TimerManager.java#L108-L110): `nowmicrotime = (System.nanoTime() - starttime) / 1000`
 - 이 값은 `MainController.render()` 맨 앞에서만 갱신됩니다. 판정 스레드나 배경음 스레드가 읽는 "지금"은 **마지막 프레임이 시작된 시각**입니다.
 - 플레이 시각은 `nowmicrotime - timer[TIMER_PLAY]`입니다. 채보 앞에 1000 ms 여유가 붙습니다(`PlayerResource.java:214`).
 - 재생 속도(오토플레이·리플레이 전용)는 `TIMER_PLAY` 기준점을 프레임마다 밀어서 구현합니다(`BMSPlayer.java:621-624`).
 - 일시정지는 없습니다.
 
 ### LVF (확인)
-- [beat.h:57](third_party/lunaticvibesf/src/common/beat.h#L57): `std::chrono::system_clock::now()`.
+- [beat.h:57](bms/third_party/lunaticvibesf/src/common/beat.h#L57): `std::chrono::system_clock::now()`.
 - `system_clock`은 단조 시계가 아닙니다. 플레이 중에 OS 시계가 동기화되면 시간이 튈 수 있습니다. (추정: 실제 영향은 측정하지 않음)
 - 플레이 시각은 `rt = tick_t - PLAY_START`입니다(`scene_play.cpp:1886-1896`). 판정은 `Time::norm()`(ms 정수)로 합니다.
 - 재생 속도는 시계가 아니라 채보를 다시 컴파일해서 구현합니다(BPM × pitchSpeed). 오디오는 FMOD 피치로 맞춥니다.
@@ -91,15 +91,15 @@ IIDX는 시간을 "프레임 번호 × 틱 길이"로 셉니다. 렉이 걸리�
 | 스레드 | 하는 일 | 주기 |
 |---|---|---|
 | 렌더 (libGDX) | 시계 갱신, 상태 머신, 그리기 | VSync(기본 꺼짐) 또는 `maxFramePerSecond` 240 |
-| 입력 폴링 | 키보드·컨트롤러 상태 읽기, 시각 기록 | ms 경계마다 1번 (최대 1 kHz), 아니면 0.5 ms sleep ([MainController.java:355-369](third_party/beatoraja/src/bms/player/beatoraja/MainController.java#L355-L369)) |
+| 입력 폴링 | 키보드·컨트롤러 상태 읽기, 시각 기록 | ms 경계마다 1번 (최대 1 kHz), 아니면 0.5 ms sleep ([MainController.java:355-369](bms/third_party/beatoraja/src/bms/player/beatoraja/MainController.java#L355-L369)) |
 | JudgeThread | `JudgeManager.update()` | `TIMER_PLAY`가 바뀔 때만, 즉 **프레임마다 1회** (`KeyInputProccessor.java:168-200`) |
-| AutoplayThread | 배경음 발음 | 다음 이벤트까지 sleep ([KeySoundProcessor.java:77-90](third_party/beatoraja/src/bms/player/beatoraja/play/KeySoundProcessor.java#L77-L90)) |
+| AutoplayThread | 배경음 발음 | 다음 이벤트까지 sleep ([KeySoundProcessor.java:77-90](bms/third_party/beatoraja/src/bms/player/beatoraja/play/KeySoundProcessor.java#L77-L90)) |
 | 믹서 (PortAudio/AudioDevice 드라이버) | 샘플 합산, 장치 쓰기 | 장치 버퍼 단위 |
 
 - 스레드 사이 공유 상태(`nowmicrotime`, 키 배열)에 `volatile`도 잠금도 없습니다. (확인) Java 메모리 모델상 다른 스레드에서 갱신이 늦게 보일 수 있습니다. (추정)
 
 ### LVF (확인)
-- **게임 로직은 1000 Hz 가상 고정 틱입니다**([game.cpp:326-354](third_party/lunaticvibesf/src/game/game.cpp#L326-L354)).
+- **게임 로직은 1000 Hz 가상 고정 틱입니다**([game.cpp:326-354](bms/third_party/lunaticvibesf/src/game/game.cpp#L326-L354)).
   ```cpp
   _acc += t - _last_update_time;
   const auto dt = lunaticvibes::Time{1000 / rate};
@@ -131,7 +131,7 @@ IIDX는 시간을 "프레임 번호 × 틱 길이"로 셉니다. 렉이 걸리�
 - LVF: `getDSPClock`, `setDelay`, `getPosition`, `getLatency` 호출이 없습니다. (확인)
 
 ### 배경음 발음
-- **beatoraja** ([KeySoundProcessor.java:77-84](third_party/beatoraja/src/bms/player/beatoraja/play/KeySoundProcessor.java#L77-L84)):
+- **beatoraja** ([KeySoundProcessor.java:77-84](bms/third_party/beatoraja/src/bms/player/beatoraja/play/KeySoundProcessor.java#L77-L84)):
   ```java
   final long time = player.timer.getNowMicroTime(TIMER_PLAY);
   while (p < timelines.length && timelines[p].getMicroTime() <= time) {
@@ -174,7 +174,7 @@ IIDX는 곡 전체 길이의 반주가 있으니 그 재생 위치가 곧 "오�
 
 ### 7.1 판정 창
 
-**LVF = LR2 값** ([ruleset_bms.h:277-281](third_party/lunaticvibesf/src/game/ruleset/ruleset_bms.h#L277-L281), 주석: "verified with LR2 disassembly") (확인)
+**LVF = LR2 값** ([ruleset_bms.h:277-281](bms/third_party/lunaticvibesf/src/game/ruleset/ruleset_bms.h#L277-L281), 주석: "verified with LR2 disassembly") (확인)
 
 | #RANK | PG | GR | GD | BD | 빈 POOR |
 |---|---|---|---|---|---|
@@ -183,11 +183,11 @@ IIDX는 곡 전체 길이의 반주가 있으니 그 재생 위치가 곧 "오�
 | 2 NORMAL | 18 | 40 | 100 | 200 | 1000 |
 | 3 EASY | 21 | 60 | 120 | 200 | 1000 |
 
-- 오차 = `time.norm() - note.time.norm()`([ruleset_bms.cpp:950](third_party/lunaticvibesf/src/game/ruleset/ruleset_bms.cpp#L950)). 두 시각을 각각 ms 정수로 자른 뒤 뺍니다.
+- 오차 = `time.norm() - note.time.norm()`([ruleset_bms.cpp:950](bms/third_party/lunaticvibesf/src/game/ruleset/ruleset_bms.cpp#L950)). 두 시각을 각각 ms 정수로 자른 뒤 뺍니다.
 - 빠른 쪽 경계는 포함하고 늦은 쪽 경계는 포함하지 않습니다. 그래서 NORMAL PG는 실제로 −18..+17 ms입니다. (확인)
 - #RANK 4, 잘못된 값, #RANK 없음은 모두 NORMAL로 처리합니다. #DEFEXRANK는 무시합니다. (확인)
 
-**beatoraja = 모드별 µs 표 × #RANK 비율** ([JudgeProperty.java:23-33](third_party/beatoraja/src/bms/player/beatoraja/play/JudgeProperty.java#L23-L33), 7KEYS, 100% 기준) (확인)
+**beatoraja = 모드별 µs 표 × #RANK 비율** ([JudgeProperty.java:23-33](bms/third_party/beatoraja/src/bms/player/beatoraja/play/JudgeProperty.java#L23-L33), 7KEYS, 100% 기준) (확인)
 
 | 종류 | PG | GR | GD | BAD (빠름/늦음) | 빈 POOR |
 |---|---|---|---|---|---|
@@ -213,7 +213,7 @@ IIDX는 곡 전체 길이의 반주가 있으니 그 재생 위치가 곧 "오�
 - 미스 판정은 다릅니다.
   - beatoraja: 프레임마다 훑습니다(`JudgeManager.java:592-628`).
   - LVF: 1 kHz 틱에서 노트 시각 + 200 ms에 판정합니다.
-- 두 구동기 모두 **판정 오프셋을 판정 계산식에 넣지 않습니다.** `judgetiming`과 `JudgeOffset`은 화면 위치만 옮깁니다([LaneRenderer.java:301](third_party/beatoraja/src/bms/player/beatoraja/play/LaneRenderer.java#L301), `lvf/game/chart/chart.cpp:338`). 자동 조정 기능도 이 화면 오프셋만 1 ms씩 움직입니다. (확인)
+- 두 구동기 모두 **판정 오프셋을 판정 계산식에 넣지 않습니다.** `judgetiming`과 `JudgeOffset`은 화면 위치만 옮깁니다([LaneRenderer.java:301](bms/third_party/beatoraja/src/bms/player/beatoraja/play/LaneRenderer.java#L301), `lvf/game/chart/chart.cpp:338`). 자동 조정 기능도 이 화면 오프셋만 1 ms씩 움직입니다. (확인)
   - 판정은 "누른 순간의 벽시계 vs 채보 시각"으로만 계산됩니다. 오디오 출력 지연이나 입력 장치 지연은 플레이어가 화면 오프셋으로 간접 보정할 수밖에 없습니다.
 
 ### 7.4 LN
@@ -231,12 +231,12 @@ LVF에서 BAD 머리 LN이 두 번 끝난 것으로 셈해질 수 있다는 지�
 | | beatoraja | LVF |
 |---|---|---|
 | 누를 때 울리는 소리 | 판정된 노트의 소리. 창 안에 노트가 없으면 누른 시각 직전의 지난 노트나 투명 노트의 소리 | 틱마다, 1000 ms 안에 다가오는 레인 노트의 소리로 키를 다시 매핑합니다. 아니면 마지막 소리를 유지합니다. 판정과 관계없이 매번 울립니다. |
-| 같은 소리 재트리거 | **항상 끊음**: 채널 = `wavId*256 + pitch + 128`, stop 후 play ([AbstractAudioDriver.java:507-526](third_party/beatoraja/src/bms/player/beatoraja/audio/AbstractAudioDriver.java#L507-L526)). 키와 배경음 모두 해당 | **항상 끊음** (추정): `FMOD_UNIQUE`로 로드 (`sound_fmod.cpp:678`) |
+| 같은 소리 재트리거 | **항상 끊음**: 채널 = `wavId*256 + pitch + 128`, stop 후 play ([AbstractAudioDriver.java:507-526](bms/third_party/beatoraja/src/bms/player/beatoraja/audio/AbstractAudioDriver.java#L507-L526)). 키와 배경음 모두 해당 | **항상 끊음** (추정): `FMOD_UNIQUE`로 로드 (`sound_fmod.cpp:678`) |
 | 동시 발음 수 | 256 (`deviceSimultaneousSources`). PortAudio 믹서는 꽉 차면 **새 소리를 버림**, 리미터 없음 | 512 소프트웨어 채널, 우선순위나 뺏기 없음 |
 | 로딩 | 전부 메모리에 PCM으로 디코딩. 로드할 때 선형 보간 리샘플 | 전부 메모리 (`CREATESAMPLE`) |
 | 볼륨 | #VOLWAV × keyvolume/bgvolume (기본 각각 0.5) | 채보의 배경음이 KEY 그룹으로 나가서 **BGM 볼륨 슬라이더가 안 먹음** (`scene_play.cpp:2591`) (확인) |
 
-**컨버터 작업과의 연결:** 이번에 Qwilight에서 FLAC 반주가 안 울렸던 문제는 디코딩 경로 문제였습니다(WAV로 바꾸자 해결). 같은 소리 재트리거 정책(끊기 vs 겹치기)은 IIDX 원곡을 재현할 때 소리가 실제로 달라지는 정책입니다. IIDX 채보는 같은 키음을 짧은 간격으로 다시 울리는 경우가 많기 때문입니다. 우리가 가진 `../converter/tools/bms_render.py`(겹치기)와 게임 미리듣기를 비교하면 어느 쪽이 원곡에 가까운지 잴 수 있습니다(§11의 실험 M6).
+**컨버터 작업과의 연결:** 이번에 Qwilight에서 FLAC 반주가 안 울렸던 문제는 디코딩 경로 문제였습니다(WAV로 바꾸자 해결). 같은 소리 재트리거 정책(끊기 vs 겹치기)은 IIDX 원곡을 재현할 때 소리가 실제로 달라지는 정책입니다. IIDX 채보는 같은 키음을 짧은 간격으로 다시 울리는 경우가 많기 때문입니다. 우리가 가진 `bms/converter/tools/bms_render.py`(겹치기)와 게임 미리듣기를 비교하면 어느 쪽이 원곡에 가까운지 잴 수 있습니다(§11의 실험 M6).
 
 ---
 
@@ -244,7 +244,7 @@ LVF에서 BAD 머리 LN이 두 번 끝난 것으로 셈해질 수 있다는 지�
 
 | | beatoraja | LVF |
 |---|---|---|
-| 위치 | 타임라인을 따라 Δ마디 × scroll × (레인 높이 × HS)를 더함. 현재 구간만 시각으로 보간 ([LaneRenderer.java:321-326](third_party/beatoraja/src/bms/player/beatoraja/play/LaneRenderer.java#L321-L326)) | `y = 판정선 − floor(Δmetre × 레인 높이 × basespeed × HS)` (`sprite_lane.cpp:139-153`) |
+| 위치 | 타임라인을 따라 Δ마디 × scroll × (레인 높이 × HS)를 더함. 현재 구간만 시각으로 보간 ([LaneRenderer.java:321-326](bms/third_party/beatoraja/src/bms/player/beatoraja/play/LaneRenderer.java#L321-L326)) | `y = 판정선 − floor(Δmetre × 레인 높이 × basespeed × HS)` (`sprite_lane.cpp:139-153`) |
 | 계산 방식 | 매 프레임 시계에서 다시 계산 (상태 없음) | 매 프레임 마지막 틱 값에서 다시 계산, 정수 픽셀 |
 | BPM 변화 | 화면 속도가 BPM에 비례, STOP에서 멈춤 | 같음 |
 | 프레임 보간·출력 시각 예측 | 없음 | 없음 (최대 1 ms 묵은 값) |
@@ -293,12 +293,12 @@ LVF에서 BAD 머리 LN이 두 번 끝난 것으로 셈해질 수 있다는 지�
 
 | 지표 | 정의 | 재는 법 |
 |---|---|---|
-| M1 발음 오차 | 실제 출력된 소리의 시작 − 채보 시각 | 출력을 루프백으로 녹음하고 `../converter/tools/bms_render.py` 렌더(샘플 정확한 정답)와 상호상관. 우리가 이미 쓰는 방법 |
+| M1 발음 오차 | 실제 출력된 소리의 시작 − 채보 시각 | 출력을 루프백으로 녹음하고 `bms/converter/tools/bms_render.py` 렌더(샘플 정확한 정답)와 상호상관. 우리가 이미 쓰는 방법 |
 | M2 판정 시각 오차 | 엔진이 기록한 누른 시각 − 실제 누른 시각 | 기준 입력 장치(마이크로컨트롤러가 정해진 시각에 키 신호를 넣고 같은 순간 오디오 클릭도 냄)로 비교 |
 | M3 렉 복구 | 인위적 정지(50/100/500 ms)를 넣은 뒤, 오디오–채보 오차가 1 ms 안으로 돌아오기까지 걸린 시간과 그동안의 최대 오차 | 엔진 안에서 정지를 주입하고 로그 기록 |
 | M4 화면 불연속 | 복구 중 노트가 한 프레임에 건너뛴 최대 픽셀 | 렌더 로그 |
 | M5 장기 드리프트 | 곡 끝에서 오디오 DSP 클록 − 엔진 시계 | 로그 (10분 이상 곡이나 반복 재생) |
-| M6 원곡 재현도 | 엔진 출력과 IIDX 미리듣기의 상관계수 | `../converter/tools/compare_preview.py` (P9·P10 비교용) |
+| M6 원곡 재현도 | 엔진 출력과 IIDX 미리듣기의 상관계수 | `bms/converter/tools/compare_preview.py` (P9·P10 비교용) |
 | M7 판정 결정성 | 같은 입력 기록을 다시 돌렸을 때 판정이 같은 비율 | 입력 기록 재생 |
 | M8 지연 분포 | 입력 → 키음 출력, 입력 → 화면 반응 | M1·M2 장치 조합 |
 

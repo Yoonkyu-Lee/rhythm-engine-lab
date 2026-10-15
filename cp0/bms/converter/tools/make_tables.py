@@ -1,6 +1,6 @@
 r"""변환한 IIDX BMS로 "작품별" BMS 난이도 테이블 생성 (SP, DP 각각).
 
-python -I tools\make_tables.py [변환 출력 기준 경로] [테이블 출력 폴더]
+python -I cp0\bms\converter\tools\make_tables.py [변환 출력 기준 경로] [테이블 출력 폴더]
   기본: D:\Games\BMS\IIDX converted (→ "... SP", "... DP"),  D:\Games\BMS\IIDX tables
 
 형식: 표준 BMS 테이블 (beatoraja/LR2/Qwilight 공통)
@@ -10,12 +10,13 @@ python -I tools\make_tables.py [변환 출력 기준 경로] [테이블 출력 �
 레벨 = 작품 ("01 1st style" ~ "33 Sparkle Shower"). 플레이어는 MD5로 내 폴더의 BMS 파일을 찾음.
 ※ BMS 파일을 다시 변환하면 해시가 바뀌므로 테이블도 다시 만들어야 함.
 """
-import hashlib, json, pathlib, sys
+import argparse, hashlib, json, pathlib, sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _paths import BMS_LIBRARY_BASE, BMS_TABLES, IIDX_ROOT
 
 sys.stdout.reconfigure(encoding="utf-8")
-BASE = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(r"D:\Games\BMS\IIDX converted")
-OUT = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else pathlib.Path(r"D:\Games\BMS\IIDX tables")
-SONGS = pathlib.Path(r"D:\Arcade\LDJ-010-2026081900\extracted\system\database\songs.json")
+SONGS_DEFAULT = IIDX_ROOT / "extracted/system/database/songs.json"
 DIFF = {"B": "BEGINNER", "N": "NORMAL", "H": "HYPER", "A": "ANOTHER", "L": "LEGGENDARIA"}
 LEVEL_KEY = {"B": "B", "N": "N", "H": "H", "A": "A", "L": "L"}
 
@@ -27,10 +28,17 @@ def header_value(text, key):
     return ""
 
 
-def main():
-    songs = {s["id"]: s for s in json.loads(SONGS.read_text(encoding="utf-8"))}
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("base", nargs="?", type=pathlib.Path, default=BMS_LIBRARY_BASE)
+    parser.add_argument("out", nargs="?", type=pathlib.Path, default=BMS_TABLES)
+    parser.add_argument("--songs-json", type=pathlib.Path, default=SONGS_DEFAULT)
+    args = parser.parse_args(argv)
+    base = args.base.expanduser().resolve()
+    out = args.out.expanduser().resolve()
+    songs = {s["id"]: s for s in json.loads(args.songs_json.read_text(encoding="utf-8"))}
     for style, mode, symbol in (("SP", "beat-7k", "Ⅱ"), ("DP", "beat-14k", "Ⅱ")):
-        root = BASE.with_name(f"{BASE.name} {style}")
+        root = base.with_name(f"{base.name} {style}")
         versions = {}
         data = []
         for bme in sorted(root.glob("*/*.bme")):
@@ -54,7 +62,7 @@ def main():
         name = f"IIDX {style} 작품별"
         header = {"name": name, "symbol": symbol, "data_url": "data.json",
                   "level_order": [versions[k] for k in sorted(versions)], "mode": mode}
-        d = OUT / style.lower()
+        d = out / style.lower()
         d.mkdir(parents=True, exist_ok=True)
         (d / "header.json").write_text(json.dumps(header, ensure_ascii=False, indent=1), encoding="utf-8")
         (d / "data.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -65,4 +73,5 @@ def main():
         print(f"{name}: {len(data)} charts, {len(versions)} levels → {d}")
 
 
-main()
+if __name__ == "__main__":
+    main()

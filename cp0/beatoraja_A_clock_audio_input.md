@@ -1,6 +1,6 @@
 # beatoraja 소스 분석 (Part A): 시간축 · 메인 루프 · 오디오 · 입력
 
-- 대상: `third_party/beatoraja` (origin `exch-bms2/beatoraja`, HEAD `8320241`, 2026-10-07)
+- 대상: `bms/third_party/beatoraja` (origin `exch-bms2/beatoraja`, HEAD `8320241`, 2026-10-07)
 - 소스 루트: `src/bms/player/beatoraja/` (아래 경로는 이 루트 기준 상대경로)
 - 백엔드: libGDX **LWJGL2** 백엔드 (`lib/gdx-backend-lwjgl.jar`, 내장 LWJGL 2.9.x / OpenAL Soft DLL, 2014년 빌드). 컨트롤러는 `gdx-controllers-desktop.jar` = **OIS** 기반.
 - 차트 파서: `lib/jbms-parser.jar` (`bms.model.BMSModel`, `TimeLine`, `Note`, `BMSModelUtils` …). 디컴파일은 하지 않았고, jar 내부 동작은 클래스명과 바이트코드 문자열 상수로만 확인했음.

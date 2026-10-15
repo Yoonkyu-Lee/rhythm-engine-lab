@@ -1,14 +1,14 @@
 r"""IIDX 곡 데이터(.1 채보 + 소리 묶음) → BMS 변환기.
 
-python -I tools\iidx2bms.py 33131 01002          # 곡 ID 지정
-python -I tools\iidx2bms.py --all                # 전곡
-python -I tools\iidx2bms.py 33131 --no-audio     # 채보만 (빠른 검증)
+python -I cp0\bms\converter\tools\iidx2bms.py 33131 01002          # 곡 ID 지정
+python -I cp0\bms\converter\tools\iidx2bms.py --all                # 전곡
+python -I cp0\bms\converter\tools\iidx2bms.py 33131 --no-audio     # 채보만 (빠른 검증)
 
 입력: 추출본 D:\Arcade\LDJ-010-2026081900\extracted (패치 -p0 적용 후 상태)
       + 곡 DB music_data.bin / music_omni.bin (차분별 소리 묶음 접미사 +0x684)
 출력: out\<곡ID> <제목>\  (BMS 파일, 소리, 미리듣기, report.json)
 
-근거 (확인한 사실, cp0\IIDX_vs_BMS.md / cp0\IIDX_timing_policy.md / cp0\tools\iidx_survey.py):
+근거 (확인한 사실, cp0\IIDX_vs_BMS.md / cp0\IIDX_timing_policy.md / cp0\iidx\tools\iidx_survey.py):
   - .1 칸 0..4 = SP H,N,A,B,L / 6..10 = DP H,N,A,B,L
   - 이벤트 8B (u32 ms, u8 type, u8 param, u16 value), 시각 0x7FFFFFFF = 끝 표식
   - type 0/1 노트 (1P/2P, param 0..6 건반, 7 스크래치, 107 특수 스크래치), value = 롱노트 길이(ms)
@@ -22,13 +22,16 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _paths import CONVERTER_ROOT, IIDX_ROOT
+
 sys.stdout.reconfigure(encoding="utf-8")
 
-ROOT = pathlib.Path(r"D:\Arcade\LDJ-010-2026081900")
+ROOT = IIDX_ROOT
 EXTRACTED = ROOT / "extracted"
 DB_FILES = [ROOT / "contents/data/info/1/music_data.bin", ROOT / "contents/data/info/1/music_omni.bin"]
 SONGS_JSON = EXTRACTED / "system/database/songs.json"
-OUT_DEFAULT = pathlib.Path(__file__).resolve().parent.parent / "out"
+OUT_DEFAULT = CONVERTER_ROOT / "out"
 
 # .1 칸 → (스타일, 난이도 문자, 곡 DB 난이도 인덱스 0..9 = SP B,N,H,A,L, DP B,N,H,A,L)
 SLOTS = {0: ("SP", "H", 2), 1: ("SP", "N", 1), 2: ("SP", "A", 3), 3: ("SP", "B", 0), 4: ("SP", "L", 4),
@@ -457,7 +460,7 @@ def convert_chart(events, style, diff, song, bank_files, sound_name, tol_ms, inv
     lvl_idx = SLOTS_DIFF_INDEX[(style, diff)]
     level = [song.get(k) for k in ("SPB", "SPN", "SPH", "SPA", "SPL", "DPB", "DPN", "DPH", "DPA", "DPL")][lvl_idx]
     hdr = [
-        "*---------------------- converted by iidx2bms (tools/iidx2bms.py)",
+        "*---------------------- converted by iidx2bms (cp0/bms/converter/tools/iidx2bms.py)",
         f"* source: IIDX {song['id']:05d} slot {style}{diff}, bank {sound_name}",
         f"* judge windows (type 8, s8 raw): {judge[:6]}",
         f"* lost: autoplay pan x{rep['counts']['autoplay_pan_lost']}, special scratch x{rep['counts']['special_scratch']} (as LN/tap)",
@@ -700,6 +703,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=4, help="곡 하나 안에서 동시에 돌리는 ffmpeg 수")
     ap.add_argument("--procs", type=int, default=max(1, (os.cpu_count() or 2) - 2), help="동시에 변환하는 곡 수")
     a = ap.parse_args()
+    a.out = a.out.expanduser().resolve()
     meta = load_music_db()
     ids = [i for i in (sorted(meta) if a.all else a.ids) if i in meta]
     for i in (a.ids or []):

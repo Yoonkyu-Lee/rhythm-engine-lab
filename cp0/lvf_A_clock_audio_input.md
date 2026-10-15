@@ -1,6 +1,6 @@
 # Lunatic Vibes F 소스 분석 (A): 시간 기준, 스레드/루프, 오디오, 입력
 
-- 대상: `third_party/lunaticvibesf` (v0.27.2, 커밋 `3e8a655`, shallow clone), FMOD Core 2.02.07 (`ext/fmod/inc/fmod_common.h:60`)
+- 대상: `bms/third_party/lunaticvibesf` (v0.27.2, 커밋 `3e8a655`, shallow clone), FMOD Core 2.02.07 (`ext/fmod/inc/fmod_common.h:60`)
 - 범위: (1) 시간 기준 (2) 스레드/루프 (3) 오디오 (4) 오디오와 차트의 동기화 (5) 입력 (6) 설정 키
 - 표기: **(확인)** 코드에서 직접 읽은 사실 / **(추정)** 코드에서 추론했거나 외부 문서·상식에 의존한 내용
 - 경로는 모두 `src/` 기준이고 줄 번호는 해당 파일 기준이다.

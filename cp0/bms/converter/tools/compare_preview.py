@@ -1,6 +1,6 @@
 r"""렌더링한 곡과 게임 미리듣기(_pre.2dx 추출본)를 상호상관으로 비교.
 
-python -I tools\compare_preview.py <render.wav> <preview.wav>
+python -I cp0\bms\converter\tools\compare_preview.py <render.wav> <preview.wav>
 
 출력: 미리듣기가 렌더 안에서 시작하는 위치(초), 정규화 상관계수(전체),
       1초 창마다의 국소 지연(샘플) → 위치가 구간마다 흔들리는지(박 위치 복원 오류) 확인.
