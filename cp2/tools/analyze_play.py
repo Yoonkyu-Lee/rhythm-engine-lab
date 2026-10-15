@@ -48,12 +48,24 @@ def main():
     run = pathlib.Path(a.run)
     meta = json.loads((run / "meta.json").read_text(encoding="utf-8"))
     rate, origin, gain = meta["rate"], meta["origin"], meta["master_gain"]
-    ref = reference(meta, a.render_exe) * np.float32(gain)
-    # 정답을 스트림 프레임 좌표로: 곡 시간 0 = 스트림 프레임 origin
-    stream = np.zeros((origin + len(ref), 2), np.float32)
-    stream[origin:] = ref
+    if "gain" in (run / "mix_events.csv").open(encoding="utf-8").readline():
+        # 믹서 사건 로그로 실제 출력 스트림을 재구성 (어떤 정책·입력이든 "냈다고 한 것"과 "나간 것"을 비교)
+        rs = run / "restream.wav"
+        if not rs.exists():
+            chart = pathlib.Path(meta["chart"])
+            chart = chart if chart.is_absolute() else CP2 / chart
+            subprocess.run([str(pathlib.Path(a.render_exe).with_name("restream.exe")), str(chart), str(run / "mix_events.csv"), str(rate), str(gain), str(rs)],
+                           check=True, capture_output=True)
+        stream = read_wav_f32(rs).astype(np.float32)
+        res_ref = "restream"
+    else:
+        ref = reference(meta, a.render_exe) * np.float32(gain)
+        # 정답을 스트림 프레임 좌표로: 곡 시간 0 = 스트림 프레임 origin
+        stream = np.zeros((origin + len(ref), 2), np.float32)
+        stream[origin:] = ref
+        res_ref = "perfect_render"
     cap = np.fromfile(run / "capture_2ch.f32", "<f4").reshape(-1, 2)
-    res = {"run": run.name, "rate": rate, "capture_frames": len(cap), "stream_frames": int(meta["written"])}
+    res = {"run": run.name, "reference": res_ref, "rate": rate, "capture_frames": len(cap), "stream_frames": int(meta["written"])}
 
     # 2. 전체 어긋남: 녹음의 앞 20초를 스트림의 앞 22초와
     seg = min(len(cap), 20 * rate)

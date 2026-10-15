@@ -7,7 +7,7 @@
 //! - 이 스레드는 할당·잠금·파일 작업을 하지 않는다 (링이 가득 차면 버리고 센다).
 //! - 마스터 이득: 섞은 뒤 곱한다 (헤드룸 정책은 main이 정함).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -85,7 +85,25 @@ pub struct AudioStats {
     pub mix_lost: u64,
 }
 
+/// 화면 HUD·렉 감지가 읽는 오디오 상태 (오디오 스레드가 원자 변수로만 쓴다).
+#[derive(Default)]
+pub struct AudioMonitor {
+    pub blocks: AtomicU64,
+    /// 버퍼가 비어 있던(padding 0) 블록 수 = 언더런 의심.
+    pub underruns: AtomicU64,
+    /// 블록 사이 깨어난 간격의 최댓값 (µs). 읽는 쪽이 0으로 되돌린다.
+    pub max_wake_gap_us: AtomicU64,
+    pub voices: AtomicU64,
+    /// 늦게 시작한 키음 수와 마지막 지각량 (프레임).
+    pub late_player: AtomicU64,
+    pub last_player_late: AtomicI64,
+    pub written: AtomicI64,
+    /// 고장 주입: 0이 아니면 다음 깨어날 때 그만큼(ms) 버퍼를 채우지 않고 잔다.
+    pub inject_stall_ms: std::sync::atomic::AtomicU32,
+}
+
 pub struct AudioHandles {
+    pub monitor: Arc<AudioMonitor>,
     pub info: AudioInfo,
     pub clock: Arc<SharedClock>,
     pub done: Arc<AtomicBool>,
@@ -115,6 +133,8 @@ pub fn spawn(
     let done = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
+    let monitor = Arc::new(AudioMonitor::default());
+    let mon = monitor.clone();
     let (info_tx, info_rx) = std::sync::mpsc::channel::<Result<AudioInfo, String>>();
     let (clock2, done2) = (clock.clone(), done.clone());
     let join = thread::Builder::new()
@@ -191,6 +211,12 @@ pub fn spawn(
                         rc.ReleaseBuffer(n, 0)?;
                     }
                     mixer.drain_each(|e| {
+                        if let MixEvent::Start { late, player: true, .. } = e {
+                            if late > 0 {
+                                mon.late_player.fetch_add(1, Ordering::Relaxed);
+                                mon.last_player_late.store(late, Ordering::Relaxed);
+                            }
+                        }
                         if !mix.push(e) {
                             st.mix_lost += 1;
                         }
@@ -202,10 +228,16 @@ pub fn spawn(
                 let fill_ns = fill(s.buffer_frames, &mut written, &mut mixer, &mut st)?;
                 let _ = blocks.push(BlockLog { qpc_wake: qpc::now(), written: 0, padding: 0, frames: s.buffer_frames, fill_ns, ..Default::default() });
                 unsafe { s.client.Start()? };
+                let mut prev_wake = qpc::now();
                 while written < end && !stop2.load(Ordering::Relaxed) {
                     unsafe { WaitForSingleObject(s.event, 2000) };
                     let wake = qpc::now();
                     let mut injected = 0u16;
+                    let req = mon.inject_stall_ms.swap(0, Ordering::AcqRel);
+                    if req > 0 {
+                        thread::sleep(Duration::from_millis(req as u64));
+                        injected += req as u16;
+                    }
                     let song_s = (written - origin) as f64 / rate as f64;
                     for (i, f) in cfg.faults.iter().enumerate() {
                         if !fired[i] && song_s >= f.at_s {
@@ -225,6 +257,15 @@ pub fn spawn(
                         obs.push(frame, qpos as i64);
                     }
                     st.blocks += 1;
+                    mon.blocks.fetch_add(1, Ordering::Relaxed);
+                    if pad == 0 {
+                        mon.underruns.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let gap_us = ((wake - prev_wake) * 1_000_000 / qpc::frequency()) as u64;
+                    prev_wake = wake;
+                    mon.max_wake_gap_us.fetch_max(gap_us, Ordering::Relaxed);
+                    mon.voices.store(mixer.active_voices() as u64, Ordering::Relaxed);
+                    mon.written.store(written, Ordering::Relaxed);
                     let log = BlockLog {
                         qpc_wake: wake,
                         written: before,
@@ -258,5 +299,5 @@ pub fn spawn(
         })
         .map_err(|e| e.to_string())?;
     let info = info_rx.recv().map_err(|_| "오디오 스레드가 시작 정보를 보내지 못함".to_string())??;
-    Ok(AudioHandles { info, clock, done, stop, join })
+    Ok(AudioHandles { monitor, info, clock, done, stop, join })
 }

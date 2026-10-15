@@ -8,7 +8,12 @@
 //! 출력: runs/<tag>-<시각>/ meta.json, audio_blocks.csv, mix_events.csv, capture_2ch.f32, capture_packets.csv
 
 mod audio;
+mod bot;
 mod capture;
+mod game;
+mod input;
+mod judging;
+mod render;
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -27,7 +32,7 @@ pub(crate) fn arg(args: &[String], key: &str, default: &str) -> String {
     args.iter().position(|a| a == key).and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| default.to_string())
 }
 
-fn flag(args: &[String], key: &str) -> bool {
+pub(crate) fn flag(args: &[String], key: &str) -> bool {
     args.iter().any(|a| a == key)
 }
 
@@ -35,8 +40,9 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let r = match args.get(1).map(String::as_str) {
         Some("play") => play(&args),
+        Some("run") => game::run(&args),
         _ => {
-            eprintln!("사용법: cp2game play <곡.rtc> [--autoplay-notes] [--faults 30:150] [--out runs]");
+            eprintln!("사용법: cp2game run <곡.rtc> [--bot] [--faults audio@30:150,...] | cp2game play <곡.rtc> [--autoplay-notes]");
             Ok(())
         }
     };
@@ -47,7 +53,7 @@ fn main() {
 }
 
 /// 헤드룸 정책: 정답 렌더의 최댓값이 −1 dBFS를 넘으면 그만큼 줄인다 (곡마다 고정, 플레이 중 바꾸지 않음).
-fn master_gain(c: &runtime::Compiled) -> (f32, f32) {
+pub(crate) fn master_gain(c: &runtime::Compiled) -> (f32, f32) {
     let (pcm, _) = render_perfect(c, 4096);
     let peak = pcm.iter().fold(0f32, |m, &x| m.max(x.abs()));
     let limit = 10f32.powf(-1.0 / 20.0);
@@ -131,7 +137,7 @@ fn play(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut fb = BufWriter::new(File::create(out.join("audio_blocks.csv"))?);
     writeln!(fb, "qpc_wake,written,padding,frames,dev_frame,dev_qpc100,fill_ns,voices,injected_ms")?;
     let mut fm = BufWriter::new(File::create(out.join("mix_events.csv"))?);
-    writeln!(fm, "kind,sound,due,start,block,late,player")?;
+    writeln!(fm, "kind,sound,due,start,block,late,player,gain")?;
     let secs_limit: f64 = arg(args, "--secs", "0").parse()?;
     let mut n_blocks = 0u64;
     let mut secs_limit_hit = false;
@@ -143,9 +149,9 @@ fn play(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         while let Some(e) = mix_rx.pop() {
             match e {
-                MixEvent::Start { sound, due, start, block, late, player } => writeln!(fm, "start,{sound},{due},{start},{block},{late},{}", player as u8)?,
-                MixEvent::Dropped { sound, due, block, player } => writeln!(fm, "dropped,{sound},{due},,{block},,{}", player as u8)?,
-                MixEvent::Overflow { sound, due, player } => writeln!(fm, "overflow,{sound},{due},,,,{}", player as u8)?,
+                MixEvent::Start { sound, due, start, block, late, player, gain } => writeln!(fm, "start,{sound},{due},{start},{block},{late},{},{gain}", player as u8)?,
+                MixEvent::Dropped { sound, due, block, player } => writeln!(fm, "dropped,{sound},{due},,{block},,{},", player as u8)?,
+                MixEvent::Overflow { sound, due, player } => writeln!(fm, "overflow,{sound},{due},,,,{},", player as u8)?,
             }
         }
         if finished {

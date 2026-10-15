@@ -22,15 +22,21 @@ pub enum Late {
     Drop,
 }
 
+/// 늦은 소리의 처리를 출처별로 정한다.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LatePolicy {
+    /// 플레이어가 친 키음 (설계안 8-3 최소 지연 모드: 가장 이른 안전한 프레임에 처음부터 = PlayWhole).
+    /// 앞부분을 자르면 소리의 어택이 사라진다 (CP2 2-2에서 2초 넘는 키음이 잘리는 것으로 발견).
+    pub player: Late,
+    /// 자동재생의 짧은 소리.
     pub short: Late,
+    /// 자동재생의 긴 소리 (반주): 박자를 지키도록 자르기 (CP1 3-3).
     pub long: Late,
 }
 
 impl LatePolicy {
-    /// 설계안 기본값 후보: 긴 반주는 자르기(CP1 3-3), 짧은 키음은 CP2 2-5에서 정한다 (임시: 처음부터).
-    pub const DEFAULT: LatePolicy = LatePolicy { short: Late::PlayWhole, long: Late::CutFront };
+    /// 자동재생 짧은 소리는 CP2 2-5에서 정한다 (임시: 처음부터).
+    pub const DEFAULT: LatePolicy = LatePolicy { player: Late::PlayWhole, short: Late::PlayWhole, long: Late::CutFront };
 }
 
 /// 보이스 하나. `start`는 소리의 0번 샘플이 놓인 스트림 프레임 (자르기면 블록보다 앞일 수 있음).
@@ -46,7 +52,7 @@ struct Voice {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MixEvent {
     /// 소리를 올렸다. `late` = 블록 시작 − 예정 시작 (프레임, 0 이하면 제때).
-    Start { sound: u32, due: i64, start: i64, block: i64, late: i64, player: bool },
+    Start { sound: u32, due: i64, start: i64, block: i64, late: i64, player: bool, gain: f32 },
     /// 늦어서 버렸다.
     Dropped { sound: u32, due: i64, block: i64, player: bool },
     /// 보이스 풀이 가득 차서 올리지 못했다.
@@ -131,9 +137,10 @@ impl<'a> Mixer<'a> {
         let start = if late <= 0 {
             due
         } else {
-            let p = match self.c.chart.bank.sounds[sound as usize].kind {
-                SoundKind::Long => self.late.long,
-                SoundKind::Short => self.late.short,
+            let p = match (player, self.c.chart.bank.sounds[sound as usize].kind) {
+                (true, _) => self.late.player,
+                (false, SoundKind::Long) => self.late.long,
+                (false, SoundKind::Short) => self.late.short,
             };
             match p {
                 Late::CutFront => due,
@@ -155,7 +162,7 @@ impl<'a> Mixer<'a> {
             return;
         }
         self.voices.push(Voice { sound, start, gain, end: start + frames });
-        self.log(MixEvent::Start { sound, due, start, block, late, player });
+        self.log(MixEvent::Start { sound, due, start, block, late, player, gain });
     }
 
     /// 스트림 프레임 [block, block + n)을 채운다. `out`은 출력 채널 수(`out_ch`)만큼 끼워 넣은 버퍼이고 0으로 초기화돼 있어야 한다.
@@ -306,14 +313,14 @@ mod tests {
     #[test]
     fn late_policies() {
         let c = compile(tiny()).unwrap();
-        let mut m = Mixer::new(&c, 0, LatePolicy { short: Late::Drop, long: Late::CutFront }, 64);
+        let mut m = Mixer::new(&c, 0, LatePolicy { player: Late::Drop, short: Late::Drop, long: Late::CutFront }, 64);
         let mut out = vec![0f32; 100 * 2];
         // 블록 1,000부터 시작: 긴 소리(0프레임 예정)는 잘라서 원래 자리, 짧은 소리 요청(900)은 버림
         m.play_note(0, 0, 900);
         m.fill(&mut out, 2, 1000, 100);
         let mut log = Vec::new();
         m.drain_events(&mut log);
-        assert!(log.contains(&MixEvent::Start { sound: 2, due: 0, start: 0, block: 1000, late: 1000, player: false }));
+        assert!(log.contains(&MixEvent::Start { sound: 2, due: 0, start: 0, block: 1000, late: 1000, player: false, gain: 1.0 }));
         assert!(log.contains(&MixEvent::Dropped { sound: 1, due: 900, block: 1000, player: true }));
         let s2 = (c.chart.bank.sounds[2].offset as usize + 1000) * 2;
         assert_eq!(out[0], c.chart.bank.pcm[s2]);
