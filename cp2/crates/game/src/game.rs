@@ -36,6 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::audio::{self, AudioCfg};
 use crate::bot::{self, BotCfg, BotLog, BOT_KEY};
 use crate::judging::{self, JudgeCfg, JudgeLog};
+use crate::monitor::{self, Heartbeats, LagEvent, MonitorShared, LAG_NAMES, STATE_NAMES};
 use crate::render::{D3D11Renderer, DrawList, FrameTiming, Renderer, Rgba};
 use crate::{arg, capture, flag};
 
@@ -148,6 +149,7 @@ struct Logs {
     judge: Consumer<JudgeLog>,
     bot: Consumer<BotLog>,
     frames: Consumer<FrameLog>,
+    lags: Consumer<LagEvent>,
 }
 
 /// 기록 스레드: 링을 비워 CSV로 쓴다. 실시간 스레드는 파일을 만지지 않는다.
@@ -160,7 +162,9 @@ fn spawn_logger(dir: PathBuf, mut l: Logs, stop: Arc<AtomicBool>) -> thread::Joi
             let mut fm = BufWriter::new(File::create(dir.join("mix_events.csv"))?);
             writeln!(fm, "kind,sound,due,start,block,late,player,gain")?;
             let mut fj = BufWriter::new(File::create(dir.join("judgments.csv"))?);
-            writeln!(fj, "kind,note,grade,err_ns,t_ns,q_in,q_proc,vkey,key_frame")?;
+            writeln!(fj, "kind,note,grade,err_ns,t_ns,q_in,q_proc,vkey,key_frame,state")?;
+            let mut fl = BufWriter::new(File::create(dir.join("lag_events.csv"))?);
+            writeln!(fl, "kind,name,q_start,q_detect,q_end,magnitude_us")?;
             let mut fo = BufWriter::new(File::create(dir.join("bot.csv"))?);
             writeln!(fo, "note,down,target_ns,q_target,q_sent")?;
             let mut ff = BufWriter::new(File::create(dir.join("frames.csv"))?);
@@ -178,7 +182,10 @@ fn spawn_logger(dir: PathBuf, mut l: Logs, stop: Arc<AtomicBool>) -> thread::Joi
                     }
                 }
                 while let Some(j) = l.judge.pop() {
-                    writeln!(fj, "{},{},{},{},{},{},{},{},{}", j.kind, j.note, j.grade, j.err_ns, j.t_ns, j.q_in, j.q_proc, j.vkey, j.key_frame)?;
+                    writeln!(fj, "{},{},{},{},{},{},{},{},{},{}", j.kind, j.note, j.grade, j.err_ns, j.t_ns, j.q_in, j.q_proc, j.vkey, j.key_frame, j.state)?;
+                }
+                while let Some(e) = l.lags.pop() {
+                    writeln!(fl, "{},{},{},{},{},{}", e.kind, LAG_NAMES[e.kind as usize], e.q_start, e.q_detect, e.q_end, e.magnitude_us)?;
                 }
                 while let Some(o) = l.bot.pop() {
                     writeln!(fo, "{},{},{},{},{}", o.note, o.down as u8, o.target_ns, o.q_target, o.q_sent)?;
@@ -196,7 +203,7 @@ fn spawn_logger(dir: PathBuf, mut l: Logs, stop: Arc<AtomicBool>) -> thread::Joi
                 }
                 thread::sleep(Duration::from_millis(20));
             }
-            for f in [&mut fb, &mut fm, &mut fj, &mut fo, &mut ff] {
+            for f in [&mut fb, &mut fm, &mut fj, &mut fo, &mut ff, &mut fl] {
                 f.flush()?;
             }
             Ok(())
@@ -252,6 +259,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (jl_tx, jl_rx) = ring::<JudgeLog>(1 << 13);
     let (bot_tx, bot_rx) = ring::<BotLog>(1 << 13);
     let (fr_tx, fr_rx) = ring::<FrameLog>(1 << 14);
+    let (lag_tx, lag_rx) = ring::<LagEvent>(4096);
     let mut fr_tx = fr_tx;
 
     let a = audio::spawn(
@@ -264,6 +272,9 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (origin, rate) = (a.info.origin, a.info.rate);
     let input = crate::input::Input::spawn(kev_tx)?;
     let stop = Arc::new(AtomicBool::new(false));
+    let beats = Arc::new(Heartbeats::default());
+    let mon = Arc::new(MonitorShared::default());
+    let monitor_join = monitor::spawn(mon.clone(), a.monitor.clone(), a.clock.clone(), input.watermark.clone(), beats.clone(), lag_tx, stop.clone());
     let keys = vec![BOT_KEY, 0x20, b'J' as u16, b'F' as u16];
     let windows_cfg = Windows::CP2;
     let (judge, judge_join) = judging::spawn(
@@ -275,6 +286,8 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         key_tx,
         jl_tx,
         stop.clone(),
+        beats.clone(),
+        mon.clone(),
     );
     let bot_join = use_bot.then(|| {
         let cfg = BotCfg {
@@ -288,7 +301,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         bot::spawn(chart.clone(), cfg, a.clock.clone(), bot_tx, stop.clone())
     });
     let log_stop = Arc::new(AtomicBool::new(false));
-    let logger = spawn_logger(dir.clone(), Logs { blocks: blk_rx, mix: mix_rx, judge: jl_rx, bot: bot_rx, frames: fr_rx }, log_stop.clone());
+    let logger = spawn_logger(dir.clone(), Logs { blocks: blk_rx, mix: mix_rx, judge: jl_rx, bot: bot_rx, frames: fr_rx, lags: lag_rx }, log_stop.clone());
     let mut flog = BufWriter::new(File::create(dir.join("faults.csv"))?);
     writeln!(flog, "kind,at_song_s,ms,q,source")?;
 
@@ -310,6 +323,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut audio_gap_ms = 0.0;
     while !quit {
         let (_ws, we) = rend.wait();
+        beats.render.store(we, Ordering::Release);
         let gap = (we - prev_wait_end) as f64 * 1e3 / qf as f64;
         prev_wait_end = we;
         cur_max_gap = cur_max_gap.max(gap);
@@ -424,10 +438,35 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 judge.violations.load(Ordering::Relaxed),
                 input.lost.load(Ordering::Relaxed)
             ),
+            format!(
+                "감지: 오디오 정지 {} · 언더런 {} · 시계 점프 {} · 화면 정지 {} · 판정 정지 {} · 입력 정지 {}",
+                mon.counts[0].load(Ordering::Relaxed),
+                mon.counts[1].load(Ordering::Relaxed),
+                mon.counts[2].load(Ordering::Relaxed),
+                mon.counts[3].load(Ordering::Relaxed),
+                mon.counts[4].load(Ordering::Relaxed),
+                mon.counts[5].load(Ordering::Relaxed)
+            ),
             format!("고장: F1 오디오 150 ms · F2 화면 300 ms · F3 판정 300 ms · F4 입력 300 ms · Esc 끝"),
         ];
         for (i, s) in lines.iter().enumerate() {
             list.text(16.0, 12.0 + i as f32 * 22.0, 15.0, hud, s.as_str());
+        }
+        // 상태와 최근 렉 사건 (감지까지 걸린 시간, 길이)
+        let st_now = mon.state.load(Ordering::Relaxed);
+        let st_col = [Rgba(0.4, 0.9, 0.5, 1.0), Rgba(1.0, 0.8, 0.3, 1.0), Rgba(1.0, 0.4, 0.4, 1.0)][st_now as usize];
+        let base_y = 12.0 + lines.len() as f32 * 22.0 + 8.0;
+        list.text(16.0, base_y, 22.0, st_col, STATE_NAMES[st_now as usize]);
+        if let Ok(r) = mon.recent.lock() {
+            for (i, e) in r.iter().rev().enumerate() {
+                let s = match e.kind {
+                    6 => format!("상태 → {}", STATE_NAMES[e.magnitude_us as usize]),
+                    2 | 7 => format!("{} {:+.1} ms", LAG_NAMES[e.kind as usize], e.magnitude_us as f64 / 1e3),
+                    1 => LAG_NAMES[1].to_string(),
+                    k => format!("{} {:.0} ms (감지 {:.0} ms 뒤)", LAG_NAMES[k as usize], e.magnitude_us as f64 / 1e3, (e.q_detect - e.q_start) as f64 * 1e3 / qf as f64),
+                };
+                list.text(16.0, base_y + 34.0 + i as f32 * 20.0, 14.0, Rgba(0.9, 0.7, 0.5, 1.0), s);
+            }
         }
         rend.draw(&list)?;
         let ft = rend.present(vsync);
@@ -454,6 +493,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     stop.store(true, Ordering::Release);
     let st = a.join.join().map_err(|_| "오디오 스레드 패닉")??;
     let judge_lost = judge_join.join().map_err(|_| "판정 스레드 패닉")?;
+    let _ = monitor_join.join();
     if let Some(b) = bot_join {
         let _ = b.join();
     }
@@ -470,7 +510,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let t = &view.tally;
     let snap = a.clock.load();
     let meta = format!(
-        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"ours\",\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"origin\": {origin}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
+        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"ours\",\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"origin\": {origin}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"lag_counts\": [{}],\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
         path.replace('\\', "/"),
         chart.hash,
         chart.chart.title,
@@ -487,6 +527,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         st.overflows,
         st.log_lost,
         st.mix_lost,
+        mon.counts.iter().map(|c| c.load(Ordering::Relaxed).to_string()).collect::<Vec<_>>().join(", "),
         t.perfect,
         t.great,
         t.good,

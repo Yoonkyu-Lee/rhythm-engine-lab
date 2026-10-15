@@ -13,6 +13,7 @@ mod capture;
 mod game;
 mod input;
 mod judging;
+mod monitor;
 mod render;
 
 use std::fs::{self, File};

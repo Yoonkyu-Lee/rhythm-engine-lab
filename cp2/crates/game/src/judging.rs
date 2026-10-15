@@ -38,6 +38,8 @@ pub struct JudgeLog {
     pub vkey: u16,
     /// 요청한 키음 목표 스트림 프레임 (없으면 −1).
     pub key_frame: i64,
+    /// 판정할 때의 게임 상태 (0 Running, 1 Suspect, 2 Resyncing).
+    pub state: u8,
 }
 
 /// 화면이 읽는 판정 상태 (자주 바뀌지 않으므로 잠금으로 충분: 판정 스레드는 try_lock만 한다).
@@ -94,6 +96,8 @@ pub fn spawn(
     mut key_out: Producer<KeyReq>,
     mut log: Producer<JudgeLog>,
     stop: Arc<AtomicBool>,
+    beats: Arc<crate::monitor::Heartbeats>,
+    monitor: Arc<crate::monitor::MonitorShared>,
 ) -> (Arc<JudgeShared>, JoinHandle<u64>) {
     let shared = Arc::new(JudgeShared {
         view: Mutex::new(JudgeView { next_note: vec![0; chart.chart.lanes.len()], ..Default::default() }),
@@ -115,7 +119,8 @@ pub fn spawn(
             let mut pressed = false;
             let mut last: Option<(u8, i64)> = None;
             let freq = qpc::frequency();
-            let emit = |log: &mut Producer<JudgeLog>, lost: &mut u64, l: JudgeLog| {
+            let emit = |log: &mut Producer<JudgeLog>, lost: &mut u64, mut l: JudgeLog| {
+                l.state = monitor.state.load(Ordering::Relaxed);
                 if !log.push(l) {
                     *lost += 1;
                 }
@@ -131,6 +136,7 @@ pub fn spawn(
                         }
                     }
                 }
+                beats.judge.store(qpc::now(), Ordering::Release);
                 let req = sh.inject_stall_ms.swap(0, Ordering::AcqRel);
                 if req > 0 {
                     thread::sleep(Duration::from_millis(req as u64));
@@ -170,7 +176,7 @@ pub fn spawn(
                         if kind == 0 {
                             last = Some((grade as u8, err));
                         }
-                        emit(&mut log, &mut lost, JudgeLog { kind, note, grade: grade as u8, err_ns: err, t_ns: t, q_in, q_proc, vkey: ev.vkey, key_frame });
+                        emit(&mut log, &mut lost, JudgeLog { kind, note, grade: grade as u8, err_ns: err, t_ns: t, q_in, q_proc, vkey: ev.vkey, key_frame, state: 0 });
                     } else {
                         pressed = false;
                         if let Some(Judged::LongEnd { note, ok, err }) = lane.release(notes, &cfg.windows, t) {
@@ -198,6 +204,7 @@ pub fn spawn(
                                     Judged::LongEnd { note, ok, err } => JudgeLog { kind: if ok { 3 } else { 4 }, note, err_ns: err, t_ns: wm_song, q_in: wm_q, q_proc, key_frame: -1, ..Default::default() },
                                     _ => return,
                                 };
+                                let l = JudgeLog { state: monitor.state.load(Ordering::Relaxed), ..l };
                                 if !log.push(l) {
                                     lost += 1;
                                 }

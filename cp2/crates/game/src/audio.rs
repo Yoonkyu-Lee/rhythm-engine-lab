@@ -98,6 +98,8 @@ pub struct AudioMonitor {
     pub late_player: AtomicU64,
     pub last_player_late: AtomicI64,
     pub written: AtomicI64,
+    /// 맥박: 마지막으로 깨어난 QPC (감시 스레드가 오디오 정지를 알아챈다).
+    pub last_wake_qpc: AtomicI64,
     /// 고장 주입: 0이 아니면 다음 깨어날 때 그만큼(ms) 버퍼를 채우지 않고 잔다.
     pub inject_stall_ms: std::sync::atomic::AtomicU32,
 }
@@ -232,6 +234,7 @@ pub fn spawn(
                 while written < end && !stop2.load(Ordering::Relaxed) {
                     unsafe { WaitForSingleObject(s.event, 2000) };
                     let wake = qpc::now();
+                    mon.last_wake_qpc.store(wake, Ordering::Release);
                     let mut injected = 0u16;
                     let req = mon.inject_stall_ms.swap(0, Ordering::AcqRel);
                     if req > 0 {

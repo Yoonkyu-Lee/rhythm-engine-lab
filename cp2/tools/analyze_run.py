@@ -89,6 +89,46 @@ def main():
     fl = run / "faults.csv"
     rep["faults"] = [ln for ln in fl.read_text(encoding="utf-8").splitlines()[1:]] if fl.exists() else []
 
+    # 렉 감지: 주입(faults.csv)과 감지(lag_events.csv)를 맞댄다
+    lag_path = run / "lag_events.csv"
+    if lag_path.exists():
+        names = {0: "AudioStall", 1: "Underrun", 2: "ClockJump", 3: "RenderStall", 4: "JudgeStall", 5: "InputStall", 6: "State", 7: "ResyncDone"}
+        want = {"Audio": 0, "Render": 3, "Judge": 4, "Input": 5}
+        ev = [ln.split(",") for ln in lag_path.read_text(encoding="utf-8").splitlines()[1:]]
+        ev = [(int(k), int(qs), int(qd), int(qe), int(mg)) for k, _, qs, qd, qe, mg in ev]
+        used, matches = set(), []
+        for ln in rep["faults"]:
+            kind, at_s, ms_, q, src = ln.split(",")
+            q, ms_ = int(q), int(ms_)
+            k = want[kind]
+            cand = [i for i, e in enumerate(ev) if e[0] == k and i not in used and e[1] >= q - qf // 20 and e[1] <= q + qf]
+            m = {"kind": kind, "at_song_s": float(at_s), "injected_ms": ms_}
+            if cand:
+                i = cand[0]
+                used.add(i)
+                e = ev[i]
+                m.update(detected=True, detect_after_stall_ms=round((e[2] - e[1]) * 1e3 / qf, 2), detect_after_inject_ms=round((e[2] - q) * 1e3 / qf, 2),
+                         measured_ms=round(e[4] / 1e3, 1))
+                if kind == "Audio":
+                    jumps = [x for x in ev if x[0] == 2 and x[1] >= e[1] and x[1] <= e[1] + qf]
+                    unders = [x for x in ev if x[0] == 1 and x[1] >= e[1] - qf // 100 and x[1] <= e[1] + qf]
+                    done = [x for x in ev if x[0] == 7 and x[1] >= e[1] and x[1] <= e[1] + 3 * qf]
+                    m.update(underrun_seen=bool(unders), clock_jump_ms=round(jumps[0][4] / 1e3, 2) if jumps else None,
+                             clock_jump_after_inject_ms=round((jumps[0][2] - q) * 1e3 / qf, 1) if jumps else None,
+                             resync_total_ms=round(done[0][4] / 1e3, 2) if done else None,
+                             resync_done_after_inject_ms=round((done[0][2] - q) * 1e3 / qf, 1) if done else None)
+                    for x in jumps[:1] + unders[:1]:
+                        used.add(ev.index(x))
+            else:
+                m.update(detected=False)
+            matches.append(m)
+        stalls = [i for i, e in enumerate(ev) if e[0] in (0, 3, 4, 5) and i not in used]
+        states = [e for e in ev if e[0] == 6]
+        rep["lag"] = {"matches": matches, "unmatched_stalls": [{"kind": names[ev[i][0]], "ms": round(ev[i][4] / 1e3, 1)} for i in stalls],
+                      "state_changes": len(states)}
+        jstate = j["state"] if "state" in j.dtype.names else np.zeros(len(j), int)
+        rep["judgments_not_running"] = int(np.sum(jstate != 0))
+
     if not a.no_audio and (run / "capture_2ch.f32").exists():
         r = subprocess.run([sys.executable, "-I", "-X", "utf8", str(HERE / "analyze_play.py"), str(run)], capture_output=True, text=True, encoding="utf-8")
         print(r.stdout.strip())
@@ -102,6 +142,15 @@ def main():
     if "input_stamp_minus_sent_ms" in rep:
         print(f"입력 경로: 봇 송신 정확도 {fmt(rep['bot_send_minus_target_ms'])}, 송신 → 입력 도장 {fmt(rep['input_stamp_minus_sent_ms'])}")
         print(f"키음: 믹서 지각 {fmt(rep['keysound_mixer_late_ms'])}, 송신 → 장치 출력 {fmt(rep['keysound_sent_to_device_ms'])}")
+    if "lag" in rep:
+        for m in rep["lag"]["matches"]:
+            if m["detected"]:
+                extra = (f", 언더런 {'예' if m.get('underrun_seen') else '아니오'}, 첫 시계 점프 {m.get('clock_jump_ms')} ms ({m.get('clock_jump_after_inject_ms')} ms 뒤),"
+                         f" 재동기화 완료 총 밀림 {m.get('resync_total_ms')} ms ({m.get('resync_done_after_inject_ms')} ms 뒤)") if m["kind"] == "Audio" else ""
+                print(f"렉 {m['kind']} {m['injected_ms']} ms @ {m['at_song_s']:.1f}s: 감지 (멈춘 뒤 {m['detect_after_stall_ms']} ms), 잰 길이 {m['measured_ms']} ms{extra}")
+            else:
+                print(f"렉 {m['kind']} {m['injected_ms']} ms @ {m['at_song_s']:.1f}s: 감지 못함")
+        print(f"  짝 없는 감지(오탐 후보) {rep['lag']['unmatched_stalls']}, 상태 변화 {rep['lag']['state_changes']}회, Running 아닌 동안의 판정 {rep['judgments_not_running']}")
     print(f"화면: {rep['fps_mean']} fps, 프레임 간격 {fmt(rep['frame_interval_ms'])}, present {fmt(rep['present_ms'])}, DXGI 통계 {rep['dxgi_stats_frames']}/{len(we)} 프레임")
 
 

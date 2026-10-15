@@ -106,6 +106,21 @@ pub fn spawn(chart: Arc<Compiled>, cfg: BotCfg, clock: Arc<SharedClock>, mut log
                         _ => thread::sleep(Duration::from_millis(20)),
                     }
                 };
+                // 기다리는 동안에도 시계를 다시 읽는다: 언더런으로 음악이 밀리면 누를 시각도 같이 밀린다 (음악을 따라 치는 플레이어)
+                let mut q = q;
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Some(nq) = qpc_for_song(&clock, t, &cfg) {
+                        q = nq;
+                    }
+                    let left = q - qpc::now();
+                    if left <= 3 * qpc::frequency() / 1000 {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
                 if !wait_until(q, &stop) {
                     return;
                 }
