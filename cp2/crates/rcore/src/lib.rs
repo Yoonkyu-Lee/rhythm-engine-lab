@@ -2,5 +2,6 @@
 //!
 //! 코어는 기존 게임 형식(BMS 채널·소절·WAV ID 등)을 모른다. 기존 곡은 코어 밖 어댑터가 실행 데이터로 바꿔 넣는다.
 
+pub mod mixer;
 pub mod rtc;
 pub mod runtime;
