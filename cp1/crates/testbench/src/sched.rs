@@ -29,6 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use synchronizer::clock::ClockPolicy;
 use synchronizer::shared_clock::{obs_ring, spawn_clock_thread, SharedClock};
+use synchronizer::timeline::ContentSkip;
 use synchronizer::qpc;
 use synchronizer::scheduler::{Cmd, LatePolicy, Mixer};
 use synchronizer::wasapi::{self, IAudioClock, IAudioRenderClient, Stream};
@@ -136,6 +137,12 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let faults = parse_faults(&arg(args, "--faults", ""))?;
     let render_name = arg(args, "--render", "Playback 1/2");
     let wmode = wasapi::Mode::parse(&arg(args, "--wasapi", "shared")).ok_or("--wasapi shared|lowlat|exclusive")?;
+    // 오디오 정지 정책 (CP1-4): skip = 콘텐츠를 건너뛰어 시간축을 잇는다(기본), push = 스트림이 밀리는 대로 둔다(CP1 기존)
+    let skip = match arg(args, "--audio-stall", "skip").as_str() {
+        "skip" => true,
+        "push" => false,
+        m => return Err(format!("--audio-stall skip|push: {m}").into()),
+    };
     let capture_name = arg(args, "--capture", "Loopback 1/2");
     let unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let tag = match mode {
@@ -162,7 +169,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let ren = {
         let (out, name, clock, done) = (out.clone(), render_name.clone(), clock.clone(), render_done.clone());
         let fa: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'A').collect();
-        thread::spawn(move || render_loop(&name, wmode, &out, secs, late, noise_s, fa, rx, clock, done))
+        thread::spawn(move || render_loop(&name, wmode, skip, &out, secs, late, noise_s, fa, rx, clock, done))
     };
     let fb: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'B').collect();
     let probe_hz: f64 = arg(args, "--probe-hz", "0").parse()?;
@@ -289,14 +296,15 @@ pub(crate) fn game_loop(
 
 #[allow(clippy::too_many_arguments)]
 fn render_loop(
-    name: &str, wmode: wasapi::Mode, out: &Path, secs: f64, late: LatePolicy, noise_s: f64, faults: Vec<Fault>, rx: Receiver<Cmd>,
+    name: &str, wmode: wasapi::Mode, skip: bool, out: &Path, secs: f64, late: LatePolicy, noise_s: f64, faults: Vec<Fault>, rx: Receiver<Cmd>,
     clock: Arc<SharedClock>, done: Arc<AtomicBool>,
 ) -> Result<Meta, String> {
     let r = (|| -> Result<Meta, Box<dyn std::error::Error>> {
         wasapi::com_init()?;
         let mmcss = wasapi::mmcss_pro_audio();
         let ep = wasapi::find(false, name)?;
-        let s = Stream::open_mode(&ep.device, wmode)?;
+        let excl_period: Option<i64> = std::env::var("CP1_EXCL_PERIOD_MS").ok().and_then(|v| v.parse::<f64>().ok()).map(|ms| (ms * 1e4) as i64);
+        let s = Stream::open_mode_period(&ep.device, wmode, excl_period)?;
         if s.channels < 2 {
             return Err(format!("스테레오가 아님: {} ch", s.channels).into());
         }
@@ -335,12 +343,15 @@ fn render_loop(
         pilots.flush()?;
 
         let mut written: u64 = 0;
-        let mut fill = |n: u32, written: &mut u64, mixer: &mut Mixer| -> Result<(), Box<dyn std::error::Error>> {
+        // 시간축 = 스트림 + offset. 오디오가 멈춰 장치가 뒤처지면 offset을 늘려 콘텐츠를 건너뛴다 (2 ms 넘게 뒤처졌을 때만: 위치 보고의 1 ms 톱니보다 크게)
+        let mut cskip = ContentSkip::new(0.002 * rate as f64);
+        let mut fill = |n: u32, written: &mut u64, off: i64, mixer: &mut Mixer| -> Result<(), Box<dyn std::error::Error>> {
             let buf = &mut scratch[..n as usize * ch];
             buf.fill(0.0);
-            mixer.fill(buf, ch, *written, n as usize, &rx);
+            let tl = (*written as i64 + off) as u64; // 이 블록의 시간축 프레임
+            mixer.fill(buf, ch, tl, n as usize, &rx);
             for i in 0..n as u64 {
-                let f = *written + i;
+                let f = tl + i;
                 if f >= pilot_start && (f - pilot_start) % pilot_period < CLICK.len() as u64 && f < total {
                     buf[i as usize * ch + 1] += CLICK[0];
                 }
@@ -349,7 +360,7 @@ fn render_loop(
             *written += n as u64;
             Ok(())
         };
-        fill(s.buffer_frames, &mut written, &mut mixer)?;
+        fill(s.buffer_frames, &mut written, 0, &mut mixer)?;
         unsafe { s.client.Start()? };
         let mut rlog = BufWriter::new(File::create(out.join("render_packets.csv"))?);
         writeln!(rlog, "qpc,written_before,padding,frames,clock_pos,clock_qpc100ns")?;
@@ -364,17 +375,19 @@ fn render_loop(
                 }
             }
             let now = qpc::now();
+            // 먼저 장치 위치를 보고 (뒤처졌으면) 건너뛴 다음에 채운다: 이번 블록부터 제 시간축 위치의 콘텐츠를 쓴다
+            let (mut pos, mut qpos) = (0u64, 0u64);
+            unsafe { ac.GetPosition(&mut pos, Some(&mut qpos))? };
+            let raw = (pos as f64 * rate as f64 / clock_freq as f64).round() as u64;
+            let frame = if skip { cskip.observe(raw, qpos as i64, &clock.load()) } else { raw };
+            if raw > rate / 20 {
+                obs.push(frame, qpos as i64);
+            }
             let pad = if s.mode == wasapi::Mode::Exclusive { 0 } else { unsafe { s.client.GetCurrentPadding()? } };
             let n = s.frames_to_write()?;
             let before = written;
             if n > 0 {
-                fill(n, &mut written, &mut mixer)?;
-            }
-            let (mut pos, mut qpos) = (0u64, 0u64);
-            unsafe { ac.GetPosition(&mut pos, Some(&mut qpos))? };
-            let frame = (pos as f64 * rate as f64 / clock_freq as f64).round() as u64;
-            if frame > rate / 20 {
-                obs.push(frame, qpos as i64);
+                fill(n, &mut written, cskip.offset, &mut mixer)?;
             }
             writeln!(rlog, "{now},{before},{pad},{n},{pos},{qpos}")?;
         }
@@ -386,6 +399,12 @@ fn render_loop(
         }
         rlog.flush()?;
         flog.flush()?;
+        let mut klog = BufWriter::new(File::create(out.join("skips.csv"))?);
+        writeln!(klog, "qpc100ns,frames")?;
+        for (t, d) in &cskip.skips {
+            writeln!(klog, "{t},{d}")?;
+        }
+        klog.flush()?;
         let mut slog = BufWriter::new(File::create(out.join("starts.csv"))?);
         writeln!(slog, "sound,requested,start,block")?;
         for l in &mixer.log {

@@ -387,7 +387,9 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut cbl = BufWriter::new(File::create(out.join("asio_callbacks.csv"))?);
     writeln!(cbl, "qpc_in,qpc_out,spos,systime_ns,frame,index")?;
     for (i, c) in st.cblog.iter().enumerate() {
-        writeln!(cp, "{},{},{},{},0", c.qpc_in, i * buffer as usize, to_100ns(c.qpc_in), buffer)?;
+        // 녹음 위치 = 장치 재생 위치 (콜백이 멈춘 동안 장치는 흘러가고 그 구간의 입력은 받지 못한다 → 위치로 적어야 구멍이 보인다)
+        let _ = i;
+        writeln!(cp, "{},{},{},{},0", c.qpc_in, c.spos, to_100ns(c.qpc_in), buffer)?;
         writeln!(cbl, "{},{},{},{},{},{}", c.qpc_in, c.qpc_out, c.spos, c.systime_ns, c.frame, c.index)?;
     }
     cp.flush()?;

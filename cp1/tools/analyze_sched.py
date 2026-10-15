@@ -40,8 +40,12 @@ def analyze(run):
 
     pilots = np.loadtxt(run / "pilots.csv", skiprows=1, dtype=np.int64, ndmin=1)
     p_on = to_dpos(onsets(cap[:, 1], rate))
-    n = min(len(p_on), len(pilots))
-    offs = p_on[:n] - pilots[:n]
+    # 녹음된 클릭마다 가장 가까운 예정 클릭과 짝 (순서대로 짝지으면, 오디오 정지로 건너뛴 구간에 빠진 클릭 하나에 뒤가 0.5초씩 밀린다)
+    o0 = p_on[0] - pilots[0]
+    k = np.clip(np.searchsorted(pilots, p_on - o0), 1, len(pilots) - 1)
+    k = np.where(np.abs(p_on - o0 - pilots[k - 1]) <= np.abs(p_on - o0 - pilots[k]), k - 1, k)
+    offs = p_on - pilots[k]
+    n = len(offs)
     offset = int(np.median(offs))
 
     with open(run / "game_sends.csv", newline="") as f:

@@ -7,4 +7,5 @@ pub mod input;
 pub mod qpc;
 pub mod scheduler;
 pub mod shared_clock;
+pub mod timeline;
 pub mod wasapi;

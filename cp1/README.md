@@ -318,8 +318,10 @@ CP2 1차 시도(브랜치 `cp2-attempt1`)에서 드러난 결함: 판정·화면
 ### 4-1 결과: 경로별 "요청 → 쓰기 위치" 필요량 (각 60초, 요청 약 2,950개)
 
 ```powershell
-.	argetelease	estbench.exe sched --mode sample --secs 60 --probe-hz 50 [--wasapi shared|lowlat|exclusive]
-.	argetelease	estbench.exe asiorun --mode sample --secs 60 --probe-hz 50 --buffer 64|128|256
+.	arget
+elease	estbench.exe sched --mode sample --secs 60 --probe-hz 50 [--wasapi shared|lowlat|exclusive]
+.	arget
+elease	estbench.exe asiorun --mode sample --secs 60 --probe-hz 50 --buffer 64|128|256
 python -I -X utf8 toolsnalyze_d.py runs\<기록>
 ```
 
@@ -333,6 +335,15 @@ python -I -X utf8 toolsnalyze_d.py runs\<기록>
 | ASIO 버퍼 256 | 256 | −0.4 | 2.8 | 5.9 | 6.0 | 7 ms |
 
 - 장치 시계 A가 가리키는 지점은 경로마다 다르다(WASAPI: 장치가 보고한 재생 위치, ASIO: 지금 채우는 버퍼의 위치). 그래서 ASIO는 필요량이 약 1 버퍼이고, 출력 지연은 그 뒤에 따로 붙는다. 출력 지연은 음악과 키음이 똑같이 치르므로 D에 들어가지 않는다. 손 → 소리 총량은 4-4에서 루프백으로 잰다.
+- 배타 모드 최소 주기(3 ms)는 드라이버가 간헐적으로 약 1.9초마다 33 ms씩 이벤트를 주지 않는다. 실용 최소는 5 ms 주기: 필요량 4.9~10.0 ms → D ≈ 11 ms (`CP1_EXCL_PERIOD_MS=5`). 10 ms 주기: 9.9~20.0 ms.
+
+### 4-2 결과: 오디오 정지에도 시간축 유지 (`--audio-stall skip`, 기본)
+
+| 경로 | 고장 (오디오 스레드 정지) | 건너뛰기: 기준 클릭 흔들림 | 밀기: 기준 클릭 흔들림 |
+|---|---|---|---|
+| WASAPI 공유 | 150 ms, 50 ms | ±0.03 ms | 138 ms + 38 ms 밀림 |
+| WASAPI 배타 5 ms | 150 ms, 50 ms (+ 드라이버 33 ms 끊김 약 16번) | ±0.15 ms | −154 ~ +60 ms |
+| ASIO 64 | 150 ms, 50 ms | 0.25 ms 이내 (장치가 흘러가 원래 건너뜀) | — |
 
 ## 다음
 

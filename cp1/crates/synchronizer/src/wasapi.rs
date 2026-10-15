@@ -139,6 +139,11 @@ impl Stream {
     }
 
     pub fn open_mode(device: &IMMDevice, mode: Mode) -> Result<Stream> {
+        Stream::open_mode_period(device, mode, None)
+    }
+
+    /// 배타 모드의 주기를 정해서 연다 (`period_100ns`, 장치 최소보다 작으면 최소). 다른 모드에서는 무시.
+    pub fn open_mode_period(device: &IMMDevice, mode: Mode, period_100ns: Option<i64>) -> Result<Stream> {
         unsafe {
             let mut client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
             let mix: *mut WAVEFORMATEX = client.GetMixFormat()?;
@@ -178,7 +183,7 @@ impl Stream {
                     }
                     let (f, w) = chosen.ok_or_else(|| windows::core::Error::new(windows::Win32::Foundation::E_FAIL, "배타 모드에서 받는 형식 없음 (f32/i32/i16, 2ch)"))?;
                     let wp = &w as *const _ as *const WAVEFORMATEX;
-                    let mut period = min;
+                    let mut period = period_100ns.unwrap_or(min).max(min);
                     if let Err(e) = client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, period, period, wp, None) {
                         if e.code() != AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED {
                             return Err(e);
