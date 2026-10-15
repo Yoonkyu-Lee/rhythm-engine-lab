@@ -2,7 +2,7 @@
 //!
 //!   cp2game run <곡.rtc> [--bot] [--bot-offset-ms 0] [--bot-jitter-ms 0] [--faults audio@30:150,render@45:300,judge@60:300,input@75:300]
 //!                [--out-offset-ms 0] [--no-vsync] [--no-capture] [--tag run] [--out runs] [--quit-at-end] [--stop-at 곡초]
-//!                [--profile ours|iidx|iidx-fine|djmax|bms] [--bot-adapt-ms 0] [--late-drop-ms 100] [--resync-judge void|count]
+//!                [--profile ours|iidx|iidx-fine|djmax|bms] [--bot-adapt-ms 0] [--late-drop-ms 100] [--resync-judge void|count] [--sound-delay-ms 50]
 //!
 //! 스레드: 화면(이 스레드) · 오디오 · 입력 · 판정 · 봇 · 녹음 · 기록. 실시간 스레드끼리는 SPSC 링과 원자 변수만 쓴다.
 //! 고장 주입: 곡 시각 예약(--faults) 또는 단축키 F1 오디오 150 ms, F2 화면 300 ms, F3 판정 300 ms, F4 입력 300 ms.
@@ -233,6 +233,9 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let faults = parse_faults(&arg(args, "--faults", ""))?;
     // 늦은 키음: 이 ms보다 늦으면 버린다 (0이면 끝없이 민다). CP2 2-5 결정: 100 ms (평소 34~44 ms, 그보다 크게 늦은 키음은 틀린 소리로 들린다)
     let late_drop_ms: f64 = arg(args, "--late-drop-ms", "100").parse().map_err(|_| "--late-drop-ms ms")?;
+    // 소리 지연 D (우리 방식만): 키음 경로의 최대 지연(최소 지연 모드에서 34~44 ms)보다 길게. 프레임 구동 프로필은 0 (구조상 "지금 울려"가 같은 지연을 갖는다)
+    let sound_delay_ms: f64 = if Profile::parse(&arg(args, "--profile", "ours"))? == Profile::Ours { arg(args, "--sound-delay-ms", "50").parse().map_err(|_| "--sound-delay-ms ms")? } else { 0.0 };
+    let sound_delay_frames = (sound_delay_ms * dev_rate as f64 / 1e3).round() as i64;
     let late_drop_frames = if late_drop_ms > 0.0 { (late_drop_ms * dev_rate as f64 / 1e3) as i64 } else { i64::MAX };
     let stop_at: f64 = arg(args, "--stop-at", "0").parse().map_err(|_| "--stop-at 곡초")?;
     let out_offset_ns = (arg(args, "--out-offset-ms", "0").parse::<f64>()? * 1e6) as i64;
@@ -273,7 +276,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let a = audio::spawn(
         chart.clone(),
-        AudioCfg { render: render_name, lead_in_s: 2.0, tail_s: 1.0, master_gain: gain, late: LatePolicy { drop_after: late_drop_frames, ..LatePolicy::DEFAULT }, autoplay_notes: false, auto_from_chart: profile == Profile::Ours, cut_same: profile == Profile::Bms, faults: vec![] },
+        AudioCfg { render: render_name, lead_in_s: 2.0, tail_s: 1.0, master_gain: gain, late: LatePolicy { drop_after: late_drop_frames, ..LatePolicy::DEFAULT }, autoplay_notes: false, auto_from_chart: profile == Profile::Ours, cut_same: profile == Profile::Bms, sound_delay_s: sound_delay_ms / 1e3, faults: vec![] },
         key_rx,
         blk_tx,
         mix_tx,
@@ -290,7 +293,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (judge, judge_join, mut logic) = if profile == Profile::Ours {
         let (j, h) = judging::spawn(
             chart.clone(),
-            JudgeCfg { origin, rate, out_offset_ns, windows: windows_cfg, keys: keys.clone(), faults: vec![], resync_void: arg(args, "--resync-judge", "void") != "count" },
+            JudgeCfg { origin, rate, out_offset_ns, windows: windows_cfg, keys: keys.clone(), faults: vec![], resync_void: arg(args, "--resync-judge", "void") != "count", ks_delay_frames: sound_delay_frames },
             a.clock.clone(),
             input.watermark.clone(),
             kev_rx,
@@ -564,7 +567,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let t = &view.tally;
     let snap = a.clock.load();
     let meta = format!(
-        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"{}\", \"slew\": [{}, {}],\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"origin\": {origin}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"lag_counts\": [{}],\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"void\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
+        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"{}\", \"slew\": [{}, {}],\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"origin\": {origin}, \"sound_delay_frames\": {sound_delay_frames}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"lag_counts\": [{}],\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"void\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
         path.replace('\\', "/"),
         chart.hash,
         chart.chart.title,

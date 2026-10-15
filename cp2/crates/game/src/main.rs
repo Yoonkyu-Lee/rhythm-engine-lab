@@ -122,6 +122,7 @@ fn play(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         autoplay_notes: flag(args, "--autoplay-notes"),
         auto_from_chart: true,
         cut_same: false,
+        sound_delay_s: 0.0,
         faults: faults.clone(),
     };
     let autoplay = cfg.autoplay_notes;

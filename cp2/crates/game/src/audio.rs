@@ -83,6 +83,9 @@ pub struct AudioCfg {
     pub auto_from_chart: bool,
     /// 같은 소리를 다시 울리면 앞 소리를 끊는가 (BMS식).
     pub cut_same: bool,
+    /// 소리 지연 D (초): 곡 시각 t의 자동재생을 스트림 프레임 origin + (t + D)에 놓는다.
+    /// 판정·화면은 origin 기준 그대로라, 정확히 친 키음(누른 순간 + D에 예약)과 음악이 같은 샘플에 떨어진다 (CP2 2-7).
+    pub sound_delay_s: f64,
     pub faults: Vec<AudioFault>,
 }
 
@@ -190,7 +193,9 @@ pub fn spawn(
                 }));
                 let (mut obs, obs_rx) = obs_ring(4096);
                 let clock_thread = spawn_clock_thread(s.rate as f64, ClockPolicy::default(), obs_rx, clock2.clone());
-                let mut mixer = Mixer::new(&chart, origin, cfg.late, 4096);
+                // 소리는 D만큼 뒤에: 판정·화면 시간축(origin)과 소리 시간축(sound_origin)을 분리한다
+                let sound_origin = origin + (cfg.sound_delay_s * rate as f64).round() as i64;
+                let mut mixer = Mixer::new(&chart, sound_origin, cfg.late, 4096);
                 mixer.set_auto_from_chart(cfg.auto_from_chart);
                 mixer.set_cut_same(cfg.cut_same);
                 let mut scratch = vec![0.0f32; s.buffer_frames as usize * ch];
@@ -217,7 +222,7 @@ pub fn spawn(
                         for (l, cur) in note_cur.iter_mut().enumerate() {
                             let notes = &chart.chart.lanes[l].notes;
                             while *cur < notes.len() {
-                                let f = origin + ns_to_frame(notes[*cur].t, s.rate);
+                                let f = sound_origin + ns_to_frame(notes[*cur].t, s.rate);
                                 if f >= blk_end {
                                     break;
                                 }

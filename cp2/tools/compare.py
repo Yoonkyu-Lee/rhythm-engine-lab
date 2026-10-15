@@ -64,7 +64,8 @@ def main():
              "- **M3**: 차트↔오디오 어긋남이 10 ms 안으로 돌아와 머문 시각 (ms, 고장부터. – = 10초 안에 못 돌아옴)",
              "- **M4**: 화면 튐 최대 = 프레임 사이 차트 이동 − 실제 흐른 시간 (ms, −면 차트가 멈칫/뒤로)",
              "- **M7**: 고장 없는 실행과 등급이 달라진 노트 수 (22초까지)",
-             "- **M8**: 누름 → 키음 장치 출력, 고장 전 중앙값 → 창 안 최대 (ms)", ""]
+             "- **M8**: 누름 → 키음 장치 출력, 고장 전 중앙값 → 창 안 최대 (ms)",
+             "- **키음 vs 음악**: 정확히 쳤다면 키음이 음악보다 몇 ms 늦게(+)/이르게(−) 나오나. 새 소리 대비 / 그 순간 이미 울리던 긴 소리 대비, 창 안 최대 → 5~10초 뒤 (ms). 올바른 엔진이면 0", ""]
     clean = {p: latest(runs, f"m-{p}-clean") for p in PROFILES}
     clean_g = {p: grades(r) for p, r in clean.items() if r}
     data = {}
@@ -80,7 +81,7 @@ def main():
             m7 = sum(1 for n, x in g.items() if n in cg and cg[n] != x)
             t = rep.get("tally") or {}
             data[(s, p)] = dict(rep=rep, w=w, m7=m7, tally=t)
-    lines += ["| 시나리오 | 프로필 | 판정(3초) | M1 | M2 최대 → 잔여 | M3 복구 | M4 튐 | M7 | M8 |", "|---|---|---|---|---|---|---|---|---|"]
+    lines += ["| 시나리오 | 프로필 | 판정(3초) | 키음 vs 새 소리 | 키음 vs 긴 소리 | M1 | M2 최대 → 잔여 | M3 복구 | M4 튐 | M7 | M8 |", "|---|---|---|---|---|---|---|---|---|---|---|"]
     for s in SCEN:
         for p in PROFILES:
             d = data.get((s, p))
@@ -93,11 +94,12 @@ def main():
                 je = rep.get("judging_error_ms", {})
                 ap_ = rep.get("autoplay_err_ms", {})
                 ks = rep.get("keysound_sent_to_device_ms", {})
-                lines.append(f"| {SNAME[s]} | {PNAME[p]} | {gr} | 평균 {v(ap_.get('mean'))} | p99 {v(je.get('p99'))} | – | – | – | 중앙 {v(ks.get('p50'))} |")
+                kn, kl = rep.get("ks_vs_music_ms", {}), rep.get("ks_vs_long_ms", {})
+                lines.append(f"| {SNAME[s]} | {PNAME[p]} | {gr} | 중앙 {v(kn.get('p50'))} (p99 {v(kn.get('p99'))}) | 중앙 {v(kl.get('p50'))} | 평균 {v(ap_.get('mean'))} | p99 {v(je.get('p99'))} | – | – | – | 중앙 {v(ks.get('p50'))} |")
                 continue
             g = w.get("grades", [0] * 5)
             gr = " ".join(f"{GRADE[i]}{g[i]}" for i in range(5) if g[i])
-            lines.append(f"| {SNAME[s]} | {PNAME[p]} | {gr} | {v(w.get('m1_peak_ms'))} | {v(w.get('m2_peak_ms'))} → {v(w.get('m2_after_ms'))} | {v(w.get('m3_recover_ms'))} | {v(w.get('m4_jump_ms'))} | {d['m7']} | {v(w.get('m8_ms'))} → {v(w.get('m8_peak_ms'))} |")
+            lines.append(f"| {SNAME[s]} | {PNAME[p]} | {gr} | {v(w.get('ks_new_peak_ms'))} → {v(w.get('ks_new_after_ms'))} | {v(w.get('ks_long_peak_ms'))} → {v(w.get('ks_long_after_ms'))} | {v(w.get('m1_peak_ms'))} | {v(w.get('m2_peak_ms'))} → {v(w.get('m2_after_ms'))} | {v(w.get('m3_recover_ms'))} | {v(w.get('m4_jump_ms'))} | {d['m7']} | {v(w.get('m8_ms'))} → {v(w.get('m8_peak_ms'))} |")
     # 추가 실험
     lines += ["", "## 추가 실험", ""]
     for ad in (300, 0):

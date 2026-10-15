@@ -92,6 +92,9 @@ pub struct JudgeCfg {
     pub faults: Vec<JudgeFault>,
     /// 재동기화(Resyncing) 중의 노트 판정·MISS를 무효로 한다 (CP2 2-5 결정: 그 순간 플레이어는 밀리기 전 박자를 따르고 있다).
     pub resync_void: bool,
+    /// 키음 지연 D (프레임): 키음을 누른 순간의 프레임 + D에 예약한다. 자동재생도 D만큼 뒤에 놓이므로
+    /// 정확히 친 키음 = 음악과 같은 샘플 (설계안 8-3 일정 지연 모드, CP2 2-7).
+    pub ks_delay_frames: i64,
 }
 
 const STATE_RESYNCING: u8 = 2;
@@ -217,7 +220,7 @@ pub fn spawn(
                             _ => unreachable!(),
                         };
                         let key_frame = if let Some(n) = sound_note {
-                            let f = frame.round() as i64;
+                            let f = frame.round() as i64 + cfg.ks_delay_frames;
                             let _ = key_out.push(KeyReq::note(f, 0, n));
                             f
                         } else {

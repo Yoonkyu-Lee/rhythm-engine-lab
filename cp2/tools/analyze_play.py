@@ -48,6 +48,7 @@ def main():
     run = pathlib.Path(a.run)
     meta = json.loads((run / "meta.json").read_text(encoding="utf-8"))
     rate, origin, gain = meta["rate"], meta["origin"], meta["master_gain"]
+    origin += int(meta.get("sound_delay_frames", 0))  # 소리 시간축 = origin + D (CP2 2-7)
     if "gain" in (run / "mix_events.csv").open(encoding="utf-8").readline():
         # 믹서 사건 로그로 실제 출력 스트림을 재구성 (어떤 정책·입력이든 "냈다고 한 것"과 "나간 것"을 비교)
         rs = run / "restream.wav"
