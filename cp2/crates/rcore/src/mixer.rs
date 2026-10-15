@@ -32,11 +32,13 @@ pub struct LatePolicy {
     pub short: Late,
     /// 자동재생의 긴 소리 (반주): 박자를 지키도록 자르기 (CP1 3-3).
     pub long: Late,
+    /// "처음부터(PlayWhole)"인 소리도 이 프레임 수보다 더 늦으면 버린다 (i64::MAX면 끝없이 민다).
+    pub drop_after: i64,
 }
 
 impl LatePolicy {
     /// 자동재생 짧은 소리는 CP2 2-5에서 정한다 (임시: 처음부터).
-    pub const DEFAULT: LatePolicy = LatePolicy { player: Late::PlayWhole, short: Late::PlayWhole, long: Late::CutFront };
+    pub const DEFAULT: LatePolicy = LatePolicy { player: Late::PlayWhole, short: Late::PlayWhole, long: Late::CutFront, drop_after: i64::MAX };
 }
 
 /// 보이스 하나. `start`는 소리의 0번 샘플이 놓인 스트림 프레임 (자르기면 블록보다 앞일 수 있음).
@@ -175,8 +177,8 @@ impl<'a> Mixer<'a> {
             };
             match p {
                 Late::CutFront => due,
-                Late::PlayWhole => block,
-                Late::Drop => {
+                Late::PlayWhole if late <= self.late.drop_after => block,
+                Late::PlayWhole | Late::Drop => {
                     self.log(MixEvent::Dropped { sound, due, block, player });
                     return;
                 }
@@ -381,7 +383,7 @@ mod tests {
     #[test]
     fn late_policies() {
         let c = compile(tiny()).unwrap();
-        let mut m = Mixer::new(&c, 0, LatePolicy { player: Late::Drop, short: Late::Drop, long: Late::CutFront }, 64);
+        let mut m = Mixer::new(&c, 0, LatePolicy { player: Late::Drop, short: Late::Drop, long: Late::CutFront, drop_after: i64::MAX }, 64);
         let mut out = vec![0f32; 100 * 2];
         // 블록 1,000부터 시작: 긴 소리(0프레임 예정)는 잘라서 원래 자리, 짧은 소리 요청(900)은 버림
         m.play_note(0, 0, 900);

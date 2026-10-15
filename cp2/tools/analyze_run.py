@@ -67,6 +67,11 @@ def main():
     def heard_ns(q):  # QPC → 청취 곡 시각 (스트림 기준, 고장 앞뒤 모두)
         return (np.interp(q, ab_q, ab_pos) - origin) / rate * 1e9 + out_off + _c
 
+    _cq = _c * qf / 1e9
+
+    def stream_to_qpc(fr):  # 스트림 프레임이 장치 기준점을 지나는 QPC (스트림 기준, 고장 앞뒤 모두)
+        return np.interp(fr, ab_pos, ab_q) - _cq
+
     rep = {"run": run.name, "profile": meta.get("profile"), "slew": meta.get("slew"), "tally": meta.get("tally")}
     # 자동재생 발음 오차 (M1): 예정 프레임 vs 믹서가 실제로 놓은 프레임 (순서대로 짝)
     exp_path = pathlib.Path(meta["chart"])
@@ -102,15 +107,25 @@ def main():
         ps = m[(m["kind"] == "start") & (m["player"] == 1)]
         due = ps["due"].astype(np.int64)
         start = ps["start"].astype(np.int64)
-        lat_frames, m8 = [], []
+        lat_frames, m8, m8_q = [], [], []
         sent_by_frame = {}
         for k in range(n):
             if presses["key_frame"][k] >= 0:
                 sent_by_frame.setdefault(int(presses["key_frame"][k]), int(downs["q_sent"][k]))
-        for d, s in zip(due, start):
-            if d in sent_by_frame:
-                lat_frames.append(s - d)
-                m8.append((frame_to_qpc(s) - sent_by_frame[d]) * 1e3 / qf)
+        if sent_by_frame:
+            for d, s in zip(due, start):
+                if d in sent_by_frame:
+                    lat_frames.append(s - d)
+                    m8.append((stream_to_qpc(s) - sent_by_frame[d]) * 1e3 / qf)
+                    m8_q.append(sent_by_frame[d])
+        else:
+            # 프레임 구동: 키음은 "지금 울려"라 예정 프레임이 없다 → 누름마다 그 뒤 처음 나온 플레이어 소리와 짝짓는다
+            sq = np.sort(stream_to_qpc(start.astype(np.float64)))
+            for k in range(len(downs)):
+                i = int(np.searchsorted(sq, downs["q_sent"][k]))
+                if i < len(sq):
+                    m8.append((sq[i] - downs["q_sent"][k]) * 1e3 / qf)
+                    m8_q.append(int(downs["q_sent"][k]))
         rep["keysound_mixer_late_ms"] = pct(np.array(lat_frames) * 1e3 / rate)
         # 실제로 누른 시각의 오차(장치 시계 기준) vs 프로필이 매긴 오차 → 프로필의 판정 시각 오차
         notes_t = {}
@@ -118,7 +133,7 @@ def main():
         exp_path = exp_path if exp_path.is_absolute() else HERE.parent / exp_path
         hit_rows = j[j["kind"] == 0]
         sent_by_note = {int(o["note"]): int(o["q_sent"]) for o in downs}
-        true_err, judged_err = [], []
+        true_err, judged_err, hit_q = [], [], []
         for r in hit_rows:
             q = sent_by_note.get(int(r["note"]))
             if q is None:
@@ -126,10 +141,12 @@ def main():
             judged_err.append(r["err_ns"] / 1e6)
             note_t = r["t_ns"] - r["err_ns"]
             true_err.append((heard_ns(q) - note_t) / 1e6)
+            hit_q.append(q)
         if true_err:
             te, je = np.array(true_err), np.array(judged_err)
             rep["press_true_err_ms"] = pct(te)
             rep["judging_error_ms"] = pct(je - te)
+            m2 = (np.array(hit_q, dtype=np.float64), je - te)
 
         rep["keysound_sent_to_device_ms"] = pct(m8)
 
@@ -224,6 +241,44 @@ def main():
             jw = j[(j["q_proc"] >= q) & (j["q_proc"] < q + 3 * qf)]
             g = jw[jw["kind"] == 0]["grade"]
             r["grades"] = [int(np.sum(g == k)) for k in range(4)] + [int(np.sum(jw["kind"] == 2))]
+            # 10초 창: 판정 시각 오차(M2), 복구 시간(M3), 화면 불연속(M4), 키음 지연(M8)
+            W = q + 10 * qf
+            if "m2" in locals():
+                mw = (m2[0] >= q) & (m2[0] < W)
+                pre = m2[0] < q
+                b2 = float(np.median(m2[1][pre])) if pre.any() else 0.0
+                if mw.any():
+                    d2 = m2[1][mw] - b2
+                    r["m2_peak_ms"] = round(float(d2[np.argmax(np.abs(d2))]), 1)
+                    late = mw & (m2[0] >= q + 5 * qf)
+                    r["m2_after_ms"] = round(float(np.median(m2[1][late]) - b2), 1) if late.any() else None
+            ww = (qref >= q) & (qref < W) & ok
+            dw = desync[ww] - base
+            if dw.size:
+                # 복구 = 어긋남이 기준에서 10 ms 안으로 돌아와 창 끝까지 머문 시점 (끝까지 못 돌아오면 None)
+                bad = np.nonzero(np.abs(dw) > 10)[0]
+                if bad.size == 0:
+                    r["m3_recover_ms"] = 0.0
+                elif bad[-1] == dw.size - 1:
+                    r["m3_recover_ms"] = None  # 창 끝까지 5 ms 밖 = 복구 안 됨
+                else:
+                    r["m3_recover_ms"] = round(float((qref[ww][bad[-1] + 1] - q) * 1e3 / qf), 0)
+            ii = np.nonzero(ww)[0]
+            ii = ii[ii > 0]
+            if ii.size:
+                jump = ((f["song_ns"][ii] - f["song_ns"][ii - 1]) - (qref[ii] - qref[ii - 1]) * 1e9 / qf) / 1e6
+                jump = jump[ok[ii - 1]]
+                if jump.size:
+                    r["m4_jump_ms"] = round(float(jump[np.argmax(np.abs(jump))]), 1)
+            if "m8_q" in locals() and m8_q:
+                aq, av = np.array(m8_q, dtype=np.float64), np.array(m8)
+                pre = aq < q
+                b8 = float(np.median(av[pre])) if pre.any() else 0.0
+                mw = (aq >= q) & (aq < W)
+                if mw.any():
+                    r["m8_ms"] = round(b8, 1)
+                    r["m8_peak_ms"] = round(float(av[mw].max()), 1)
+                    r["keysound_dropped"] = 0
             wins.append(r)
         rep["fault_windows"] = wins
 
@@ -259,6 +314,7 @@ def main():
             g = r["grades"]
             print(f"  {r['kind']} {r['ms']} ms @ {r['at_s']:.0f}s: 어긋남 최대 {r.get('desync_peak_ms')} → 5초 뒤 {r.get('desync_after_ms')} ms | "
                   f"자동재생 오차 변화 최대 {r.get('m1_peak_ms')} ms (5 ms 넘음 {r.get('m1_off_5ms')}개) | 3초 판정 P{g[0]} G{g[1]} Good{g[2]} Bad{g[3]} Miss{g[4]}")
+            print(f"    판정 시각 오차 변화 최대 {r.get('m2_peak_ms')} → 5~10초 {r.get('m2_after_ms')} ms | 복구 {r.get('m3_recover_ms')} ms | 화면 튐 최대 {r.get('m4_jump_ms')} ms | 키음 지연 {r.get('m8_ms')} → 최대 {r.get('m8_peak_ms')} ms")
     print(f"화면: {rep['fps_mean']} fps, 프레임 간격 {fmt(rep['frame_interval_ms'])}, present {fmt(rep['present_ms'])}, DXGI 통계 {rep['dxgi_stats_frames']}/{len(we)} 프레임")
 
 

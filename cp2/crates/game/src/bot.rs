@@ -3,6 +3,7 @@
 //! 목표 QPC = 장치 시계의 역변환: 곡 시각 T(+오프셋+오차)가 청취되는 스트림 프레임 → 그 프레임이 나가는 QPC.
 //! 그래서 봇은 게임 내부 상태(프레임, 판정)를 보지 않고 OS 입력 경로를 그대로 탄다. 판정 오차 = 입력 도장 오차 + 시계 오차 + 의도한 오차.
 //! 롱노트는 끝까지 누르고, 단노트는 30 ms 뒤에 뗀다. 실제로 보낸 QPC를 기록한다.
+//! 사람 흉내(adapt_ns > 0): 음악이 밀려 장치 시계가 새 epoch로 바뀌어도 그 뒤 adapt_ns 동안은 옛 시계(옛 박자)로 치다가 그다음에 새 박자를 따른다.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use std::time::Duration;
 use rcore::ring::Producer;
 use rcore::runtime::Compiled;
 use synchronizer::qpc;
-use synchronizer::shared_clock::SharedClock;
+use synchronizer::shared_clock::{ClockSnapshot, SharedClock};
 use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_F24};
 
 pub const BOT_KEY: u16 = VK_F24.0;
@@ -36,6 +37,33 @@ pub struct BotCfg {
     /// 균등 무작위 오차 ±jitter_ns (0이면 없음), 결정적 시드.
     pub jitter_ns: i64,
     pub seed: u64,
+    /// 사람 흉내: 시계 점프를 알아채기까지 걸리는 시간 (ns, 0이면 즉시 따름).
+    pub adapt_ns: i64,
+}
+
+/// 봇이 믿는 시계: 같은 epoch 안에서는 최신 직선, 새 epoch는 처음 본 뒤 adapt_ns가 지나야 받아들인다.
+struct View {
+    seen: ClockSnapshot,
+    pending_since: Option<i64>,
+    adapt_q: i64,
+}
+
+impl View {
+    fn get(&mut self, clock: &SharedClock) -> ClockSnapshot {
+        let s = clock.load();
+        if self.adapt_q == 0 || !self.seen.valid || s.epoch == self.seen.epoch {
+            self.seen = s;
+            self.pending_since = None;
+        } else {
+            let now = qpc::now();
+            let since = *self.pending_since.get_or_insert(now);
+            if now - since >= self.adapt_q {
+                self.seen = s;
+                self.pending_since = None;
+            }
+        }
+        self.seen
+    }
 }
 
 fn send(down: bool) {
@@ -45,8 +73,8 @@ fn send(down: bool) {
 }
 
 /// 청취 곡 시각(ns) → 그 순간의 QPC 틱 (시계가 없으면 None).
-fn qpc_for_song(clock: &SharedClock, t_ns: i64, cfg: &BotCfg) -> Option<i64> {
-    let s = clock.load();
+fn qpc_for_song(view: &mut View, clock: &SharedClock, t_ns: i64, cfg: &BotCfg) -> Option<i64> {
+    let s = view.get(clock);
     if !s.valid {
         return None;
     }
@@ -85,6 +113,7 @@ pub fn spawn(chart: Arc<Compiled>, cfg: BotCfg, clock: Arc<SharedClock>, mut log
                 rng ^= rng << 17;
                 rng
             };
+            let mut view = View { seen: ClockSnapshot::default(), pending_since: None, adapt_q: (cfg.adapt_ns as i128 * qpc::frequency() as i128 / 1_000_000_000) as i64 };
             // 이벤트: (청취 시각, 누름?, 노트)
             let mut evs: Vec<(i64, bool, u32)> = Vec::new();
             for (i, n) in chart.chart.lanes[0].notes.iter().enumerate() {
@@ -101,7 +130,7 @@ pub fn spawn(chart: Arc<Compiled>, cfg: BotCfg, clock: Arc<SharedClock>, mut log
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
-                    match qpc_for_song(&clock, t, &cfg) {
+                    match qpc_for_song(&mut view, &clock, t, &cfg) {
                         Some(q) if q - qpc::now() < 2 * qpc::frequency() => break q,
                         _ => thread::sleep(Duration::from_millis(20)),
                     }
@@ -112,7 +141,7 @@ pub fn spawn(chart: Arc<Compiled>, cfg: BotCfg, clock: Arc<SharedClock>, mut log
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
-                    if let Some(nq) = qpc_for_song(&clock, t, &cfg) {
+                    if let Some(nq) = qpc_for_song(&mut view, &clock, t, &cfg) {
                         q = nq;
                     }
                     let left = q - qpc::now();

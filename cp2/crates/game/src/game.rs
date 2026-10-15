@@ -1,7 +1,8 @@
 //! `cp2game run`: 건반 하나짜리 게임 ("우리 방식" 프로필). 창·오디오·입력·판정·봇·녹음·기록을 엮는다.
 //!
 //!   cp2game run <곡.rtc> [--bot] [--bot-offset-ms 0] [--bot-jitter-ms 0] [--faults audio@30:150,render@45:300,judge@60:300,input@75:300]
-//!                [--out-offset-ms 0] [--no-vsync] [--no-capture] [--tag run] [--out runs] [--quit-at-end]
+//!                [--out-offset-ms 0] [--no-vsync] [--no-capture] [--tag run] [--out runs] [--quit-at-end] [--stop-at 곡초]
+//!                [--profile ours|iidx|djmax|bms] [--bot-adapt-ms 0] [--late-drop-ms 100] [--resync-judge void|count]
 //!
 //! 스레드: 화면(이 스레드) · 오디오 · 입력 · 판정 · 봇 · 녹음 · 기록. 실시간 스레드끼리는 SPSC 링과 원자 변수만 쓴다.
 //! 고장 주입: 곡 시각 예약(--faults) 또는 단축키 F1 오디오 150 ms, F2 화면 300 ms, F3 판정 300 ms, F4 입력 300 ms.
@@ -230,6 +231,10 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let chart = Arc::new(runtime::compile(ready)?);
     let (gain, peak) = crate::master_gain(&chart);
     let faults = parse_faults(&arg(args, "--faults", ""))?;
+    // 늦은 키음: 이 ms보다 늦으면 버린다 (0이면 끝없이 민다). CP2 2-5 결정: 100 ms (평소 34~44 ms, 그보다 크게 늦은 키음은 틀린 소리로 들린다)
+    let late_drop_ms: f64 = arg(args, "--late-drop-ms", "100").parse().map_err(|_| "--late-drop-ms ms")?;
+    let late_drop_frames = if late_drop_ms > 0.0 { (late_drop_ms * dev_rate as f64 / 1e3) as i64 } else { i64::MAX };
+    let stop_at: f64 = arg(args, "--stop-at", "0").parse().map_err(|_| "--stop-at 곡초")?;
     let out_offset_ns = (arg(args, "--out-offset-ms", "0").parse::<f64>()? * 1e6) as i64;
     let vsync = !flag(args, "--no-vsync");
     let use_bot = flag(args, "--bot");
@@ -268,7 +273,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let a = audio::spawn(
         chart.clone(),
-        AudioCfg { render: render_name, lead_in_s: 2.0, tail_s: 1.0, master_gain: gain, late: LatePolicy::DEFAULT, autoplay_notes: false, auto_from_chart: profile == Profile::Ours, cut_same: profile == Profile::Bms, faults: vec![] },
+        AudioCfg { render: render_name, lead_in_s: 2.0, tail_s: 1.0, master_gain: gain, late: LatePolicy { drop_after: late_drop_frames, ..LatePolicy::DEFAULT }, autoplay_notes: false, auto_from_chart: profile == Profile::Ours, cut_same: profile == Profile::Bms, faults: vec![] },
         key_rx,
         blk_tx,
         mix_tx,
@@ -285,7 +290,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (judge, judge_join, mut logic) = if profile == Profile::Ours {
         let (j, h) = judging::spawn(
             chart.clone(),
-            JudgeCfg { origin, rate, out_offset_ns, windows: windows_cfg, keys: keys.clone(), faults: vec![] },
+            JudgeCfg { origin, rate, out_offset_ns, windows: windows_cfg, keys: keys.clone(), faults: vec![], resync_void: arg(args, "--resync-judge", "void") != "count" },
             a.clock.clone(),
             input.watermark.clone(),
             kev_rx,
@@ -308,6 +313,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             offset_ns: (arg(args, "--bot-offset-ms", "0").parse::<f64>().unwrap_or(0.0) * 1e6) as i64,
             jitter_ns: (arg(args, "--bot-jitter-ms", "0").parse::<f64>().unwrap_or(0.0) * 1e6) as i64,
             seed: 12345,
+            adapt_ns: (arg(args, "--bot-adapt-ms", "0").parse::<f64>().unwrap_or(0.0) * 1e6) as i64,
         };
         bot::spawn(chart.clone(), cfg, a.clock.clone(), bot_tx, stop.clone())
     });
@@ -520,6 +526,9 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             _last_sync_r = ft.sync_refresh;
         }
         let _ = fr_tx.push(FrameLog { t: ft, song_ns: song.unwrap_or(i64::MIN), q_display, notes_drawn: drawn, injected_ms: injected });
+        if stop_at > 0.0 && song_s > stop_at {
+            quit = true;
+        }
         if a.done.load(Ordering::Acquire) && flag(args, "--quit-at-end") {
             quit = true;
         }
@@ -555,7 +564,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let t = &view.tally;
     let snap = a.clock.load();
     let meta = format!(
-        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"{}\", \"slew\": [{}, {}],\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"origin\": {origin}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"lag_counts\": [{}],\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
+        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"{}\", \"slew\": [{}, {}],\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"origin\": {origin}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"lag_counts\": [{}],\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"void\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
         path.replace('\\', "/"),
         chart.hash,
         chart.chart.title,
@@ -584,6 +593,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         t.empty,
         t.ln_ok,
         t.ln_break,
+        t.void,
         t.max_combo,
         snap.valid,
         snap.epoch,
@@ -594,6 +604,6 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         capm.map(|m| format!("{{\"name\": \"{}\", \"rate\": {}, \"frames\": {}, \"silent_packets\": {}}}", m.name, m.rate, m.frames, m.silent_packets)).unwrap_or_else(|| "null".into())
     );
     fs::write(dir.join("meta.json"), meta)?;
-    println!("  판정 P {} G {} Good {} Bad {} Miss {} 빈 {} LN {}/{} 최대 콤보 {}", t.perfect, t.great, t.good, t.bad, t.miss, t.empty, t.ln_ok, t.ln_break, t.max_combo);
+    println!("  판정 P {} G {} Good {} Bad {} Miss {} 빈 {} LN {}/{} 무효 {} 최대 콤보 {}", t.perfect, t.great, t.good, t.bad, t.miss, t.empty, t.ln_ok, t.ln_break, t.void, t.max_combo);
     Ok(())
 }

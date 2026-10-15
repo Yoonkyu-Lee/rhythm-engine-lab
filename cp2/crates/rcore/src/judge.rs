@@ -128,6 +128,8 @@ pub struct Tally {
     pub empty: u32,
     pub ln_ok: u32,
     pub ln_break: u32,
+    /// 무효 처리한 노트 (재동기화 중의 판정: 점수·콤보에 넣지 않는다, CP2 2-5).
+    pub void: u32,
     pub combo: u32,
     pub max_combo: u32,
 }

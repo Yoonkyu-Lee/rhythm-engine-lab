@@ -24,7 +24,8 @@ use crate::audio::KeyReq;
 /// 판정 하나의 기록.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JudgeLog {
-    /// 0 노트, 1 빈 누름, 2 MISS, 3 롱노트 끝(성공), 4 롱노트 끊김, 5 뗌, 6 watermark 위반(이미 지난 시각의 입력)
+    /// 0 노트, 1 빈 누름, 2 MISS, 3 롱노트 끝(성공), 4 롱노트 끊김, 5 뗌, 6 watermark 위반(이미 지난 시각의 입력),
+    /// 7 무효(재동기화 중의 노트 판정·MISS: grade는 원래 받았을 등급)
     pub kind: u8,
     pub note: u32,
     /// 0 PERFECT 1 GREAT 2 GOOD 3 BAD 4 MISS
@@ -85,7 +86,11 @@ pub struct JudgeCfg {
     pub windows: Windows,
     pub keys: Vec<u16>,
     pub faults: Vec<JudgeFault>,
+    /// 재동기화(Resyncing) 중의 노트 판정·MISS를 무효로 한다 (CP2 2-5 결정: 그 순간 플레이어는 밀리기 전 박자를 따르고 있다).
+    pub resync_void: bool,
 }
+
+const STATE_RESYNCING: u8 = 2;
 
 /// QPC 틱 → 청취 곡 시간 (ns). 시계가 아직 없으면 None.
 pub fn song_ns(clock: &SharedClock, q: i64, origin: i64, rate: u32, offset_ns: i64) -> Option<(i64, f64)> {
@@ -171,9 +176,14 @@ pub fn spawn(
                         }
                         pressed = true;
                         let j = lane.press(notes, &cfg.windows, t);
-                        tally.add(&j);
+                        let void = cfg.resync_void && matches!(j, Judged::Hit { .. }) && monitor.state.load(Ordering::Relaxed) == STATE_RESYNCING;
+                        if void {
+                            tally.void += 1;
+                        } else {
+                            tally.add(&j);
+                        }
                         let (kind, note, grade, err, sound_note) = match j {
-                            Judged::Hit { note, grade, err } => (0, note, grade, err, Some(note)),
+                            Judged::Hit { note, grade, err } => (if void { 7 } else { 0 }, note, grade, err, Some(note)),
                             Judged::Empty { sound_note, .. } => (1, sound_note.unwrap_or(u32::MAX), Grade::Miss, 0, sound_note),
                             _ => unreachable!(),
                         };
@@ -208,10 +218,16 @@ pub fn spawn(
                             last_wm_q = wm_q;
                             sh.watermark_song_ns.store(wm_song, Ordering::Release);
                             let q_proc = qpc::now();
+                            let st = monitor.state.load(Ordering::Relaxed);
                             lane.advance(notes, &cfg.windows, wm_song, &mut |j| {
-                                tally.add(&j);
+                                let void = cfg.resync_void && matches!(j, Judged::Miss { .. }) && st == STATE_RESYNCING;
+                                if void {
+                                    tally.void += 1;
+                                } else {
+                                    tally.add(&j);
+                                }
                                 let l = match j {
-                                    Judged::Miss { note } => JudgeLog { kind: 2, note, grade: Grade::Miss as u8, t_ns: wm_song, q_in: wm_q, q_proc, key_frame: -1, ..Default::default() },
+                                    Judged::Miss { note } => JudgeLog { kind: if void { 7 } else { 2 }, note, grade: Grade::Miss as u8, t_ns: wm_song, q_in: wm_q, q_proc, key_frame: -1, ..Default::default() },
                                     Judged::LongEnd { note, ok, err } => JudgeLog { kind: if ok { 3 } else { 4 }, note, err_ns: err, t_ns: wm_song, q_in: wm_q, q_proc, key_frame: -1, ..Default::default() },
                                     _ => return,
                                 };
