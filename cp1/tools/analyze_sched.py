@@ -55,6 +55,7 @@ def analyze(run):
 
     with open(run / "starts.csv", newline="") as f:
         st = [{k: int(v) for k, v in r.items()} for r in csv.DictReader(f)]
+    st = [r for r in st if r["sound"] == 0]  # 1번 = CP1-4 요청 탐침 (무음)
     internal = []
     for r, k in zip(st, range(len(ev))):
         internal.append((r["start"] - ev[k]) / rate * 1e3)

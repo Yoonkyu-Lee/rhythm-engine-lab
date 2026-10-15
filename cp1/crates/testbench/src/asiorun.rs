@@ -28,7 +28,7 @@ use synchronizer::scheduler::{Cmd, LatePolicy, Mixer};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
 use crate::arg;
-use crate::sched::{game_loop, noise_burst, parse_faults, Fault, Mode, CLICK, EVENT_PERIOD_S, PILOT_PERIOD_S, PILOT_START_S};
+use crate::sched::{game_loop, noise_burst, spawn_req_probe, parse_faults, Fault, Mode, CLICK, EVENT_PERIOD_S, PILOT_PERIOD_S, PILOT_START_S};
 
 const OUT_L: i32 = 0;
 const OUT_R: i32 = 1;
@@ -309,7 +309,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         by_position,
         output_ready: false,
         rx,
-        mixer: Mixer::new(vec![sound0], late),
+        mixer: Mixer::new(vec![sound0, Vec::new()], late), // 1번 = 요청 탐침용 무음
         scratch: vec![0.0; 4096 * 2],
         pilot_start: (PILOT_START_S * rate).round() as u64,
         pilot_period: (PILOT_PERIOD_S * rate).round() as u64,
@@ -337,6 +337,8 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // 게임 스레드 (sched와 같은 코드). 시계 모델은 콜백이 채운다.
     // 드라이버를 만든 이 스레드(STA)는 메시지를 계속 처리한다: 처리하지 않으면 약 0.7초 뒤 콜백이 멈췄다.
     let fb: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'B').collect();
+    let probe_hz: f64 = arg(args, "--probe-hz", "0").parse()?;
+    let req_probe = (probe_hz > 0.0).then(|| spawn_req_probe(clock.clone(), tx.clone(), probe_hz, done.clone()));
     let game_thread = {
         let (out, done) = (out.clone(), done.clone());
         thread::spawn(move || game_loop(&out, mode, fps, secs, lookahead_ms, event_period, fb, tx, clock, done).map_err(|e| e.to_string()))
@@ -367,6 +369,9 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let _ = drv.dispose_buffers();
     STATE.store(std::ptr::null_mut(), Ordering::Release);
     probe_stop.store(true, Ordering::Release);
+    if let Some(p) = req_probe {
+        println!("  요청 탐침: {}개 보냄", p.join().map_err(|_| "요청 탐침 스레드 패닉")?);
+    }
     let (wakes, gaps) = probe.join().map_err(|_| "탐침 스레드 패닉")?;
     game.map_err(|e| e.to_string())?;
 

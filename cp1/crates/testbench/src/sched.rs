@@ -13,6 +13,10 @@
 //!   immediate : fps 주기로 도는 게임 루프가 시계를 보고, 이벤트 시각이 지났으면 "지금 울려"(Now)를 보낸다.
 //! 오른쪽 채널: 기준 클릭. 렌더 스레드가 정해진 프레임에 직접 쓴다. 루프백 위치를 재생 프레임 번호로 바꾸는 기준.
 //! 분석: cp1/tools/analyze_sched.py
+//!
+//! CP1-4 요청 탐침 (`--probe-hz N`): 탐침 스레드가 무작위 순간에 "지금 장치 위치 A(q)에 무음 소리(1번)를 놓아 달라"를 보낸다.
+//! 믹서가 그 요청을 처리한 블록의 첫 프레임(= 그 순간 소리를 놓을 수 있는 가장 이른 위치)을 기록하므로,
+//! starts.csv의 sound=1 행에서 (block − requested)가 "요청 → 쓰기 위치" 지연, 곧 기록 시계 D가 덮어야 하는 양이다. 분석: tools/analyze_d.py
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -40,6 +44,33 @@ pub(crate) const PILOT_PERIOD_S: f64 = 0.5;
 pub(crate) const CLICK: [f32; 3] = [0.25; 3];
 
 /// 50 ms 결정적 노이즈 버스트 (양끝 1 ms 페이드). 앞부분이 잘려도 남은 부분의 위치를 상호상관으로 잴 수 있다.
+/// CP1-4 요청 탐침 스레드. 평균 `hz`번/초, 간격은 [0.5, 1.5]/hz 균등 무작위 (블록 경계와 위상이 고르게 섞이게).
+pub(crate) fn spawn_req_probe(clock: Arc<SharedClock>, tx: Sender<Cmd>, hz: f64, stop: Arc<AtomicBool>) -> thread::JoinHandle<u64> {
+    thread::spawn(move || {
+        unsafe { timeBeginPeriod(1) };
+        let (mut x, mut sent) = (0x9e37_79b9u32, 0u64);
+        let qf = qpc::frequency() as i128;
+        while !stop.load(Ordering::Relaxed) {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let gap = (0.5 + x as f64 / u32::MAX as f64) / hz;
+            thread::sleep(Duration::from_secs_f64(gap));
+            let snap = clock.load();
+            if !snap.valid {
+                continue;
+            }
+            let t100 = (qpc::now() as i128 * 10_000_000 / qf) as i64;
+            let f = snap.frame_at(t100);
+            if f > 0.0 && tx.send(Cmd::At { frame: f.round() as u64, sound: 1, channel: 0 }).is_ok() {
+                sent += 1;
+            }
+        }
+        unsafe { timeEndPeriod(1) };
+        sent
+    })
+}
+
 pub(crate) fn noise_burst(rate: f64, secs: f64) -> Vec<f32> {
     let n = (secs * rate) as usize;
     let fade = (0.001 * rate) as usize;
@@ -104,6 +135,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let event_period: f64 = arg(args, "--event-period-s", &EVENT_PERIOD_S.to_string()).parse()?;
     let faults = parse_faults(&arg(args, "--faults", ""))?;
     let render_name = arg(args, "--render", "Playback 1/2");
+    let wmode = wasapi::Mode::parse(&arg(args, "--wasapi", "shared")).ok_or("--wasapi shared|lowlat|exclusive")?;
     let capture_name = arg(args, "--capture", "Loopback 1/2");
     let unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let tag = match mode {
@@ -130,10 +162,15 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let ren = {
         let (out, name, clock, done) = (out.clone(), render_name.clone(), clock.clone(), render_done.clone());
         let fa: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'A').collect();
-        thread::spawn(move || render_loop(&name, &out, secs, late, noise_s, fa, rx, clock, done))
+        thread::spawn(move || render_loop(&name, wmode, &out, secs, late, noise_s, fa, rx, clock, done))
     };
     let fb: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'B').collect();
+    let probe_hz: f64 = arg(args, "--probe-hz", "0").parse()?;
+    let probe = (probe_hz > 0.0).then(|| spawn_req_probe(clock.clone(), tx.clone(), probe_hz, render_done.clone()));
     let game = game_loop(&out, mode, fps, secs, lookahead_ms, event_period, fb, tx, clock, render_done.clone());
+    if let Some(p) = probe {
+        println!("  요청 탐침: {}개 보냄", p.join().map_err(|_| "탐침 스레드 패닉")?);
+    }
 
     let rmeta = ren.join().map_err(|_| "렌더 스레드 패닉")??;
     game?;
@@ -150,9 +187,10 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut f = File::create(out.join("meta.json"))?;
     writeln!(
         f,
-        "{{\"mode\": \"{}\", \"fps\": {fps}, \"lookahead_ms\": {lookahead_ms}, \"late\": \"{}\", \"sound\": \"{}\", \"faults\": \"{}\", \"secs\": {secs}, \"qpc_freq\": {}, \
+        "{{\"path\": \"{}\", \"mode\": \"{}\", \"fps\": {fps}, \"lookahead_ms\": {lookahead_ms}, \"late\": \"{}\", \"sound\": \"{}\", \"faults\": \"{}\", \"secs\": {secs}, \"qpc_freq\": {}, \
          \"event\": {{\"start_s\": {EVENT_START_S}, \"period_s\": {event_period}}}, \"pilot\": {{\"start_s\": {PILOT_START_S}, \"period_s\": {PILOT_PERIOD_S}}}, \
          \"render\": {}, \"capture\": {}}}",
+        wmode.name(),
         if mode == Mode::Sample { "sample" } else { "immediate" },
         if late == LatePolicy::CutFront { "cut" } else { "whole" },
         sound_kind,
@@ -251,17 +289,18 @@ pub(crate) fn game_loop(
 
 #[allow(clippy::too_many_arguments)]
 fn render_loop(
-    name: &str, out: &Path, secs: f64, late: LatePolicy, noise_s: f64, faults: Vec<Fault>, rx: Receiver<Cmd>,
+    name: &str, wmode: wasapi::Mode, out: &Path, secs: f64, late: LatePolicy, noise_s: f64, faults: Vec<Fault>, rx: Receiver<Cmd>,
     clock: Arc<SharedClock>, done: Arc<AtomicBool>,
 ) -> Result<Meta, String> {
     let r = (|| -> Result<Meta, Box<dyn std::error::Error>> {
         wasapi::com_init()?;
         let mmcss = wasapi::mmcss_pro_audio();
         let ep = wasapi::find(false, name)?;
-        let s = Stream::open(&ep.device)?;
-        if s.bits != 32 || s.channels < 2 {
-            return Err(format!("믹스 형식이 32비트 float 스테레오가 아님: {} bit, {} ch", s.bits, s.channels).into());
+        let s = Stream::open_mode(&ep.device, wmode)?;
+        if s.channels < 2 {
+            return Err(format!("스테레오가 아님: {} ch", s.channels).into());
         }
+        println!("  출력: {} {:?} {} bit, 버퍼 {} 프레임, 주기 {} 프레임", wmode.name(), s.sample, s.bits, s.buffer_frames, s.period_frames);
         let rc: IAudioRenderClient = s.service()?;
         let ac: IAudioClock = s.service()?;
         let clock_freq = unsafe { ac.GetFrequency()? };
@@ -280,7 +319,7 @@ fn render_loop(
                 f.write_all(&v.to_le_bytes())?;
             }
         }
-        let mut mixer = Mixer::new(vec![sound0], late);
+        let mut mixer = Mixer::new(vec![sound0, Vec::new()], late); // 1번 = 요청 탐침용 무음
         let mut fired = vec![false; faults.len()];
         let mut flog = BufWriter::new(File::create(out.join("faults_render.csv"))?);
         writeln!(flog, "kind,at_s,ms,qpc_before,qpc_after,written")?;
@@ -306,11 +345,7 @@ fn render_loop(
                     buf[i as usize * ch + 1] += CLICK[0];
                 }
             }
-            unsafe {
-                let p = rc.GetBuffer(n)? as *mut f32;
-                std::ptr::copy_nonoverlapping(buf.as_ptr(), p, buf.len());
-                rc.ReleaseBuffer(n, 0)?;
-            }
+            s.write(&rc, buf, n)?;
             *written += n as u64;
             Ok(())
         };
@@ -329,8 +364,8 @@ fn render_loop(
                 }
             }
             let now = qpc::now();
-            let pad = unsafe { s.client.GetCurrentPadding()? };
-            let n = s.buffer_frames - pad;
+            let pad = if s.mode == wasapi::Mode::Exclusive { 0 } else { unsafe { s.client.GetCurrentPadding()? } };
+            let n = s.frames_to_write()?;
             let before = written;
             if n > 0 {
                 fill(n, &mut written, &mut mixer)?;

@@ -315,6 +315,25 @@ CP2 1차 시도(브랜치 `cp2-attempt1`)에서 드러난 결함: 판정·화면
 | 4-4 | 누름 → 내 키음 총 지연(입력 시각 → 루프백 시작)과 흔들림, 경로별 | 경로별 표 |
 | 4-5 | 청취 시점 H 추정과 교정 방법 (키음 자동 연주 모드 옵션 2) | 교정 절차와 오차 |
 
+### 4-1 결과: 경로별 "요청 → 쓰기 위치" 필요량 (각 60초, 요청 약 2,950개)
+
+```powershell
+.	argetelease	estbench.exe sched --mode sample --secs 60 --probe-hz 50 [--wasapi shared|lowlat|exclusive]
+.	argetelease	estbench.exe asiorun --mode sample --secs 60 --probe-hz 50 --buffer 64|128|256
+python -I -X utf8 toolsnalyze_d.py runs\<기록>
+```
+
+| 경로 | 버퍼 / 주기 | 최소 | 중앙 | p99.9 | 최대 | D (최대 + 1 ms) |
+|---|---|---|---|---|---|---|
+| WASAPI 공유 (48 kHz f32) | 1056 / 480 프레임 | 31.7 | 36.8 | 41.9 | 41.9 | 43 ms |
+| WASAPI 공유 저지연 | 드라이버가 10 ms 미만 거부 → 공유와 같음 | 31.7 | 36.8 | 41.9 | 41.9 | 43 ms |
+| WASAPI 배타 (16비트 정수만 받음) | 144 / 144 프레임 | 3.0 | 4.5 | 6.0 | 6.0 | 7 ms |
+| ASIO 버퍼 64 | 64 | −0.4 | 0.8 | 1.9 | 1.9 | 3 ms |
+| ASIO 버퍼 128 | 128 | −0.4 | 1.5 | 3.3 | 3.3 | 4.5 ms |
+| ASIO 버퍼 256 | 256 | −0.4 | 2.8 | 5.9 | 6.0 | 7 ms |
+
+- 장치 시계 A가 가리키는 지점은 경로마다 다르다(WASAPI: 장치가 보고한 재생 위치, ASIO: 지금 채우는 버퍼의 위치). 그래서 ASIO는 필요량이 약 1 버퍼이고, 출력 지연은 그 뒤에 따로 붙는다. 출력 지연은 음악과 키음이 똑같이 치르므로 D에 들어가지 않는다. 손 → 소리 총량은 4-4에서 루프백으로 잰다.
+
 ## 다음
 
 CP1 (Windows 공유 모드)은 끝났다. 실측 데이터: `results/cp1_wasapi_shared.json` (`python -I tools\export_cp1.py`로 다시 만든다).
