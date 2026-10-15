@@ -1,5 +1,5 @@
 //! 오프라인 정답 렌더: 모든 노트를 제때 쳤다고 보고 곡 전체를 32비트 float WAV로 쓴다.
-//!   render <파일.rtc> <출력.wav> [--block 512] [--check 1,64,441,4096]
+//!   render <파일.rtc> <출력.wav> [--block 512] [--check 1,64,441,4096] [--rate 48000]
 //! `--check`: 블록 크기를 바꿔 다시 렌더해 비트 단위로 같은지 확인한다 (믹서 결정성).
 //! 옆에 <출력>.json: 해시, 길이, 발음 수, 늦음·버림·넘침 수, 렌더 시간.
 
@@ -39,7 +39,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("사용법: render <파일.rtc> <출력.wav> [--block 512] [--check 1,64,441,4096]");
         std::process::exit(2);
     }
-    let c = runtime::compile(rtc::decode(&std::fs::read(&args[1])?)?)?;
+    let mut src = rtc::decode(&std::fs::read(&args[1])?)?;
+    // --rate: 실시간 재생과 같은 장치 속도로 리샘플링한 정답 (게임과 같은 리샘플러)
+    let rate: u32 = arg(&args, "--rate", "0").parse()?;
+    if rate != 0 && rate != src.bank.rate {
+        src = rcore::resample::resample_chart(&src, rate)?;
+    }
+    let c = runtime::compile(src)?;
     let block: usize = arg(&args, "--block", "512").parse()?;
     let t0 = Instant::now();
     let (pcm, log) = render_perfect(&c, block);

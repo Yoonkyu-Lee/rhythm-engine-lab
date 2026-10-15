@@ -105,6 +105,18 @@ impl<'a> Mixer<'a> {
         into.extend(self.events.drain(..));
     }
 
+    /// 지난 블록 이후의 믹서 사건을 하나씩 넘긴다 (할당 없음. 실시간 콜백에서 SPSC 링으로 보낼 때).
+    pub fn drain_each(&mut self, mut f: impl FnMut(MixEvent)) {
+        for e in self.events.drain(..) {
+            f(e);
+        }
+    }
+
+    /// 지금까지 자동재생 커서가 지나간 이벤트 수.
+    pub fn auto_cursor(&self) -> usize {
+        self.cursor
+    }
+
     fn log(&mut self, e: MixEvent) {
         if self.events.len() < self.events_cap {
             self.events.push(e);
