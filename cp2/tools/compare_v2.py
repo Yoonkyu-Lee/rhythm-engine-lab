@@ -10,8 +10,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from analyze_v2 import analyze  # noqa: E402
 
-PROFILES = ["ours", "iidx", "djmax", "bms"]
-PNAME = {"ours": "우리 방식", "iidx": "IIDX 개량형", "djmax": "DJMAX식", "bms": "BMS식"}
+PROFILES = ["ours", "iidx", "iidx-dev", "djmax", "bms"]
+PNAME = {"ours": "우리 방식", "iidx": "IIDX 개량형 (반주 트랙 기준)", "iidx-dev": "IIDX 개량형 (장치 시계 기준)", "djmax": "DJMAX식", "bms": "BMS식"}
 PATHS = ["shared", "exclusive", "asio"]
 PATHNAME = {"shared": "공유", "exclusive": "배타", "asio": "ASIO"}
 FNAME = {"Audio": "오디오", "Render": "화면", "Judge": "판정", "Input": "입력"}
@@ -38,13 +38,14 @@ def main():
     reps = {}
     for prof in PROFILES:
         for p in PATHS:
-            c = sorted(runs.glob(f"f-{a.song}-{prof}-{p}-*"))
+            c = sorted(runs.glob(f"f-{a.song}-{prof}-{p}-[0-9]*"))
             if c:
                 print(f"분석: {c[-1].name}")
                 reps[(prof, p)] = analyze(c[-1], audio=False)
     L = ["# CP2 2-5 비교 표 (2차) — PERFECT 키음 vs 반주", "",
          f"곡: {a.song} (BMS 출신 표본 Unshakable, 노트 209). 고장 다섯 개: 오디오 150 ms(15초) · 화면 300 ms(30초) · 판정 500 ms(45초) · 입력 300 ms(60초) · 오디오 1초(75초).",
          "봇은 그 게임의 시계로 PERFECT 순간에 친다 (우리 방식은 기록 시계, 프레임 구동 프로필은 그 프로필의 곡 시각).",
+         "키음 짝짓기: 믹서 기록의 노트 곡 시각으로 정확히 (2026-10-16 외부 검토 반영, 이전 표의 시각 어림 짝짓기를 대체). BMS식의 재트리거로 끊긴 반주는 긴 소리 기준에서 뺀다.",
          "",
          "- **키음 vs 반주** = PERFECT 판정을 받은 누름의 키음 − 같은 곡 시각의 반주 (ms, 가장 크게 어긋난 값, 괄호 = 5 ms 넘게 어긋난 개수).",
          "  - 새 소리: 그 시각 앞뒤에 새로 울린 자동재생 기준. 긴 소리: 그 순간 이미 울리고 있던 2초 넘는 소리 기준.",

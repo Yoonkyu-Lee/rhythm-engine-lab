@@ -4,7 +4,7 @@ python -I -X utf8 cp2/tools/analyze_v2.py <runs/...> [...] [--no-audio]
 
 1. PERFECT 키음 vs 반주 (믹서 기록, 샘플 단위):
    - 키음: 그 누름이 요청한 플레이어 소리가 실제로 놓인 시간축 프레임.
-   - 반주(새 소리): 같은 곡 시각 T의 자동재생이 실제로 놓인 프레임 (T 앞뒤 2초 안에 실제로 시작한 자동재생들을 곡 시각으로 보간).
+   - 반주(새 소리): 곡 시각이 T에 가장 가까운 자동재생(2초 안)이 실제로 놓인 자리에서 본 T의 위치. 같은 거리면 더 크게 어긋난 쪽.
    - 반주(긴 소리): T에 울리고 있는 긴 자동재생 소리(2초 넘는 것)들의 해당 위치 = 그 소리의 시작 + (T − 그 소리의 곡 시각).
      그중 키음과 가장 크게 어긋난 것을 쓴다 (귀에 들리는 가장 나쁜 어긋남).
    - 값 = 키음 − 반주 (ms, +면 키음이 늦음). PERFECT 판정을 받은 누름만 센다.
@@ -78,6 +78,14 @@ def analyze(run, audio=True):
     aT = np.array([auto[i][0] for i in keep], dtype=float)
     aS = np.array([auto[i][1] for i in keep], dtype=int)
     aF = np.array([int(rows[i]["start"]) for i in keep], dtype=float)
+    if mix and "t_ns" in mix[0]:
+        # 믹서 기록에 곡 시각(t_ns)이 있으면 순서 대신 그것으로 정확히 짝짓는다 (순서 짝짓기는 한 블록에 몰린 요청에서 밀릴 수 있다)
+        ex = [(int(r["t_ns"]), int(r["sound"]), int(r["start"])) for r in rows if r["kind"] == "start" and r["start"] == r["due"] and r.get("t_ns")]
+        aT = np.array([e[0] for e in ex], dtype=float)
+        aS = np.array([e[1] for e in ex], dtype=int)
+        aF = np.array([e[2] for e in ex], dtype=float)
+        o = np.argsort(aT, kind="stable")
+        aT, aS, aF = aT[o], aS[o], aF[o]
     if meta.get("profile") == "ours":
         want = origin + d + np.floor(aT * rate / 1e9 + 0.5)
         mism = int(np.sum(np.abs(aF - want) > 0))
@@ -96,10 +104,11 @@ def analyze(run, audio=True):
         p_start_by_block.setdefault(int(r["block"]), int(r["start"]))
     # 플레이어 키음: 노트 곡 시각(t_ns, 믹서가 노트에서 붙인 값) → 실제 시작. 기록에 있으면 시각 어림 대신 이것으로 정확히 짝짓는다
     has_t = "t_ns" in (mix[0] if mix else {})
+    # 같은 노트 시각의 키음이 여럿일 수 있다 (빈 누름도 다음 노트의 소리를 울린다) → 놓인 순서대로 두고 판정 순서대로 하나씩 쓴다
     ks_by_t = {}
-    for r in p_rows:
-        if r.get("t_ns"):
-            ks_by_t.setdefault(int(r["t_ns"]), int(r["start"]))
+    for r in sorted((r for r in p_rows if r.get("t_ns")), key=lambda r: int(r["start"])):
+        ks_by_t.setdefault(int(r["t_ns"]), []).append(int(r["start"]))
+    note_t = [n[0] for n in cd["lanes"][0]]
     # 재트리거 끊기(BMS식): 끊긴 자동재생 소리는 그 프레임에서 끝난다 → "울리고 있는 긴 소리"에서 뺀다
     cut_end = np.full(len(aF), np.inf)
     by_sound = {}
@@ -122,6 +131,12 @@ def analyze(run, audio=True):
     hits = []
     for r in load_csv(run / "judgments.csv"):
         kind, grade = int(r["kind"]), int(r["grade"])
+        if kind == 1 and has_t and int(r["key_frame"]) < 0 and int(r["note"]) < len(note_t):
+            # 빈 누름이 울린 다음 노트의 소리: 그 노트의 키음 목록에서 하나를 소비한다
+            q = ks_by_t.get(note_t[int(r["note"])])
+            if q:
+                q.pop(0)
+            continue
         if kind not in (0, 7):
             continue
         T = (int(r["t_ns"]) - int(r["err_ns"])) / 1e9  # 노트 곡 시각 (초)
@@ -132,7 +147,8 @@ def analyze(run, audio=True):
             late_f = late_by_due.get(kf, 0)
         elif has_t:
             # 프레임 구동: 그 노트 시각을 붙인 플레이어 소리 (정확한 짝)
-            ks = ks_by_t.get(int(r["t_ns"]) - int(r["err_ns"]))
+            q = ks_by_t.get(int(r["t_ns"]) - int(r["err_ns"]))
+            ks = q.pop(0) if q else None
         else:
             # (t_ns 열이 없는 옛 기록) 이 판정을 처리한 순간 이후 처음 채운 블록의 플레이어 소리 — 옆 노트와 잘못 짝지어질 수 있다
             tl_proc = np.interp(int(r["q_proc"]), bq, btl)
@@ -146,9 +162,15 @@ def analyze(run, audio=True):
             hits.append(dict(T=T, grade=grade, ks=None, late_ms=late_f * 1e3 / rate))
             continue
         Tn = T * 1e9
-        # 새로 울린 소리: 이 시각 앞뒤 2초 안에 시작한 자동재생들로 보간 (범위 밖으로 끝값을 끌어오지 않게)
-        near = np.abs(aT - Tn) <= 2e9
-        new = np.interp(Tn, aT[near], aF[near]) if near.any() and aT[near].min() <= Tn <= aT[near].max() else np.nan
+        # 새로 울린 소리: 곡 시각이 가장 가까운 자동재생(2초 안)이 그 자리에서 가리키는 위치. 같은 거리면 더 크게 어긋난 쪽
+        # (보간은 오디오 정지 앞뒤처럼 자동재생 자리가 계단으로 바뀌는 곳에서 없는 값을 만든다)
+        dist = np.abs(aT - Tn)
+        if dist.size and dist.min() <= 2e9:
+            cand = np.nonzero(dist <= dist.min() + 1)[0]
+            pos = aF[cand] + (Tn - aT[cand]) / 1e9 * rate
+            new = pos[np.argmax(np.abs(ks - pos))]
+        else:
+            new = np.nan
         # 그 순간 울리고 있는 긴 소리 전부와 비교해 가장 크게 어긋난 것 (귀에 들리는 가장 나쁜 어긋남).
         # 가장 최근 것 하나만 보면, 고장 뒤에 새로 시작한 긴 소리가 고장 전부터 울리던 소리의 어긋남을 가린다.
         L = np.nonzero(is_long[aS] & (aT <= Tn) & (aT + snd_len[aS] * 1e9 > Tn) & (aF + (Tn - aT) / 1e9 * rate < cut_end))[0]
