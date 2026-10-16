@@ -18,6 +18,7 @@ mod asioprobe;
 mod asiorun;
 mod clockjump;
 mod input;
+mod perfect;
 mod sched;
 mod watch;
 

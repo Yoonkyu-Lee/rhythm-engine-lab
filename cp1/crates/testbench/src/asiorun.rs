@@ -220,8 +220,13 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mode = match arg(args, "--mode", "sample").as_str() {
         "sample" => Mode::Sample,
         "immediate" => Mode::Immediate,
-        m => return Err(format!("--mode 는 sample 또는 immediate: {m}").into()),
+        "perfect" => Mode::Perfect,
+        m => return Err(format!("--mode 는 sample · immediate · perfect: {m}").into()),
     };
+    let d_ms: f64 = arg(args, "--d-ms", "0").parse()?;
+    if mode == Mode::Perfect && d_ms <= 0.0 {
+        return Err("--mode perfect 에는 --d-ms (기록 시계 D) 가 필요".into());
+    }
     let fps: f64 = arg(args, "--fps", "144").parse()?;
     let secs: f64 = arg(args, "--secs", "50").parse()?;
     let lookahead_ms: f64 = arg(args, "--lookahead-ms", "100").parse()?;
@@ -235,7 +240,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let tag = format!(
         "{}-{}-{}",
-        match mode { Mode::Sample => format!("sample-{}", if late == LatePolicy::CutFront { "cut" } else { "whole" }), Mode::Immediate => format!("immediate-{fps:.0}fps") },
+        match mode { Mode::Sample => format!("sample-{}", if late == LatePolicy::CutFront { "cut" } else { "whole" }), Mode::Immediate => format!("immediate-{fps:.0}fps"), Mode::Perfect => format!("perfect-d{d_ms}") },
         if by_position { "pos" } else { "cb" },
         buffer
     );
@@ -309,9 +314,10 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         by_position,
         output_ready: false,
         rx,
-        mixer: Mixer::new(vec![sound0, Vec::new()], late), // 1번 = 요청 탐침용 무음
+        mixer: Mixer::new(vec![sound0, Vec::new(), CLICK.to_vec()], late), // 1번 = 요청 탐침용 무음, 2번 = 키음 (CP1-4 4-3)
         scratch: vec![0.0; 4096 * 2],
-        pilot_start: (PILOT_START_S * rate).round() as u64,
+        // 기준 클릭(오른쪽)은 PERFECT 누름 시험에서 끈다 (오른쪽을 키음이 쓴다)
+        pilot_start: if mode == Mode::Perfect { u64::MAX / 2 } else { (PILOT_START_S * rate).round() as u64 },
         pilot_period: (PILOT_PERIOD_S * rate).round() as u64,
         total,
         faults: faults.iter().copied().filter(|f| f.kind == 'A').collect(),
@@ -341,7 +347,14 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let req_probe = (probe_hz > 0.0).then(|| spawn_req_probe(clock.clone(), tx.clone(), probe_hz, done.clone()));
     let game_thread = {
         let (out, done) = (out.clone(), done.clone());
-        thread::spawn(move || game_loop(&out, mode, fps, secs, lookahead_ms, event_period, fb, tx, clock, done).map_err(|e| e.to_string()))
+        let fbc: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'B' || f.kind == 'C').collect();
+        thread::spawn(move || {
+            if mode == Mode::Perfect {
+                crate::perfect::perfect_loop(&out, secs, event_period, d_ms, fbc, tx, clock, done).map_err(|e| e.to_string())
+            } else {
+                game_loop(&out, mode, fps, secs, lookahead_ms, event_period, fb, tx, clock, done).map_err(|e| e.to_string())
+            }
+        })
     };
     // 콜백이 2초 넘게 멈추면 어느 단계에서 멈췄는지 알린다 (진단).
     let (mut last_report, mut last_in) = (std::time::Instant::now(), 0u64);
@@ -431,10 +444,10 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         entry.name, rate as u32, (buffer as f64 / rate * 1e7) as i64, rate as u64
     );
     fs::write(out.join("meta.json"), format!(
-        "{{\"path\": \"ASIO\", \"mode\": \"{}\", \"fps\": {fps}, \"lookahead_ms\": {lookahead_ms}, \"late\": \"{}\", \"sound\": \"{sound_kind}\", \"faults\": \"{}\", \"secs\": {secs}, \"qpc_freq\": {qf}, \
+        "{{\"path\": \"ASIO\", \"mode\": \"{}\", \"fps\": {fps}, \"lookahead_ms\": {lookahead_ms}, \"late\": \"{}\", \"sound\": \"{sound_kind}\", \"faults\": \"{}\", \"secs\": {secs}, \"d_ms\": {d_ms}, \"qpc_freq\": {qf}, \
          \"index\": \"{}\", \"asio_latency\": {{\"input\": {in_lat}, \"output\": {out_lat}}}, \"asio_latency_after_create\": {{\"input\": {in_lat_buf}, \"output\": {out_lat_buf}}}, \"output_ready\": {}, \"callbacks\": {}, \
          \"event\": {{\"start_s\": 1.0, \"period_s\": {event_period}}}, \"pilot\": {{\"start_s\": {PILOT_START_S}, \"period_s\": {PILOT_PERIOD_S}}}, \"render\": {m}, \"capture\": {m}}}\n",
-        if mode == Mode::Sample { "sample" } else { "immediate" },
+        match mode { Mode::Sample => "sample", Mode::Immediate => "immediate", Mode::Perfect => "perfect" },
         if late == LatePolicy::CutFront { "cut" } else { "whole" },
         arg(args, "--faults", ""),
         if by_position { "position" } else { "callback" },

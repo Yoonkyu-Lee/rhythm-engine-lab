@@ -5,8 +5,14 @@
 //! - `msg_time_ms`: Windows가 메시지에 붙인 시각 (`GetMessageTime`, ms 단위 틱). 스레드가 늦어도 보존되는지 3-2 단계에서 잰다.
 //!
 //! 전용 스레드가 메시지 전용 창을 만들고 `RIDEV_INPUTSINK`로 등록해, 창이 앞에 없어도 키보드 입력을 받는다.
+//!
+//! CP1-4: 메시지 시각으로 되돌리는 추정은 틱 경계를 넘으면 거의 기다리지 않은 입력도 한 틱(15–16 ms) 과거로 보낸다
+//! (CP2 1차 시도에서 발견). 그래서 "큐가 비어 있음을 마지막으로 확인한 순간"(`floor_qpc`)보다 과거로 가지 않게 자른다.
+//! 그 순간 이전의 입력은 이미 모두 넘겼으므로, 이 입력은 그 뒤에 들어온 것이 확실하다. 같은 값이 watermark다.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use windows::core::{w, Result};
@@ -19,8 +25,9 @@ use windows::Win32::UI::Input::{
     RID_INPUT, RIM_TYPEKEYBOARD,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageTime, GetMessageW, PostThreadMessageW, RegisterClassW,
-    HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT, WM_QUIT, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageTime, MsgWaitForMultipleObjects, PeekMessageW,
+    PostThreadMessageW, RegisterClassW, HWND_MESSAGE, MSG, PM_REMOVE, QS_ALLINPUT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_INPUT, WM_QUIT, WNDCLASSW,
 };
 
 use crate::qpc;
@@ -33,6 +40,8 @@ pub struct KeyEvent {
     pub msg_time_ms: u32,
     /// 메시지를 받은 순간의 GetTickCount. msg_time_ms와 같은 틱 시계라서, 둘의 차이 = 메시지가 기다린 시간(틱 해상도).
     pub tick_ms: u32,
+    /// 이 입력을 꺼내기 전, 큐가 비어 있음을 마지막으로 확인한 QPC. 누른 시각은 이보다 이를 수 없다.
+    pub floor_qpc: i64,
 }
 
 impl KeyEvent {
@@ -41,7 +50,7 @@ impl KeyEvent {
     /// 3-2 단계 측정: 평상시 +0.04 ms, 입력 스레드 100·300 ms 멈춤 중 +2.9 … +7.2 ms.
     pub fn estimated_qpc(&self, qpc_freq: i64) -> i64 {
         let waited_ms = self.tick_ms.wrapping_sub(self.msg_time_ms) as i64;
-        self.qpc - waited_ms * qpc_freq / 1000
+        (self.qpc - waited_ms * qpc_freq / 1000).max(self.floor_qpc)
     }
 }
 
@@ -50,6 +59,8 @@ const WM_STALL: u32 = WM_APP + 1;
 
 pub struct RawKeyboard {
     pub thread_id: u32,
+    /// 큐가 비어 있음을 마지막으로 확인한 QPC (이 시각 이전의 입력은 모두 보냈다는 생산자 계약). 1 ms마다라도 오른다.
+    pub watermark: Arc<AtomicI64>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -61,14 +72,16 @@ impl RawKeyboard {
     /// 입력 스레드를 띄운다. 키 이벤트는 `tx`로 보낸다.
     pub fn spawn(tx: Sender<KeyEvent>) -> Result<RawKeyboard> {
         let (id_tx, id_rx) = std::sync::mpsc::channel::<std::result::Result<u32, String>>();
+        let watermark = Arc::new(AtomicI64::new(0));
+        let wm = watermark.clone();
         let handle = thread::spawn(move || {
-            let r = unsafe { run(&tx, &id_tx) };
+            let r = unsafe { run(&tx, &id_tx, &wm) };
             if let Err(e) = r {
                 let _ = id_tx.send(Err(e.to_string()));
             }
         });
         match id_rx.recv() {
-            Ok(Ok(thread_id)) => Ok(RawKeyboard { thread_id, handle: Some(handle) }),
+            Ok(Ok(thread_id)) => Ok(RawKeyboard { thread_id, watermark, handle: Some(handle) }),
             Ok(Err(e)) => Err(windows::core::Error::new(windows::Win32::Foundation::E_FAIL, e)),
             Err(_) => Err(windows::core::Error::new(windows::Win32::Foundation::E_FAIL, "입력 스레드가 시작하지 못함")),
         }
@@ -91,7 +104,7 @@ impl RawKeyboard {
     }
 }
 
-unsafe fn run(tx: &Sender<KeyEvent>, id_tx: &std::sync::mpsc::Sender<std::result::Result<u32, String>>) -> Result<()> {
+unsafe fn run(tx: &Sender<KeyEvent>, id_tx: &std::sync::mpsc::Sender<std::result::Result<u32, String>>, wm: &AtomicI64) -> Result<()> {
     let hinst = GetModuleHandleW(None)?;
     let class = w!("cp1_raw_keyboard");
     let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: hinst.into(), lpszClassName: class, ..Default::default() };
@@ -103,41 +116,46 @@ unsafe fn run(tx: &Sender<KeyEvent>, id_tx: &std::sync::mpsc::Sender<std::result
 
     let mut msg = MSG::default();
     let mut buf = [0u8; 256];
+    let mut last_empty = qpc::now();
+    wm.store(last_empty, Ordering::Release);
     loop {
-        let r = GetMessageW(&mut msg, None, 0, 0);
-        if r.0 <= 0 {
-            break;
-        }
-        let q = qpc::now();
-        match msg.message {
-            WM_INPUT => {
-                let mt = GetMessageTime() as u32;
-                let tk = GetTickCount();
-                let mut size = buf.len() as u32;
-                let n = GetRawInputData(
-                    HRAWINPUT(msg.lParam.0 as _),
-                    RID_INPUT,
-                    Some(buf.as_mut_ptr() as *mut _),
-                    &mut size,
-                    std::mem::size_of::<RAWINPUTHEADER>() as u32,
-                );
-                if n != u32::MAX && n as usize >= std::mem::size_of::<RAWINPUTHEADER>() {
-                    let raw = &*(buf.as_ptr() as *const RAWINPUT);
-                    if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
-                        let kb = raw.data.keyboard;
-                        let down = kb.Flags & 0x01 == 0; // RI_KEY_BREAK = 1
-                        let _ = tx.send(KeyEvent { vkey: kb.VKey, down, qpc: q, msg_time_ms: mt, tick_ms: tk });
+        // 1 ms마다라도 깨어 watermark를 올린다 (입력이 없어도 받는 쪽이 "그 시각까지 입력 없음"을 알 수 있게)
+        MsgWaitForMultipleObjects(None, false, 1, QS_ALLINPUT);
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            let q = qpc::now();
+            match msg.message {
+                WM_QUIT => return Ok(()),
+                WM_INPUT => {
+                    let mt = GetMessageTime() as u32;
+                    let tk = GetTickCount();
+                    let mut size = buf.len() as u32;
+                    let n = GetRawInputData(
+                        HRAWINPUT(msg.lParam.0 as _),
+                        RID_INPUT,
+                        Some(buf.as_mut_ptr() as *mut _),
+                        &mut size,
+                        std::mem::size_of::<RAWINPUTHEADER>() as u32,
+                    );
+                    if n != u32::MAX && n as usize >= std::mem::size_of::<RAWINPUTHEADER>() {
+                        let raw = &*(buf.as_ptr() as *const RAWINPUT);
+                        if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
+                            let kb = raw.data.keyboard;
+                            let down = kb.Flags & 0x01 == 0; // RI_KEY_BREAK = 1
+                            let _ = tx.send(KeyEvent { vkey: kb.VKey, down, qpc: q, msg_time_ms: mt, tick_ms: tk, floor_qpc: last_empty });
+                        }
                     }
+                    DispatchMessageW(&msg);
                 }
-                DispatchMessageW(&msg);
-            }
-            m if m == WM_STALL => {
-                std::thread::sleep(std::time::Duration::from_millis(msg.wParam.0 as u64));
-            }
-            _ => {
-                DispatchMessageW(&msg);
+                m if m == WM_STALL => {
+                    std::thread::sleep(std::time::Duration::from_millis(msg.wParam.0 as u64));
+                }
+                _ => {
+                    DispatchMessageW(&msg);
+                }
             }
         }
+        // 큐가 비었다: 지금 이전의 입력은 모두 넘겼다
+        last_empty = qpc::now();
+        wm.store(last_empty, Ordering::Release);
     }
-    Ok(())
 }

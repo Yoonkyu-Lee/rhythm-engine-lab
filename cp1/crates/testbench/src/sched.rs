@@ -116,14 +116,21 @@ pub(crate) fn parse_faults(s: &str) -> Result<Vec<Fault>, String> {
 pub(crate) enum Mode {
     Sample,
     Immediate,
+    /// CP1-4 4-3: PERFECT 누름 (perfect.rs)
+    Perfect,
 }
 
 pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mode = match arg(args, "--mode", "sample").as_str() {
         "sample" => Mode::Sample,
         "immediate" => Mode::Immediate,
-        m => return Err(format!("--mode 는 sample 또는 immediate: {m}").into()),
+        "perfect" => Mode::Perfect,
+        m => return Err(format!("--mode 는 sample · immediate · perfect: {m}").into()),
     };
+    let d_ms: f64 = arg(args, "--d-ms", "0").parse()?;
+    if mode == Mode::Perfect && d_ms <= 0.0 {
+        return Err("--mode perfect 에는 --d-ms (기록 시계 D) 가 필요".into());
+    }
     let fps: f64 = arg(args, "--fps", "60").parse()?;
     let secs: f64 = arg(args, "--secs", "60").parse()?;
     let lookahead_ms: f64 = arg(args, "--lookahead-ms", "100").parse()?;
@@ -148,6 +155,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let tag = match mode {
         Mode::Sample => format!("sample-la{lookahead_ms:.0}-{}", if late == LatePolicy::CutFront { "cut" } else { "whole" }),
         Mode::Immediate => format!("immediate-{fps:.0}fps"),
+        Mode::Perfect => format!("perfect-{}-d{d_ms}", arg(args, "--wasapi", "shared")),
     };
     let out: PathBuf = Path::new(&arg(args, "--out", "runs")).join(format!("sched-{tag}-{unix}"));
     fs::create_dir_all(&out)?;
@@ -169,12 +177,18 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let ren = {
         let (out, name, clock, done) = (out.clone(), render_name.clone(), clock.clone(), render_done.clone());
         let fa: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'A').collect();
-        thread::spawn(move || render_loop(&name, wmode, skip, &out, secs, late, noise_s, fa, rx, clock, done))
+        let pilots = mode != Mode::Perfect;
+        thread::spawn(move || render_loop(&name, wmode, skip, pilots, &out, secs, late, noise_s, fa, rx, clock, done))
     };
     let fb: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'B').collect();
     let probe_hz: f64 = arg(args, "--probe-hz", "0").parse()?;
     let probe = (probe_hz > 0.0).then(|| spawn_req_probe(clock.clone(), tx.clone(), probe_hz, render_done.clone()));
-    let game = game_loop(&out, mode, fps, secs, lookahead_ms, event_period, fb, tx, clock, render_done.clone());
+    let game = if mode == Mode::Perfect {
+        let fbc: Vec<Fault> = faults.iter().copied().filter(|f| f.kind == 'B' || f.kind == 'C').collect();
+        crate::perfect::perfect_loop(&out, secs, event_period, d_ms, fbc, tx, clock, render_done.clone())
+    } else {
+        game_loop(&out, mode, fps, secs, lookahead_ms, event_period, fb, tx, clock, render_done.clone())
+    };
     if let Some(p) = probe {
         println!("  요청 탐침: {}개 보냄", p.join().map_err(|_| "탐침 스레드 패닉")?);
     }
@@ -194,11 +208,11 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut f = File::create(out.join("meta.json"))?;
     writeln!(
         f,
-        "{{\"path\": \"{}\", \"mode\": \"{}\", \"fps\": {fps}, \"lookahead_ms\": {lookahead_ms}, \"late\": \"{}\", \"sound\": \"{}\", \"faults\": \"{}\", \"secs\": {secs}, \"qpc_freq\": {}, \
+        "{{\"path\": \"{}\", \"mode\": \"{}\", \"fps\": {fps}, \"lookahead_ms\": {lookahead_ms}, \"late\": \"{}\", \"sound\": \"{}\", \"faults\": \"{}\", \"secs\": {secs}, \"d_ms\": {d_ms}, \"qpc_freq\": {}, \
          \"event\": {{\"start_s\": {EVENT_START_S}, \"period_s\": {event_period}}}, \"pilot\": {{\"start_s\": {PILOT_START_S}, \"period_s\": {PILOT_PERIOD_S}}}, \
          \"render\": {}, \"capture\": {}}}",
         wmode.name(),
-        if mode == Mode::Sample { "sample" } else { "immediate" },
+        match mode { Mode::Sample => "sample", Mode::Immediate => "immediate", Mode::Perfect => "perfect" },
         if late == LatePolicy::CutFront { "cut" } else { "whole" },
         sound_kind,
         arg(args, "--faults", ""),
@@ -265,14 +279,14 @@ pub(crate) fn game_loop(
         let now_frame = clock.load().frame_at((q as f64 * 1e7 / qf) as i64);
         while k < ev.len() {
             let due = match mode {
-                Mode::Sample => ev[k] as f64 <= now_frame + lookahead,
+                Mode::Sample | Mode::Perfect => ev[k] as f64 <= now_frame + lookahead,
                 Mode::Immediate => ev[k] as f64 <= now_frame,
             };
             if !due {
                 break;
             }
             let cmd = match mode {
-                Mode::Sample => Cmd::At { frame: ev[k], sound: 0, channel: 0 },
+                Mode::Sample | Mode::Perfect => Cmd::At { frame: ev[k], sound: 0, channel: 0 },
                 Mode::Immediate => Cmd::Now { sound: 0, channel: 0 },
             };
             tx.send(cmd)?;
@@ -296,7 +310,7 @@ pub(crate) fn game_loop(
 
 #[allow(clippy::too_many_arguments)]
 fn render_loop(
-    name: &str, wmode: wasapi::Mode, skip: bool, out: &Path, secs: f64, late: LatePolicy, noise_s: f64, faults: Vec<Fault>, rx: Receiver<Cmd>,
+    name: &str, wmode: wasapi::Mode, skip: bool, pilots_on: bool, out: &Path, secs: f64, late: LatePolicy, noise_s: f64, faults: Vec<Fault>, rx: Receiver<Cmd>,
     clock: Arc<SharedClock>, done: Arc<AtomicBool>,
 ) -> Result<Meta, String> {
     let r = (|| -> Result<Meta, Box<dyn std::error::Error>> {
@@ -318,7 +332,8 @@ fn render_loop(
         let (mut obs, obs_rx) = obs_ring(4096);
         let clock_thread = spawn_clock_thread(s.rate as f64, ClockPolicy::default(), obs_rx, clock.clone());
         let total = (secs * rate as f64).round() as u64;
-        let pilot_start = (PILOT_START_S * rate as f64).round() as u64;
+        // 기준 클릭은 오른쪽 채널: PERFECT 누름 시험에서는 오른쪽을 키음이 쓰므로 끈다
+        let pilot_start = if pilots_on { (PILOT_START_S * rate as f64).round() as u64 } else { u64::MAX / 2 };
         let pilot_period = (PILOT_PERIOD_S * rate as f64).round() as u64;
         let sound0 = if noise_s > 0.0 { noise_burst(s.rate as f64, noise_s) } else { CLICK.to_vec() };
         {
@@ -327,7 +342,7 @@ fn render_loop(
                 f.write_all(&v.to_le_bytes())?;
             }
         }
-        let mut mixer = Mixer::new(vec![sound0, Vec::new()], late); // 1번 = 요청 탐침용 무음
+        let mut mixer = Mixer::new(vec![sound0, Vec::new(), CLICK.to_vec()], late); // 1번 = 요청 탐침용 무음, 2번 = 키음 (CP1-4 4-3)
         let mut fired = vec![false; faults.len()];
         let mut flog = BufWriter::new(File::create(out.join("faults_render.csv"))?);
         writeln!(flog, "kind,at_s,ms,qpc_before,qpc_after,written")?;
