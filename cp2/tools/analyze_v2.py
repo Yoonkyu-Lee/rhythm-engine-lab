@@ -236,7 +236,7 @@ def analyze(run, audio=True):
             checked += 1
             if abs(dl) > 1:
                 shifts.append({"song_s": round((s0 - origin) / rate, 2), "shift_ms": round(dl * 1e3 / rate, 2)})
-        rep["integrity"] = {"lag_ms": round(L0 * 1e3 / rate, 2), "windows": checked, "shifted": len(shifts), "shifts": shifts[:20]}
+        rep["integrity"] = {"lag_ms": round(L0 * 1e3 / rate, 2), "windows": checked, "shifted": len(shifts), "shifts": shifts}
 
     rep["hits"] = [{k: (round(v, 3) if isinstance(v, float) else v) for k, v in h.items()} for h in hits]
     (run / "report_v2.json").write_text(json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
