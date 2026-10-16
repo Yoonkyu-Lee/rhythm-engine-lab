@@ -10,6 +10,7 @@
 mod audio;
 mod bot;
 mod capture;
+mod envlog;
 mod game;
 mod graph;
 mod input;

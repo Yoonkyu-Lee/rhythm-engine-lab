@@ -39,6 +39,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::audio::{self, AudioCfg};
 use crate::bot::{self, BotCfg, BotLog, BOT_KEY};
+use crate::envlog::EnvLog;
 use crate::graph::{LiveGraph, Mark};
 use crate::judging::{self, JudgeCfg, JudgeLog};
 use crate::monitor::{self, Heartbeats, LagEvent, MonitorShared, LAG_NAMES, STATE_NAMES};
@@ -388,6 +389,8 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut list = DrawList::default();
     let mut audio_gap_ms = 0.0;
     let mut graph = LiveGraph::new(&dir, qf)?;
+    let mut envlog = EnvLog::new(&dir, qf)?;
+    let mut env_gap = 0u64;
     let mut prev_skipped = 0i64;
     let mut prev_lags = [0u32; 9];
     let (mut prev_extra, mut prev_hold) = (0u64, 0u64);
@@ -610,6 +613,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         graph.draw(&mut list, now, 790.0, 200.0, 430.0, 480.0);
         rend.draw(&list)?;
         let ft = rend.present(vsync);
+        envlog.sample(qpc::now(), song_s, hwnd, ft.occluded, input.gap_win_us.swap(0, Ordering::Relaxed), &mut env_gap)?;
         // 화면 주기: 첫 vblank부터의 긴 기준선 (프레임마다 짧게 재면 출렁여 평균이 1% 넘게 길게 치우친다 — IIDX 틱 길이가 틀어짐)
         if ft.sync_qpc > 0 {
             if first_sync.is_none() {
@@ -642,6 +646,12 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     flog.flush()?;
     alog.flush()?;
     graph.flush()?;
+    envlog.flush()?;
+    let es = &envlog.sum;
+    let env_json = format!(
+        "{{\"not_foreground_s\": {:.2}, \"iconic_s\": {:.2}, \"occluded_s\": {:.2}, \"timer_res_max_us\": {:.1}, \"input_gap_max_us\": {}}}",
+        es.not_foreground_s, es.iconic_s, es.occluded_s, es.timer_res_max_us, es.input_gap_max_us
+    );
     a.stop.store(true, Ordering::Release);
     stop.store(true, Ordering::Release);
     let st = a.join.join().map_err(|_| "오디오 스레드 패닉")??;
@@ -670,7 +680,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let t = &view.tally;
     let snap = a.clock.load();
     let meta = format!(
-        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"{}\", \"slew\": [{}, {}],\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"period_frames\": {}, \"path\": \"{}\", \"origin\": {origin}, \"d_frames\": {}, \"need_max_frames\": {}, \"skips\": {}, \"skipped_frames\": {}, \"late_player\": {}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"display_offset_ns\": {display_offset_ns}, \"input_mmcss\": {input_mmcss}, \"input_gap_max_us\": {input_gap_max_us}, \"input_gap_over_2ms\": {input_gap_over_2ms}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"lag_counts\": [{}],\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"void\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
+        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"{}\", \"slew\": [{}, {}],\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"period_frames\": {}, \"path\": \"{}\", \"origin\": {origin}, \"d_frames\": {}, \"need_max_frames\": {}, \"skips\": {}, \"skipped_frames\": {}, \"late_player\": {}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"display_offset_ns\": {display_offset_ns}, \"input_mmcss\": {input_mmcss}, \"env\": {env_json}, \"input_gap_max_us\": {input_gap_max_us}, \"input_gap_over_2ms\": {input_gap_over_2ms}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"lag_counts\": [{}],\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"void\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
         path.replace('\\', "/"),
         chart.hash,
         chart.chart.title,

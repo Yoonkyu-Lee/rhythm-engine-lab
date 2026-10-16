@@ -64,6 +64,8 @@ pub struct FrameTiming {
     pub present_refresh: u32,
     pub sync_refresh: u32,
     pub sync_qpc: i64,
+    /// Present가 "그릴 곳이 보이지 않음"(DXGI_STATUS_OCCLUDED)을 돌려줬나: 창이 가려졌거나 최소화됐거나 화면이 꺼짐.
+    pub occluded: bool,
 }
 
 pub trait Renderer {
@@ -185,7 +187,8 @@ impl Renderer for D3D11Renderer {
         let mut t = self.pending;
         t.q_present_start = qpc::now();
         unsafe {
-            let _ = self.swap.Present(if vsync { 1 } else { 0 }, DXGI_PRESENT(0));
+            let hr = self.swap.Present(if vsync { 1 } else { 0 }, DXGI_PRESENT(0));
+            t.occluded = hr.0 == 0x087A0001; // DXGI_STATUS_OCCLUDED
         }
         t.q_present_end = qpc::now();
         let mut st = DXGI_FRAME_STATISTICS::default();

@@ -281,6 +281,9 @@ def analyze(run, audio=True):
     (run / "report_v2.json").write_text(json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
     a = rep["all"]
     print(f"{run.name}  [{rep['profile']}, {rep['path']}, D {rep['d_ms']} ms (필요 최대 {rep['need_max_ms']}), 건너뜀 {rep['skips']}]")
+    if meta.get("env"):
+        e = meta["env"]
+        print(f"  환경: 포그라운드 아님 {e['not_foreground_s']:.1f}초 · 최소화 {e['iconic_s']:.1f}초 · 가려짐 {e['occluded_s']:.1f}초 · 타이머 해상도 최대 {e['timer_res_max_us']/1e3:.1f} ms · 입력 스레드 깨어남 간격 최대 {e['input_gap_max_us']/1e3:.1f} ms")
     t = rep["tally"] or {}
     print(f"  판정 P{t.get('perfect')} G{t.get('great')} Good{t.get('good')} Bad{t.get('bad')} Miss{t.get('miss')} 무효{t.get('void')} | 늦은 키음 {late} · 버린 키음 {dropped}")
     print(f"  PERFECT {a['perfect']}개: 키음 vs 반주(새 소리) {fmt(a['ks_vs_new'])} · 5 ms 넘음 {a['off_new_5ms']}")

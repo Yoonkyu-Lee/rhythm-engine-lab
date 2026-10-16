@@ -44,6 +44,8 @@ pub struct Input {
     /// 입력 스레드가 깨어난 간격: 최대(µs)와 2 ms 넘은 횟수 (1 ms 대기가 지켜지는지)
     pub gap_max_us: Arc<AtomicU64>,
     pub gap_over_2ms: Arc<AtomicU64>,
+    /// 마지막으로 읽은 뒤의 가장 긴 깨어남 간격 (µs, 읽는 쪽이 0으로 되돌림: 환경 기록용)
+    pub gap_win_us: Arc<AtomicU64>,
     /// 입력 스레드를 MMCSS(Pro Audio)에 등록했나
     pub mmcss: bool,
     stop: Arc<AtomicBool>,
@@ -61,22 +63,23 @@ impl Input {
         let stop = Arc::new(AtomicBool::new(false));
         let gap_max_us = Arc::new(AtomicU64::new(0));
         let gap_over_2ms = Arc::new(AtomicU64::new(0));
+        let gap_win_us = Arc::new(AtomicU64::new(0));
         let (id_tx, id_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
-        let (wm, lo, st, gm, go) = (watermark.clone(), lost.clone(), stop.clone(), gap_max_us.clone(), gap_over_2ms.clone());
+        let (wm, lo, st, gm, go, gw) = (watermark.clone(), lost.clone(), stop.clone(), gap_max_us.clone(), gap_over_2ms.clone(), gap_win_us.clone());
         let join = thread::Builder::new()
             .name("input".into())
             .spawn(move || {
                 if mmcss {
                     let _ = synchronizer::wasapi::mmcss_pro_audio();
                 }
-                let r = unsafe { run(&mut tx, &wm, &lo, &st, &id_tx, &gm, &go) };
+                let r = unsafe { run(&mut tx, &wm, &lo, &st, &id_tx, &gm, &go, &gw) };
                 if let Err(e) = r {
                     let _ = id_tx.send(Err(e.to_string()));
                 }
             })
             .map_err(|e| e.to_string())?;
         let thread_id = id_rx.recv().map_err(|_| "입력 스레드가 시작하지 못함".to_string())??;
-        Ok(Input { thread_id, poll_stall: Arc::new(std::sync::atomic::AtomicU32::new(0)), watermark, lost, gap_max_us, gap_over_2ms, mmcss, stop, join: Some(join) })
+        Ok(Input { thread_id, poll_stall: Arc::new(std::sync::atomic::AtomicU32::new(0)), watermark, lost, gap_max_us, gap_over_2ms, gap_win_us, mmcss, stop, join: Some(join) })
     }
 
     /// BMS 구동기식 입력: 1 kHz로 키 상태를 폴링하고, 바뀐 것을 본 폴링 시각을 입력 시각으로 쓴다.
@@ -121,7 +124,7 @@ impl Input {
                 }
             })
             .map_err(|e| e.to_string())?;
-        Ok(Input { thread_id: 0, poll_stall, watermark, lost, gap_max_us: Arc::new(AtomicU64::new(0)), gap_over_2ms: Arc::new(AtomicU64::new(0)), mmcss: false, stop, join: Some(join) })
+        Ok(Input { thread_id: 0, poll_stall, watermark, lost, gap_max_us: Arc::new(AtomicU64::new(0)), gap_over_2ms: Arc::new(AtomicU64::new(0)), gap_win_us: Arc::new(AtomicU64::new(0)), mmcss: false, stop, join: Some(join) })
     }
 
     /// 입력 스레드를 `ms` 동안 재운다 (고장 C).
@@ -156,6 +159,7 @@ unsafe fn run(
     id_tx: &std::sync::mpsc::Sender<Result<u32, String>>,
     gap_max_us: &AtomicU64,
     gap_over_2ms: &AtomicU64,
+    gap_win_us: &AtomicU64,
 ) -> windows::core::Result<()> {
     let hinst = GetModuleHandleW(None)?;
     let class = w!("cp2_raw_keyboard");
@@ -175,6 +179,7 @@ unsafe fn run(
         // 깨어난 간격 (직전 '큐가 비었다' 확인부터): 1 ms 대기가 실제로 몇 ms였나
         let gap_us = ((qpc::now() - last_empty) as i128 * 1_000_000 / freq as i128) as u64;
         gap_max_us.fetch_max(gap_us, Ordering::Relaxed);
+        gap_win_us.fetch_max(gap_us, Ordering::Relaxed);
         if gap_us > 2000 {
             gap_over_2ms.fetch_add(1, Ordering::Relaxed);
         }
