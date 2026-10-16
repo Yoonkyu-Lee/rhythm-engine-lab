@@ -6,7 +6,9 @@
 //! 상태 (설계안 9장의 최소 버전):
 //! - Running: 정상.
 //! - Suspect: 오디오·입력·판정 경로의 정지가 진행 중. 판정은 계속하되 이 동안의 판정에 상태를 붙여 기록한다.
-//! - Resyncing: 언더런이나 시계 점프 뒤, 새 대응(epoch)이 `RESYNC_STABLE_MS` 동안 다시 안정될 때까지.
+//! - Resyncing: 시계 점프(장치 시계 epoch 변경) 뒤, 새 대응이 `RESYNC_STABLE_MS` 동안 다시 안정될 때까지.
+//!   CP2 2차: 우리 방식은 오디오가 멈추면 콘텐츠를 건너뛰어 시간축을 잇는다(시계가 튀지 않음) → "콘텐츠 건너뜀" 사건만 남고
+//!   재동기화할 것이 없다. 시계 점프는 건너뛰기를 쓰지 않는 프레임 구동 프로필에서만 난다.
 //! 화면만 멈춘 것은 판정·소리에 영향이 없으므로 상태를 바꾸지 않고 사건만 남긴다.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, Ordering};
@@ -48,9 +50,11 @@ pub enum LagKind {
     StateChange = 6,
     /// 재동기화가 끝난 순간, 밀리기 전 직선과 지금 직선이 같은 순간을 어디로 보는지의 차이 (확정된 총 밀림).
     ResyncDone = 7,
+    /// 오디오 정지 뒤 콘텐츠를 건너뛰었다 (magnitude = 건너뛴 길이 µs). 시간축은 끊기지 않았다.
+    ContentSkip = 8,
 }
 
-pub const LAG_NAMES: [&str; 8] = ["오디오 정지", "언더런", "시계 점프", "화면 정지", "판정 정지", "입력 정지", "상태", "재동기화 완료"];
+pub const LAG_NAMES: [&str; 9] = ["오디오 정지", "언더런", "시계 점프", "화면 정지", "판정 정지", "입력 정지", "상태", "재동기화 완료", "콘텐츠 건너뜀"];
 
 /// 렉 사건 하나. 정지류: start = 마지막 맥박, detect = 기준을 넘긴 것을 본 순간, end = 맥박이 돌아온 순간 (0이면 진행 중).
 /// 시계 점프: magnitude_us = 새 직선과 옛 직선이 같은 순간에 가리키는 위치 차이(µs, +면 장치가 뒤처짐). 상태: magnitude = 새 상태.
@@ -74,7 +78,7 @@ pub struct Heartbeats {
 #[derive(Default)]
 pub struct MonitorShared {
     pub state: AtomicU8,
-    pub counts: [AtomicU32; 8],
+    pub counts: [AtomicU32; 9],
     /// 최근 사건 (화면 표시용, 최대 6개).
     pub recent: Mutex<Vec<LagEvent>>,
 }
@@ -104,6 +108,7 @@ pub fn spawn(
             let kinds = [LagKind::AudioStall, LagKind::RenderStall, LagKind::JudgeStall, LagKind::InputStall];
             let limits = [AUDIO_STALL_MS, RENDER_STALL_MS, JUDGE_STALL_MS, INPUT_STALL_MS];
             let mut underruns = audio.underruns.load(Ordering::Relaxed);
+            let mut skipped = audio.skipped_frames.load(Ordering::Relaxed);
             let mut snap = clock.load();
             let mut state = State::Running;
             let mut resync_since: Option<i64> = None;
@@ -150,13 +155,13 @@ pub fn spawn(
                 if u > underruns {
                     underruns = u;
                     push(LagEvent { kind: LagKind::Underrun as u8, q_start: audio.last_wake_qpc.load(Ordering::Relaxed), q_detect: now, q_end: 0, magnitude_us: 0 }, &sh, &mut log);
-                    resync_since = None;
-                    if state != State::Resyncing {
-                        state = State::Resyncing;
-                    }
-                    if pre.is_none() {
-                        pre = Some(snap);
-                    }
+                }
+                // 콘텐츠 건너뜀 (우리 방식: 시간축은 그대로)
+                let sk = audio.skipped_frames.load(Ordering::Relaxed);
+                if sk > skipped && snap.valid {
+                    let us = ((sk - skipped) as f64 / snap.nominal_rate * 1e6) as i64;
+                    skipped = sk;
+                    push(LagEvent { kind: LagKind::ContentSkip as u8, q_start: audio.last_wake_qpc.load(Ordering::Relaxed), q_detect: now, q_end: 0, magnitude_us: us }, &sh, &mut log);
                 }
                 // 시계 점프 (epoch 변경): 같은 순간을 옛 직선과 새 직선이 어디로 보는지
                 let ns = clock.load();
@@ -179,11 +184,6 @@ pub fn spawn(
                 let next = if state == State::Resyncing {
                     match resync_since {
                         Some(t) if ms(now - t) >= RESYNC_STABLE_MS && !path_stall => State::Running,
-                        None if !stalls[0].active => {
-                            // 언더런 뒤 아직 시계 점프를 못 봤으면, 오디오가 돌아온 시점부터 안정 시간을 센다
-                            resync_since = Some(now);
-                            State::Resyncing
-                        }
                         _ => State::Resyncing,
                     }
                 } else if path_stall {

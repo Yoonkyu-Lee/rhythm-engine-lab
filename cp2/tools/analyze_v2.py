@@ -4,7 +4,7 @@ python -I -X utf8 cp2/tools/analyze_v2.py <runs/...> [...] [--no-audio]
 
 1. PERFECT 키음 vs 반주 (믹서 기록, 샘플 단위):
    - 키음: 그 누름이 요청한 플레이어 소리가 실제로 놓인 시간축 프레임.
-   - 반주(새 소리): 같은 곡 시각 T의 자동재생이 실제로 놓인 프레임 (실제 자동재생 시작들을 곡 시각으로 보간).
+   - 반주(새 소리): 같은 곡 시각 T의 자동재생이 실제로 놓인 프레임 (T 앞뒤 2초 안에 실제로 시작한 자동재생들을 곡 시각으로 보간).
    - 반주(긴 소리): T에 이미 울리고 있던 긴 자동재생 소리(2초 넘는 것)의 해당 위치 = 그 소리의 시작 + (T − 그 소리의 곡 시각).
    - 값 = 키음 − 반주 (ms, +면 키음이 늦음). PERFECT 판정을 받은 누름만 센다.
    - 잔차 = 값 − 그 게임이 매긴 판정 오차. 판정이 "맞다"고 한 만큼 키음이 반주에 맞았는가 (우리 방식이 정확하면 0).
@@ -110,16 +110,18 @@ def analyze(run, audio=True):
             hits.append(dict(T=T, grade=grade, ks=None))
             continue
         Tn = T * 1e9
-        new = np.interp(Tn, aT[short], aF[short]) if short.any() else np.nan
+        # 새로 울린 소리: 이 시각 앞뒤 2초 안에 시작한 자동재생들로 보간 (범위 밖으로 끝값을 끌어오지 않게)
+        near = np.abs(aT - Tn) <= 2e9
+        new = np.interp(Tn, aT[near], aF[near]) if near.any() and aT[near].min() <= Tn <= aT[near].max() else np.nan
         L = np.nonzero(is_long[aS] & (aT <= Tn) & (aT + snd_len[aS] * 1e9 > Tn))[0]
         lng = aF[L[-1]] + (Tn - aT[L[-1]]) / 1e9 * rate if L.size else np.nan
         err = int(r["err_ns"]) / 1e6  # 그 게임이 매긴 판정 오차
-        hits.append(dict(T=T, grade=grade, ks=ks, err=err, new=(ks - new) * 1e3 / rate, long=(ks - lng) * 1e3 / rate if L.size else None))
+        hits.append(dict(T=T, grade=grade, ks=ks, err=err, new=(ks - new) * 1e3 / rate if np.isfinite(new) else None, long=(ks - lng) * 1e3 / rate if L.size else None))
 
     def summarize(hs):
         pf = [h for h in hs if h["grade"] == 0 and h["ks"] is not None]
-        nv = [h["new"] for h in pf]
-        rv = [h["new"] - h["err"] for h in pf]
+        nv = [h["new"] for h in pf if h["new"] is not None]
+        rv = [h["new"] - h["err"] for h in pf if h["new"] is not None]
         lv = [h["long"] for h in pf if h["long"] is not None]
         return dict(perfect=len(pf), perfect_no_keysound=sum(1 for h in hs if h["grade"] == 0 and h["ks"] is None),
                     ks_vs_new=pct(nv), ks_vs_long=pct(lv), residual=pct(rv),

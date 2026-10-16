@@ -513,9 +513,9 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 input.lost.load(Ordering::Relaxed)
             ),
             format!(
-                "감지: 오디오 정지 {} · 언더런 {} · 시계 점프 {} · 화면 정지 {} · 판정 정지 {} · 입력 정지 {}",
+                "감지: 오디오 정지 {} · 콘텐츠 건너뜀 {} · 시계 점프 {} · 화면 정지 {} · 판정 정지 {} · 입력 정지 {}",
                 mon.counts[0].load(Ordering::Relaxed),
-                mon.counts[1].load(Ordering::Relaxed),
+                mon.counts[8].load(Ordering::Relaxed),
                 mon.counts[2].load(Ordering::Relaxed),
                 mon.counts[3].load(Ordering::Relaxed),
                 mon.counts[4].load(Ordering::Relaxed),
@@ -535,7 +535,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             for (i, e) in r.iter().rev().enumerate() {
                 let s = match e.kind {
                     6 => format!("상태 → {}", STATE_NAMES[e.magnitude_us as usize]),
-                    2 | 7 => format!("{} {:+.1} ms", LAG_NAMES[e.kind as usize], e.magnitude_us as f64 / 1e3),
+                    2 | 7 | 8 => format!("{} {:+.1} ms", LAG_NAMES[e.kind as usize], e.magnitude_us as f64 / 1e3),
                     1 => LAG_NAMES[1].to_string(),
                     k => format!("{} {:.0} ms (감지 {:.0} ms 뒤)", LAG_NAMES[k as usize], e.magnitude_us as f64 / 1e3, (e.q_detect - e.q_start) as f64 * 1e3 / qf as f64),
                 };
