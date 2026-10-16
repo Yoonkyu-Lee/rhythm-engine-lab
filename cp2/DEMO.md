@@ -25,6 +25,10 @@
 | BlythE (DJMAX, 원본 복호화) | `content\djmax_1_4b_nm_t6\chart.rtc` | 노트 103 (롱노트 11) |
 | Negative Nature (DJMAX, 원본 복호화) | `content\djmax_72_4b_nm_t6\chart.rtc` | 노트 42 (롱노트 10), 템포 변화 |
 | 합성 곡 | `content\synth\synth.rtc` | 120 BPM 4분음표 256개, 9초 패드 |
+| D2 (DJMAX, 원본 복호화) | `content\djmax_254_4b_nm_t4\chart.rtc` | 4B NM 트랙 4, 노트 148 (롱 1), 115초 |
+| SON OF SUN ~Extended Mix~ (DJMAX, 원본 복호화) | `content\djmax_219_4b_nm_t6\chart.rtc` | 4B NM 트랙 6, 노트 261 (롱 31), 190초 |
+| Blind Justice ～Torn souls, Hurt Faiths～ (IIDX 14, 원본 .1·.2dx) | `content\iidx_14014_sph_l0\chart.rtc` | SP HYPER 1번 건반, 노트 184, 템포 변화 165 → 156 → 137, 131초 |
+| ANEMONE (IIDX 29, 원본 .1·.s3p) | `content\iidx_29008_sph_l4\chart.rtc` | SP HYPER 5번 건반, 노트 126, 117초 |
 
 ## 오디오 경로
 
