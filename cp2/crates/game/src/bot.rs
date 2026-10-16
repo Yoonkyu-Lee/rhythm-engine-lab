@@ -5,6 +5,7 @@
 //! 롱노트는 끝까지 누르고, 단노트는 30 ms 뒤에 뗀다. 실제로 보낸 QPC를 기록한다.
 //! 프레임 구동 프로필(CP2 2차 2-4): `follow`가 있으면 장치 시계 대신 그 게임의 시계로 친다 — 그 게임 화면을 보고 PERFECT 순간에
 //! 누르는 사람. 게임이 프레임마다 (프레임 QPC, 그때의 곡 시각)을 공개하고, 봇은 시각이 1배속으로 흐른다고 보고 목표 시각을 구한다.
+//! 오토 토글: `enabled`가 꺼져 있으면 그 노트는 누르지 않는다 (이미 누른 노트는 끝까지 뗀다). 게임에서 F5로 켜고 끈다.
 //! 사람 흉내(adapt_ns > 0): 음악이 밀려 장치 시계가 새 epoch로 바뀌어도 그 뒤 adapt_ns 동안은 옛 시계(옛 박자)로 치다가 그다음에 새 박자를 따른다.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,6 +69,8 @@ pub struct BotCfg {
     pub adapt_ns: i64,
     /// 그 게임의 시계로 친다 (프레임 구동 프로필).
     pub follow: Option<Arc<ProfileClock>>,
+    /// 오토 켜짐 (누름 순간에 본다).
+    pub enabled: Arc<AtomicBool>,
 }
 
 /// 봇이 믿는 시계: 같은 epoch 안에서는 최신 직선, 새 epoch는 처음 본 뒤 adapt_ns가 지나야 받아들인다.
@@ -157,7 +160,12 @@ pub fn spawn(chart: Arc<Compiled>, cfg: BotCfg, clock: Arc<SharedClock>, mut log
                 evs.push((up, false, i as u32));
             }
             evs.sort_by_key(|e| (e.0, e.1)); // 같은 시각이면 뗌 먼저
+            let mut held = vec![false; chart.chart.lanes[0].notes.len()];
             for (t, down, note) in evs {
+                // 누르지 않은 노트는 떼지 않는다. 누름은 그 시각까지 기다린 뒤 오토가 켜져 있을 때만
+                if !down && !held[note as usize] {
+                    continue;
+                }
                 // 시계가 생길 때까지, 그리고 목표 2초 전까지는 시계를 다시 읽으며 기다린다 (최신 직선 사용)
                 let q = loop {
                     if stop.load(Ordering::Relaxed) {
@@ -186,6 +194,10 @@ pub fn spawn(chart: Arc<Compiled>, cfg: BotCfg, clock: Arc<SharedClock>, mut log
                 if !wait_until(q, &stop) {
                     return;
                 }
+                if down && !cfg.enabled.load(Ordering::Relaxed) {
+                    continue; // 오토 꺼짐: 이 노트는 건너뜀
+                }
+                held[note as usize] = down;
                 let q_sent = qpc::now();
                 send(down);
                 let _ = log.push(BotLog { note, down, target_ns: t, q_target: q, q_sent });

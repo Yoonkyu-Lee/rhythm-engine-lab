@@ -9,7 +9,7 @@
 //! 시계: 기록 시계 C = 장치 시계 + D (CP1-4). 오디오 정지는 콘텐츠를 건너뛰어 시간축을 잇는다 (우리 방식).
 //! 스레드: 화면(이 스레드) · 오디오 · 입력 · 판정 · 봇 · 녹음 · 기록. 실시간 스레드끼리는 SPSC 링과 원자 변수만 쓴다.
 //! 고장 주입: 곡 시각 예약(--faults) 또는 단축키 F1 오디오 · F2 화면 · F3 판정 · F4 입력 (길이는 + / − 로 두 배·절반, 50 ms ~ 4초).
-//! 사람이 칠 때 키: Space, J, F (봇은 F24).
+//! 사람이 칠 때 키: Space, J, F (봇은 F24). F5: 오토(봇) 켜기·끄기 (--bot이면 켜진 채로 시작).
 //! 출력: runs/<tag>-<시각>/ meta.json, audio_blocks.csv, mix_events.csv, judgments.csv, bot.csv, frames.csv, faults.csv, capture_*.
 
 use std::fs::{self, File};
@@ -337,7 +337,9 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         (judging::JudgeShared::new(1), None, Some(l))
     };
     let pclock = Arc::new(bot::ProfileClock::default());
-    let bot_join = use_bot.then(|| {
+    // 봇은 늘 띄워 두고 F5로 켜고 끈다 (--bot = 켜진 채로 시작)
+    let auto_on = Arc::new(AtomicBool::new(use_bot));
+    let bot_join = Some({
         let cfg = BotCfg {
             origin,
             rate,
@@ -347,6 +349,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             seed: 12345,
             adapt_ns: (arg(args, "--bot-adapt-ms", "0").parse::<f64>().unwrap_or(0.0) * 1e6) as i64,
             follow: (profile != Profile::Ours).then(|| pclock.clone()),
+            enabled: auto_on.clone(),
         };
         bot::spawn(chart.clone(), cfg, a.clock.clone(), bot_tx, stop.clone())
     });
@@ -354,6 +357,9 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let logger = spawn_logger(dir.clone(), Logs { blocks: blk_rx, mix: mix_rx, judge: jl_rx, bot: bot_rx, frames: fr_rx, lags: lag_rx }, log_stop.clone());
     let mut flog = BufWriter::new(File::create(dir.join("faults.csv"))?);
     writeln!(flog, "kind,at_song_s,ms,q,source")?;
+    let mut alog = BufWriter::new(File::create(dir.join("auto.csv"))?);
+    writeln!(alog, "on,at_song_s,q")?;
+    writeln!(alog, "{},start,0", use_bot as u8)?;
 
     let hwnd = create_window()?;
     let mut rend = D3D11Renderer::new(hwnd, W, H)?;
@@ -454,6 +460,11 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             // + / − (본 자판·숫자 자판): 고장 길이 두 배 · 절반 (50 ms ~ 4초. 화면이 5초 넘게 멈추면 Windows가 "응답 없음"으로 표시한다)
             0xBB | 0x6B => fault_ms = (fault_ms * 2).min(4000),
             0xBD | 0x6D => fault_ms = (fault_ms / 2).max(50),
+            0x74 => {
+                let on = !auto_on.load(Ordering::Relaxed);
+                auto_on.store(on, Ordering::Relaxed);
+                writeln!(alog, "{},{song_s:.3},{}", on as u8, qpc::now())?;
+            }
             0x1B => quit = true,
             _ => {}
         }
@@ -527,7 +538,10 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 mon.counts[4].load(Ordering::Relaxed),
                 mon.counts[5].load(Ordering::Relaxed)
             ),
-            format!("고장 {fault_ms} ms (+ / − 로 바꿈): F1 오디오 · F2 화면 · F3 판정 · F4 입력 · Esc 끝"),
+            format!(
+                "오토 {} (F5) | 고장 {fault_ms} ms (+ / − 로 바꿈): F1 오디오 · F2 화면 · F3 판정 · F4 입력 · Esc 끝",
+                if auto_on.load(Ordering::Relaxed) { "켜짐" } else { "꺼짐" }
+            ),
         ];
         for (i, s) in lines.iter().enumerate() {
             list.text(16.0, 12.0 + i as f32 * 22.0, 15.0, hud, s.as_str());
@@ -580,6 +594,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     flog.flush()?;
+    alog.flush()?;
     a.stop.store(true, Ordering::Release);
     stop.store(true, Ordering::Release);
     let st = a.join.join().map_err(|_| "오디오 스레드 패닉")??;
