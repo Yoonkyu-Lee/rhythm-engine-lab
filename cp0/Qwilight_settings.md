@@ -36,7 +36,7 @@
 ### 0-2. 게임 디자인 관점에서 눈에 띄는 자유도
 
 1. **음악 속도와 피치 보정을 분리**: `AudioMultiplier`(0.5 ~ 2.0배)는 곡 시계와 소리를 함께 빠르게 합니다. `AudioMultiplierAtone`("피치 보정")을 켜면 FMOD 피치 시프트 DSP로 음높이를 되돌립니다. (확인)
-2. **화면 속도는 "BPM × 배속" 목표값으로 지정**: `MultiplierValue`를 기준 BPM으로 나눠 실제 배속을 구하므로, 곡이 바뀌어도 노트가 내려오는 속도가 일정합니다. 기준 BPM은 시작·최빈·최고·최저 중에서 고를 수 있습니다(`BPMStandardVarietyValueV2`). (확인)
+2. **화면 속도는 "BPM × 배속" 목표값으로 지정**: `MultiplierValue`를 기준 BPM으로 나눠 실제 배속을 구하므로, 곡이 바뀌어도 노트가 내려오는 속도가 일정합니다. 기준 BPM은 최빈(기본)·시작·최저·최고 중에서 고를 수 있습니다(`BPMStandardVarietyValueV2`). (확인)
 3. **판정 창과 게이지를 숫자로 직접 정의**: 판정은 `FavorJudgments`(6등급 × 빠름/늦음 ms), 게이지는 `FavorHitPoints`(6등급 × 토탈 비례/절대 증감)로 정하고, 이름 붙은 프리셋으로 저장합니다. 기본 프리셋으로 LR2 EZ/NM 값이 들어 있습니다. (확인)
 4. **게이지 자동 전환(GAS)과 무한 모드**:
    - `GASLevel`(1 ~ 4)은 어느 게이지까지 GAS를 허용할지 정합니다(Yell ≥ 1, 하드코어 ≥ 2, 매우 어려움 ≥ 3, 어려움 ≥ 4). 게임 안내 문구에 따르면 게이지가 0이 되면 끝나지 않고 다음 게이지로 내려갑니다. (확인: 조건식·안내 문구 / 추정: 내부 동시 계산)
@@ -284,7 +284,7 @@
 | `JudgmentVisualizerMillis` | 판정 비주얼라이저 출력 지속 시간 | ms, 1000 | 비주얼라이저 점 유지 시간(`JudgmentVisualizer.Set`) | [프론트] | 확인 |
 | `JudgmentVSVisualizers` | 판정 개수 비율 = 체크 / 체크 안 함 | bool[6], [T,F,F,F,F,F] | 비율 계산의 분자 등급 | [프론트] | 확인 |
 | `BPMVarietyValueV2` | BPM 출력 방식 | 선택지 `BPMVariety.BPM` / `AudioMultiplier` / `Multiplier` (1) | 화면 BPM 숫자 계산법(그대로 / 음악 속도 반영 / 배속 반영) | [프론트] | 확인(선택지 이름) / 추정(계산법) |
-| `BPMStandardVarietyValueV2` | BPM 출력 방식(선곡) / 기준 BPM | 0 시작, 1 최빈, 2 최고, 3 최저 BPM (0) | 기준 BPM 선택 → 스크롤 속도 환산(`Computing.get_BPMStandard` → `ModeComponent.get_Multiplier`)과 선곡 표시 | [프론트] | 확인 |
+| `BPMStandardVarietyValueV2` | BPM 출력 방식(선곡) / 기준 BPM | 0 최빈(재생 시간이 가장 긴 BPM×SCROLL), 1 시작, 2 최저, 3 최고 BPM (0) — 순서 정정 2026-10-16, Qwilight_scroll_policy.md 2-4 | 기준 BPM 선택 → 스크롤 속도 환산(`Computing.get_BPMStandard` → `ModeComponent.get_Multiplier`)과 선곡 표시 | [프론트] | 확인 |
 | `HunterVarietyV3Value` | 점수 격차 기준 | 1등·선두·후미·사용자 지정·내 기록 (4) | 점수 격차 비교 대상 | [프론트] | 확인 |
 | `FavorHunterStand` | (사용자 지정 점수) | int (0) | 사용자 지정 비교 점수 | [프론트] | 확인 |
 | `NetCommentFollow` | 실시간 랭킹 업데이트 | bool, true | 플레이 중 랭킹을 계속 받아옴 | [프론트] | 확인 |
