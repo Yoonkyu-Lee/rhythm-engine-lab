@@ -70,6 +70,13 @@ const MAX_DT_NS: i64 = 333_333_333; // Unity maximumDeltaTime
 const SLEW_LATE_NS: i64 = 17_000_000;
 const SLEW_EARLY_NS: i64 = 34_000_000;
 /// 미세 보정의 시정수: 어긋남을 이 시간에 걸쳐 지수적으로 줄인다 (속도 변화 = 어긋남 / 시정수, 최대 ±5%).
+/// 실험용 데드밴드 덮어쓰기: CP2_SLEW_MS="늦음,앞섬" (ms)
+fn slew_env() -> (i64, i64) {
+    std::env::var("CP2_SLEW_MS").ok().and_then(|v| {
+        let mut it = v.split(',').map(|x| x.trim().parse::<f64>().ok());
+        Some(((it.next()?? * 1e6) as i64, (it.next()?? * 1e6) as i64))
+    }).unwrap_or((SLEW_LATE_NS, SLEW_EARLY_NS))
+}
 const FINE_TAU_NS: i64 = 500_000_000;
 
 pub struct FrameLogic {
@@ -103,6 +110,9 @@ pub struct FrameLogic {
     pub slew_hold: u64,
     /// 마지막 비교의 (차트 − 오디오) ns
     pub slew_err_ns: i64,
+    /// 데드밴드 (늦음 한계, 앞섬 한계) ns. 기본 17 / 34 ms, 실험용으로 환경 변수 CP2_SLEW_MS="늦음,앞섬"
+    slew_late_ns: i64,
+    slew_early_ns: i64,
     keys_in: Consumer<KeyEvent>,
     key_out: Producer<KeyReq>,
     log: Producer<JudgeLog>,
@@ -149,6 +159,8 @@ impl FrameLogic {
             slew_extra: 0,
             slew_hold: 0,
             slew_err_ns: 0,
+            slew_late_ns: slew_env().0,
+            slew_early_ns: slew_env().1,
             keys_in,
             key_out,
             log,
@@ -254,13 +266,13 @@ impl FrameLogic {
                     if let Some((a, _)) = song_ns(clock, q_now, self.origin, self.rate, self.out_offset_ns) {
                         let e = self.base_ns - a;
                         self.slew_err_ns = e;
-                        if coarse_turn && e < -SLEW_LATE_NS {
+                        if coarse_turn && e < -self.slew_late_ns {
                             self.base_ns += self.tick_ns; // 2프레임에 한 틱 더 = 1.5배
                             self.slew_extra += 1;
-                        } else if coarse_turn && e > SLEW_EARLY_NS {
+                        } else if coarse_turn && e > self.slew_early_ns {
                             self.base_ns -= self.tick_ns; // 한 틱 쉼 = 0.5배
                             self.slew_hold += 1;
-                        } else if fine && n > 0 && e.abs() <= SLEW_EARLY_NS {
+                        } else if fine && n > 0 && e.abs() <= self.slew_early_ns {
                             // 데드밴드 안: 이번 틱 길이를 어긋남에 비례해 고친다 (최대 ±5%)
                             let adj = (-(e as i128) * self.tick_ns as i128 / FINE_TAU_NS as i128) as i64;
                             let cap = self.tick_ns / 20;
