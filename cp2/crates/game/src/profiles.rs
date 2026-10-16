@@ -12,6 +12,7 @@
 //! - IIDX 미세 보정형 (`iidx-fine`, CP2 뒤 추가 실험): IIDX 개량형 + 데드밴드 안에서 어긋남에 비례해 틱 길이를 조금(최대 ±5%) 고쳐
 //!   0으로 수렴시킨다 (시정수 0.5초, PLL처럼). 큰 어긋남은 그대로 1.5배/0.5배로 따라잡는다.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use rcore::judge::{Grade, Judged, Lane, Tally, Windows};
@@ -22,7 +23,7 @@ use synchronizer::input::KeyEvent;
 use synchronizer::qpc;
 use synchronizer::shared_clock::SharedClock;
 
-use crate::audio::KeyReq;
+use crate::audio::{AudioMonitor, KeyReq, BGM_NONE};
 use crate::judging::{song_ns, JudgeLog, JudgeView};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +88,8 @@ pub struct FrameLogic {
     origin: i64,
     rate: u32,
     out_offset_ns: i64,
+    /// IIDX식 따라잡기 기준: Some = 반주 트랙의 재생 위치 (실제 IIDX), None = 오디오 장치 시계 (CP2 2-4·2-5 측정 때).
+    bgm_ref: Option<Arc<AudioMonitor>>,
     lane: Lane,
     tally: Tally,
     pressed: bool,
@@ -132,6 +135,7 @@ impl FrameLogic {
         keys_in: Consumer<KeyEvent>,
         key_out: Producer<KeyReq>,
         log: Producer<JudgeLog>,
+        bgm_ref: Option<Arc<AudioMonitor>>,
     ) -> FrameLogic {
         FrameLogic {
             kind,
@@ -141,6 +145,7 @@ impl FrameLogic {
             origin,
             rate,
             out_offset_ns,
+            bgm_ref,
             lane: Lane::new(),
             tally: Tally::default(),
             pressed: false,
@@ -263,7 +268,15 @@ impl FrameLogic {
                 let fine = self.kind == Profile::IidxFine;
                 let coarse_turn = self.frame_no % 2 == 0;
                 if coarse_turn || fine {
-                    if let Some((a, _)) = song_ns(clock, q_now, self.origin, self.rate, self.out_offset_ns) {
+                    // 기준: 반주 트랙이 지금 들리는 곡 위치 = 장치 시계로 본 곡 시각 − 반주 트랙의 대응 (반주가 없으면 고치지 않음)
+                    let reference = song_ns(clock, q_now, self.origin, self.rate, self.out_offset_ns).and_then(|(a, _)| match &self.bgm_ref {
+                        None => Some(a),
+                        Some(m) => match m.bgm_offset.load(Ordering::Relaxed) {
+                            BGM_NONE => None,
+                            o => Some(a - (o as i128 * 1_000_000_000 / self.rate as i128) as i64),
+                        },
+                    });
+                    if let Some(a) = reference {
                         let e = self.base_ns - a;
                         self.slew_err_ns = e;
                         if coarse_turn && e < -self.slew_late_ns {

@@ -228,7 +228,12 @@ pub struct AudioMonitor {
     /// 콘텐츠를 건너뛴 횟수와 누적 프레임.
     pub skips: AtomicU64,
     pub skipped_frames: AtomicI64,
+    /// 반주 트랙의 대응 (프레임): 지금 울리는 긴 자동재생 중 가장 먼저 올린 것이 놓인 자리 − 채보대로의 자리.
+    /// IIDX식이 "반주 트랙의 재생 위치"를 읽는 데 쓴다. 울리는 긴 소리가 없으면 `BGM_NONE`.
+    pub bgm_offset: AtomicI64,
 }
+
+pub const BGM_NONE: i64 = i64::MIN;
 
 pub struct AudioHandles {
     pub monitor: Arc<AudioMonitor>,
@@ -434,6 +439,8 @@ impl<'a> Core<'a> {
         if new_auto.is_some() {
             self.live_new = new_auto;
         }
+        let bgm = self.mixer.long_voices().next().map(|(start, t)| start - (origin_m + ns_to_frame(t, rate_u))).unwrap_or(BGM_NONE);
+        self.mon.bgm_offset.store(bgm, Ordering::Relaxed);
         if live_on {
             self.live_sample(tl, now, &keys_here[..nkeys]);
         }
@@ -510,7 +517,7 @@ fn spawn_wasapi(
     let clock = Arc::new(SharedClock::new());
     let done = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
-    let monitor = Arc::new(AudioMonitor { d_frames: AtomicI64::new(-1), ..Default::default() });
+    let monitor = Arc::new(AudioMonitor { d_frames: AtomicI64::new(-1), bgm_offset: AtomicI64::new(BGM_NONE), ..Default::default() });
     let live = cfg.live.take();
     let (info_tx, info_rx) = std::sync::mpsc::channel::<Result<AudioInfo, String>>();
     let (clock2, done2, stop2, mon) = (clock.clone(), done.clone(), stop.clone(), monitor.clone());
@@ -876,7 +883,7 @@ fn spawn_asio(
     let clock = Arc::new(SharedClock::new());
     let done = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
-    let monitor = Arc::new(AudioMonitor { d_frames: AtomicI64::new(-1), ..Default::default() });
+    let monitor = Arc::new(AudioMonitor { d_frames: AtomicI64::new(-1), bgm_offset: AtomicI64::new(BGM_NONE), ..Default::default() });
     let live = cfg.live.take();
     let (info_tx, info_rx) = std::sync::mpsc::channel::<Result<AudioInfo, String>>();
     let (clock2, done2, stop2, mon) = (clock.clone(), done.clone(), stop.clone(), monitor.clone());

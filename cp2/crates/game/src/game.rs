@@ -4,7 +4,7 @@
 //!                [--profile ours|iidx|iidx-fine|djmax|bms] [--bot] [--bot-offset-ms 0] [--bot-jitter-ms 0] [--bot-adapt-ms 0]
 //!                [--faults audio@30:150,render@45:300,judge@60:300,input@75:300] [--fault-ms 300]
 //!                [--out-offset-ms 0] [--no-vsync] [--no-capture] [--tag run] [--out runs] [--quit-at-end] [--stop-at 곡초]
-//!                [--late-drop-ms 100] [--resync-judge void|count]
+//!                [--late-drop-ms 100] [--resync-judge void|count] [--iidx-ref bgm|device]
 //!
 //! 시계: 기록 시계 C = 장치 시계 + D (CP1-4). 오디오 정지는 콘텐츠를 건너뛰어 시간축을 잇는다 (우리 방식).
 //! 스레드: 화면(이 스레드) · 오디오 · 입력 · 판정 · 봇 · 녹음 · 기록. 실시간 스레드끼리는 SPSC 링과 원자 변수만 쓴다.
@@ -338,7 +338,9 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         );
         (j, Some(h), None)
     } else {
-        let l = FrameLogic::new(profile, chart.clone(), windows_cfg, keys.clone(), origin, rate, out_offset_ns, kev_rx, key_tx, jl_tx);
+        // IIDX식 따라잡기 기준: 반주 트랙 위치(실제 IIDX, 기본) 또는 장치 시계(--iidx-ref device, CP2 2-4·2-5 측정 때)
+        let bgm_ref = (arg(args, "--iidx-ref", "bgm") != "device").then(|| a.monitor.clone());
+        let l = FrameLogic::new(profile, chart.clone(), windows_cfg, keys.clone(), origin, rate, out_offset_ns, kev_rx, key_tx, jl_tx, bgm_ref);
         (judging::JudgeShared::new(1), None, Some(l))
     };
     // 봇은 늘 띄워 두고 F5로 켜고 끈다 (--bot = 켜진 채로 시작)
