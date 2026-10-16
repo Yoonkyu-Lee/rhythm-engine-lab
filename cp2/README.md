@@ -1,6 +1,6 @@
 # Checkpoint 2 — 렉에도 키음과 반주가 맞는 게임
 
-> 상태: **완료 (2026-10-15, 2차)** — 답: 예. 우리 방식은 세 경로 · 고장 다섯 모두에서 PERFECT 키음 vs 반주 ±1.3 ms, 세 게임식은 최대 ±1초 ([results/2-5_v2.md](results/2-5_v2.md)). 단계별 진행은 `REPORT.md`, 데모는 `DEMO.md`, 용어는 `GLOSSARY.md`.
+> 상태: **완료 (2026-10-16, 2차)** — 답: 예. 우리 방식은 세 경로 · 고장 다섯 모두에서 PERFECT 키음 vs 반주 최대 ±1.4 ms(5 ms 넘음 0), 세 게임식은 최대 약 ±1초 ([results/2-5_v2.md](results/2-5_v2.md)). 진행은 `REPORT.md`(끝에 마무리), 데모는 `DEMO.md`, 용어는 `GLOSSARY.md`, 남은 것은 아래 "CP3로 넘기는 것".
 > 1차 시도(브랜치 `cp2-attempt1`)는 "현재 = 출력 위치"로 잡아 PERFECT 키음이 반주보다 출력 지연만큼 늦었다. 그래서 되돌렸고, CP1-4에서 기록 시계를 세운 뒤 다시 시작한다.
 > 근거: [../design/기록 시계 설계.md](../design/기록%20시계%20설계.md), CP1-4 실측([../cp1/REPORT.md](../cp1/REPORT.md)), CP0 분석.
 
