@@ -94,6 +94,23 @@ def analyze(run, audio=True):
     p_start_by_block = {}
     for r in p_rows:
         p_start_by_block.setdefault(int(r["block"]), int(r["start"]))
+    # 플레이어 키음: 노트 곡 시각(t_ns, 믹서가 노트에서 붙인 값) → 실제 시작. 기록에 있으면 시각 어림 대신 이것으로 정확히 짝짓는다
+    has_t = "t_ns" in (mix[0] if mix else {})
+    ks_by_t = {}
+    for r in p_rows:
+        if r.get("t_ns"):
+            ks_by_t.setdefault(int(r["t_ns"]), int(r["start"]))
+    # 재트리거 끊기(BMS식): 끊긴 자동재생 소리는 그 프레임에서 끝난다 → "울리고 있는 긴 소리"에서 뺀다
+    cut_end = np.full(len(aF), np.inf)
+    by_sound = {}
+    for i in range(len(aF)):
+        by_sound.setdefault(int(aS[i]), []).append(i)
+    for r in mix:
+        if r["kind"] == "cut":
+            at = int(r["due"])  # cut 행은 due 칸에 끊은 프레임을 쓴다
+            idx = [i for i in by_sound.get(int(r["sound"]), []) if aF[i] < at and not np.isfinite(cut_end[i])]
+            if idx:
+                cut_end[idx[-1]] = at
     dropped = sum(1 for r in mix if r["kind"] == "dropped" and r["player"] == "1")
     late = sum(1 for r in p_rows if int(r["late"]) > 0)
 
@@ -113,8 +130,11 @@ def analyze(run, audio=True):
         if kf >= 0:
             ks = ks_by_due.get(kf)
             late_f = late_by_due.get(kf, 0)
+        elif has_t:
+            # 프레임 구동: 그 노트 시각을 붙인 플레이어 소리 (정확한 짝)
+            ks = ks_by_t.get(int(r["t_ns"]) - int(r["err_ns"]))
         else:
-            # 프레임 구동: 이 판정을 처리한 순간 이후 처음 채운 블록의 플레이어 소리
+            # (t_ns 열이 없는 옛 기록) 이 판정을 처리한 순간 이후 처음 채운 블록의 플레이어 소리 — 옆 노트와 잘못 짝지어질 수 있다
             tl_proc = np.interp(int(r["q_proc"]), bq, btl)
             i = int(np.searchsorted(p_blocks, tl_proc - 1))
             ks = p_start_by_block.get(int(p_blocks[i])) if i < len(p_blocks) and p_blocks[i] - tl_proc < 0.3 * rate else None
@@ -131,7 +151,7 @@ def analyze(run, audio=True):
         new = np.interp(Tn, aT[near], aF[near]) if near.any() and aT[near].min() <= Tn <= aT[near].max() else np.nan
         # 그 순간 울리고 있는 긴 소리 전부와 비교해 가장 크게 어긋난 것 (귀에 들리는 가장 나쁜 어긋남).
         # 가장 최근 것 하나만 보면, 고장 뒤에 새로 시작한 긴 소리가 고장 전부터 울리던 소리의 어긋남을 가린다.
-        L = np.nonzero(is_long[aS] & (aT <= Tn) & (aT + snd_len[aS] * 1e9 > Tn))[0]
+        L = np.nonzero(is_long[aS] & (aT <= Tn) & (aT + snd_len[aS] * 1e9 > Tn) & (aF + (Tn - aT) / 1e9 * rate < cut_end))[0]
         if L.size:
             devs = ks - (aF[L] + (Tn - aT[L]) / 1e9 * rate)
             lng = ks - devs[np.argmax(np.abs(devs))]

@@ -3,7 +3,7 @@
 //!   cp2game run <곡.rtc> [--audio shared|exclusive|asio] [--asio-buffer 64] [--excl-period-ms 5] [--d-ms (자동)]
 //!                [--profile ours|iidx|iidx-fine|djmax|bms] [--bot] [--bot-offset-ms 0] [--bot-jitter-ms 0] [--bot-adapt-ms 0]
 //!                [--faults audio@30:150,render@45:300,judge@60:300,input@75:300] [--fault-ms 300]
-//!                [--out-offset-ms 0] [--no-vsync] [--no-capture] [--tag run] [--out runs] [--quit-at-end] [--stop-at 곡초]
+//!                [--display-offset-ms 0] [--no-vsync] [--no-capture] [--tag run] [--out runs] [--quit-at-end] [--stop-at 곡초]
 //!                [--late-drop-ms 100] [--resync-judge void|count] [--iidx-ref bgm|device]
 //!
 //! 시계: 기록 시계 C = 장치 시계 + D (CP1-4). 오디오 정지는 콘텐츠를 건너뛰어 시간축을 잇는다 (우리 방식).
@@ -251,7 +251,10 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut fault_ms: u32 = arg(args, "--fault-ms", "300").parse().map_err(|_| "--fault-ms ms")?;
     let late_drop_frames = if late_drop_ms > 0.0 { (late_drop_ms * dev_rate as f64 / 1e3) as i64 } else { i64::MAX };
     let stop_at: f64 = arg(args, "--stop-at", "0").parse().map_err(|_| "--stop-at 곡초")?;
-    let out_offset_ns = (arg(args, "--out-offset-ms", "0").parse::<f64>()? * 1e6) as i64;
+    // 화면 오프셋 (CP2 2-6 결정, 2026-10-16): 노트를 그리는 위치만 옮긴다 (+면 노트를 그만큼 미리 그림 = 화면 지연 보정).
+    // 판정·키음·봇은 건드리지 않는다 → "PERFECT면 키음이 반주 위"와 누름 → 키음 지연(D)이 그대로다. --out-offset-ms는 옛 이름.
+    let display_offset_ns = (arg(args, "--display-offset-ms", &arg(args, "--out-offset-ms", "0")).parse::<f64>()? * 1e6) as i64;
+    let out_offset_ns = 0i64;
     let vsync = !flag(args, "--no-vsync");
     let use_bot = flag(args, "--bot");
     let profile = Profile::parse(&arg(args, "--profile", "ours"))?;
@@ -423,7 +426,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // 우리 방식: 장치 시계로 본 다음 vblank의 청취 곡 시각. 프레임 구동 방식: 그 프로필의 시계 (표시 예측 없음, 프레임 시작 시각)
         let state_now = mon.state.load(Ordering::Relaxed);
         let song = match logic.as_mut() {
-            None => judging::song_ns(&a.clock, q_display, origin, rate, out_offset_ns).map(|x| x.0),
+            None => judging::song_ns(&a.clock, q_display, origin, rate, 0).map(|x| x.0),
             Some(l) => {
                 beats.judge.store(qpc::now(), Ordering::Release);
                 let t = l.frame(we, period_q, &a.clock, state_now);
@@ -524,7 +527,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         list.rect(LANE_X - 10.0, JUDGE_Y, LANE_W + 20.0, 4.0, Rgba(0.9, 0.3, 0.3, 1.0));
         let mut drawn = 0u16;
-        if let Some(song) = song {
+        if let Some(song) = song.map(|s| s + display_offset_ns) {
             let pos_now = chart.chart.scroll_pos(song);
             for n in &notes[view.next_note.first().copied().unwrap_or(0)..] {
                 let y_head = JUDGE_Y as f64 - (chart.chart.scroll_pos(n.t) - pos_now) * px_per_beat;
@@ -666,7 +669,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let t = &view.tally;
     let snap = a.clock.load();
     let meta = format!(
-        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"{}\", \"slew\": [{}, {}],\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"period_frames\": {}, \"path\": \"{}\", \"origin\": {origin}, \"d_frames\": {}, \"need_max_frames\": {}, \"skips\": {}, \"skipped_frames\": {}, \"late_player\": {}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"lag_counts\": [{}],\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"void\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
+        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"{}\", \"slew\": [{}, {}],\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"period_frames\": {}, \"path\": \"{}\", \"origin\": {origin}, \"d_frames\": {}, \"need_max_frames\": {}, \"skips\": {}, \"skipped_frames\": {}, \"late_player\": {}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"display_offset_ns\": {display_offset_ns}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"lag_counts\": [{}],\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"void\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
         path.replace('\\', "/"),
         chart.hash,
         chart.chart.title,
