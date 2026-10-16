@@ -5,7 +5,8 @@ python -I -X utf8 cp2/tools/analyze_v2.py <runs/...> [...] [--no-audio]
 1. PERFECT 키음 vs 반주 (믹서 기록, 샘플 단위):
    - 키음: 그 누름이 요청한 플레이어 소리가 실제로 놓인 시간축 프레임.
    - 반주(새 소리): 같은 곡 시각 T의 자동재생이 실제로 놓인 프레임 (T 앞뒤 2초 안에 실제로 시작한 자동재생들을 곡 시각으로 보간).
-   - 반주(긴 소리): T에 이미 울리고 있던 긴 자동재생 소리(2초 넘는 것)의 해당 위치 = 그 소리의 시작 + (T − 그 소리의 곡 시각).
+   - 반주(긴 소리): T에 울리고 있는 긴 자동재생 소리(2초 넘는 것)들의 해당 위치 = 그 소리의 시작 + (T − 그 소리의 곡 시각).
+     그중 키음과 가장 크게 어긋난 것을 쓴다 (귀에 들리는 가장 나쁜 어긋남).
    - 값 = 키음 − 반주 (ms, +면 키음이 늦음). PERFECT 판정을 받은 누름만 센다.
    - 손실은 따로 센다: 키음을 버린 것, 예약 프레임을 지나 도착해 늦게 놓인 것 (정지 중에 누른 노트 — 제자리에 낼 수 없음).
    - 잔차 = 값 − 그 게임이 매긴 판정 오차. 판정이 "맞다"고 한 만큼 키음이 반주에 맞았는가 (우리 방식이 정확하면 0).
@@ -128,8 +129,14 @@ def analyze(run, audio=True):
         # 새로 울린 소리: 이 시각 앞뒤 2초 안에 시작한 자동재생들로 보간 (범위 밖으로 끝값을 끌어오지 않게)
         near = np.abs(aT - Tn) <= 2e9
         new = np.interp(Tn, aT[near], aF[near]) if near.any() and aT[near].min() <= Tn <= aT[near].max() else np.nan
+        # 그 순간 울리고 있는 긴 소리 전부와 비교해 가장 크게 어긋난 것 (귀에 들리는 가장 나쁜 어긋남).
+        # 가장 최근 것 하나만 보면, 고장 뒤에 새로 시작한 긴 소리가 고장 전부터 울리던 소리의 어긋남을 가린다.
         L = np.nonzero(is_long[aS] & (aT <= Tn) & (aT + snd_len[aS] * 1e9 > Tn))[0]
-        lng = aF[L[-1]] + (Tn - aT[L[-1]]) / 1e9 * rate if L.size else np.nan
+        if L.size:
+            devs = ks - (aF[L] + (Tn - aT[L]) / 1e9 * rate)
+            lng = ks - devs[np.argmax(np.abs(devs))]
+        else:
+            lng = np.nan
         err = int(r["err_ns"]) / 1e6  # 그 게임이 매긴 판정 오차
         hits.append(dict(T=T, grade=grade, ks=ks, err=err, new=(ks - new) * 1e3 / rate if np.isfinite(new) else None, long=(ks - lng) * 1e3 / rate if L.size else None))
 
@@ -211,6 +218,7 @@ def analyze(run, audio=True):
                 shifts.append({"song_s": round((s0 - origin) / rate, 2), "shift_ms": round(dl * 1e3 / rate, 2)})
         rep["integrity"] = {"lag_ms": round(L0 * 1e3 / rate, 2), "windows": checked, "shifted": len(shifts), "shifts": shifts[:20]}
 
+    rep["hits"] = [{k: (round(v, 3) if isinstance(v, float) else v) for k, v in h.items()} for h in hits]
     (run / "report_v2.json").write_text(json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
     a = rep["all"]
     print(f"{run.name}  [{rep['profile']}, {rep['path']}, D {rep['d_ms']} ms (필요 최대 {rep['need_max_ms']}), 건너뜀 {rep['skips']}]")
