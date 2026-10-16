@@ -1,6 +1,6 @@
 # Checkpoint 2 — 렉에도 키음과 반주가 맞는 게임
 
-> 상태: **범위 확정 (2026-10-15, 2차)**. 단계별 진행은 `REPORT.md`.
+> 상태: **완료 (2026-10-15, 2차)** — 답: 예. 우리 방식은 세 경로 · 고장 다섯 모두에서 PERFECT 키음 vs 반주 ±1.3 ms, 세 게임식은 최대 ±1초 ([results/2-5_v2.md](results/2-5_v2.md)). 단계별 진행은 `REPORT.md`, 데모는 `DEMO.md`, 용어는 `GLOSSARY.md`.
 > 1차 시도(브랜치 `cp2-attempt1`)는 "현재 = 출력 위치"로 잡아 PERFECT 키음이 반주보다 출력 지연만큼 늦었다. 그래서 되돌렸고, CP1-4에서 기록 시계를 세운 뒤 다시 시작한다.
 > 근거: [../design/기록 시계 설계.md](../design/기록%20시계%20설계.md), CP1-4 실측([../cp1/REPORT.md](../cp1/REPORT.md)), CP0 분석.
 
@@ -30,7 +30,7 @@
 | 비교 프로필 | IIDX 개량형 · DJMAX식 · BMS식 (프레임 구동) | 재사용, 지표만 교체 |
 | 측정 | 자동 플레이어(PERFECT 순간에 SendInput), 루프백 분석, 리플레이 | 수정 |
 
-시험 콘텐츠: 합성 곡(120 BPM, 4분음표 256개, 9초 패드), DJMAX 곡 2개(BlythE, Negative Nature, 비공개, `content/`는 git 제외).
+시험 콘텐츠: 합성 곡(120 BPM, 4분음표 256개, 9초 패드), DJMAX 곡 2개(BlythE, Negative Nature, 원본 복호화), BMS 출신 표본 Unshakable(6K U_E 팩). 비공개, `content/`는 git 제외.
 
 ## 단계
 

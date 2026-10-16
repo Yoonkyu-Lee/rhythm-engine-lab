@@ -56,7 +56,7 @@ impl Profile {
     }
     pub fn title(&self) -> &'static str {
         match self {
-            Profile::Ours => "우리 방식 (오디오 장치 시계 · 샘플 예약 · 입력 도장+watermark)",
+            Profile::Ours => "우리 방식 (기록 시계 C = 장치 시계 + D · 키음·반주 샘플 예약 · 오디오 정지는 건너뜀)",
             Profile::Iidx => "IIDX 개량형 (프레임=틱 · 오디오로 양방향 slew · 틱에서 발음·판정)",
             Profile::IidxFine => "IIDX 미세 보정형 (IIDX 개량형 + 데드밴드 안 비례 보정으로 0에 수렴)",
             Profile::Djmax => "DJMAX식 (프레임 시계 0.333초 상한 · 즉시 재생 · 200 Hz 고정 스텝 판정)",

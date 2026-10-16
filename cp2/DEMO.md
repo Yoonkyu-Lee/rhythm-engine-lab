@@ -1,0 +1,65 @@
+# CP2 데모 (2차): 렉이 와도 키음이 반주에 맞는가
+
+건반 하나짜리 시험 게임으로 직접 쳐 보고 들어 본다. 우리 방식은 렉 뒤에도 PERFECT 키음이 반주에 붙어 있고, 세 게임식은 PERFECT가 나와도 이미 울리던 반주와 갈라진다.
+모든 명령은 `cp2/` 폴더의 PowerShell에서 실행한다 (빌드: `cargo build --offline --release`).
+
+## 조작
+
+| 키 | 하는 일 |
+|---|---|
+| Space · J · F | 치기 (아무거나, 레인은 하나) |
+| F1 | 오디오 정지 (오디오 스레드가 버퍼를 안 채움 → 소리가 끊김) |
+| F2 | 화면 정지 |
+| F3 | 판정 정지 (우리 방식: 판정 스레드 / 세 게임식: 게임 루프) |
+| F4 | 입력 정지 |
+| + / − | 고장 길이 두 배 · 절반 (50 ms ~ 4초, 처음 300 ms, `--fault-ms`로 시작값) |
+| Esc | 끝내기 (곡이 끝나면 3초 뒤 저절로 끝남) |
+
+화면 위쪽 글자(HUD): 프로필, 오디오 경로, D, 필요 최대, 콘텐츠 건너뜀 횟수, 게임 상태, 최근 렉 사건, 판정 집계, 현재 고장 길이.
+
+## 곡
+
+| 곡 | 파일 | 특징 |
+|---|---|---|
+| Unshakable (BMS, 6K U_E 팩) | `content\bms_unshakable_6_11\chart.rtc` | 노트 209, 16~54초짜리 긴 반주(스템)가 깔림 — 렉 뒤 어긋남이 그 스템 끝까지 남아 잘 들림 |
+| BlythE (DJMAX, 원본 복호화) | `content\djmax_1_4b_nm_t6\chart.rtc` | 노트 103 (롱노트 11) |
+| Negative Nature (DJMAX, 원본 복호화) | `content\djmax_72_4b_nm_t6\chart.rtc` | 노트 42 (롱노트 10), 템포 변화 |
+| 합성 곡 | `content\synth\synth.rtc` | 120 BPM 4분음표 256개, 9초 패드 |
+
+## 오디오 경로
+
+`--audio shared` (기본, WASAPI 공유) · `--audio exclusive` (WASAPI 배타 5 ms) · `--audio asio` (ASIO 64샘플).
+D는 시작할 때 경로마다 자동으로 잰다 (실측: 공유 44 ms, 배타 13~15 ms, ASIO 4 ms). 키음이 반주에 맞는 것은 경로와 무관하고, 경로가 바꾸는 것은 누름 → 키음이 들리기까지의 지연(= 미리 쳐야 하는 양)이다.
+
+## 해 볼 것 (추천 순서)
+
+`$U = "content\bms_unshakable_6_11\chart.rtc"` 로 두고:
+
+1. **우리 방식, 렉 없이**
+   `.\target\release\cp2game.exe run $U --audio asio`
+   키음이 반주 위에 정확히 얹히게 쳐 본다. 그렇게 치면 PERFECT. 경로를 `shared`로 바꾸면 같은 느낌을 내려고 더 일찍 쳐야 한다(D 44 ms).
+2. **우리 방식 + 긴 오디오 정지**
+   `+`를 두 번 눌러 1,200 ms로 두고 치다가 F1. 소리가 1.2초 끊겼다가, 끊긴 만큼 앞으로 건너뛴 자리에서 다시 나온다(HUD 건너뜀 증가). 다시 들어온 긴 스템과 키음이 그대로 맞는다. F2·F3·F4도 같다 — 정지 중 누른 노트만 소리가 빠진다.
+3. **DJMAX식 + 같은 정지**
+   `... run $U --audio asio --profile djmax` 로 같은 F1 1,200 ms. 화면 노트에 맞춰 치면 판정은 PERFECT인데, 정지 전부터 울리던 긴 스템이 1.2초 밀린 채로 이어져서 키음·새 반주와 두 곡처럼 갈라진다. 그 스템이 끝날 때까지 계속.
+4. **BMS식 · IIDX 개량형**
+   `--profile bms`, `--profile iidx` 로 3을 반복. F2(화면)·F3(판정) 500 ms도 눌러 본다 — 세 게임식은 화면·판정 정지에서도 스템과 갈라진다(실측 −104~−432 ms, +170~+310 ms). IIDX 개량형은 렉 없이도 데드밴드 안에서 늘 조금 어긋나 있다.
+5. **입력 정지 중 누른 키음** (우리 방식, F4)
+   기본은 100 ms 안이면 늦게라도 내고 넘으면 버린다. `--late-drop-ms 0` 은 늦어도 끝까지 내고(정지가 길면 한참 늦게 "띵"), `--late-drop-ms 1000` 등으로 바꿔 비교. 어느 쪽을 기본으로 할지는 데모에서 정한다.
+
+고장을 곡 시각에 예약해서 같은 장면을 반복하려면: `--faults audio@15:1000,render@30:500` (종류@곡초:ms).
+
+## 친 뒤에 보기
+
+각 실행은 `runs\run-<시각>\`에 기록이 남는다.
+
+```
+$R = (Get-ChildItem runs -Directory | Sort-Object Name | Select-Object -Last 1).FullName
+python -I -X utf8 tools\analyze_v2.py $R
+.\target\release\replay.exe $R
+```
+
+- `analyze_v2.py`: 판정 집계, PERFECT 키음 vs 반주(새 소리 · 긴 소리), 잔차(우리 방식이면 ±0.01 ms), 손실, 렉 감지, 고장마다 그 뒤 10초, 무결성(녹음 ↔ 재구성).
+- `replay.exe`: 기록된 입력만으로 판정을 다시 해서 실행 중 판정과 맞댄다 (우리 방식만, "재현 100%").
+
+봇 실행으로 표를 다시 만들려면: `bash tools/run_faults_v2.sh $U "ours iidx djmax bms" "shared exclusive asio"` → `python -I -X utf8 tools/compare_v2.py` → `results/2-5_v2.md`.
