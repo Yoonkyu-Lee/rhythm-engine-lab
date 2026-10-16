@@ -304,7 +304,8 @@ impl<'a> Core<'a> {
         if let (Some(lp), true) = (self.last_pop, snap.valid) {
             let need = tl as f64 - snap.frame_at(to_100ns(lp));
             need_out = need.round() as i32;
-            if need > self.need_max {
+            // 정지 직후 블록(요청을 꺼낸 지 0.1초 넘게 지남)은 고장이지 경로 지연이 아니다: 최대에서 뺀다
+            if need > self.need_max && need < 0.1 * self.rate as f64 {
                 self.need_max = need;
                 self.mon.need_max.store(need.round() as i64, Ordering::Relaxed);
             }

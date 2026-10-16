@@ -336,6 +336,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let l = FrameLogic::new(profile, chart.clone(), windows_cfg, keys.clone(), origin, rate, out_offset_ns, kev_rx, key_tx, jl_tx);
         (judging::JudgeShared::new(1), None, Some(l))
     };
+    let pclock = Arc::new(bot::ProfileClock::default());
     let bot_join = use_bot.then(|| {
         let cfg = BotCfg {
             origin,
@@ -345,6 +346,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             jitter_ns: (arg(args, "--bot-jitter-ms", "0").parse::<f64>().unwrap_or(0.0) * 1e6) as i64,
             seed: 12345,
             adapt_ns: (arg(args, "--bot-adapt-ms", "0").parse::<f64>().unwrap_or(0.0) * 1e6) as i64,
+            follow: (profile != Profile::Ours).then(|| pclock.clone()),
         };
         bot::spawn(chart.clone(), cfg, a.clock.clone(), bot_tx, stop.clone())
     });
@@ -408,7 +410,11 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             None => judging::song_ns(&a.clock, q_display, origin, rate, out_offset_ns).map(|x| x.0),
             Some(l) => {
                 beats.judge.store(qpc::now(), Ordering::Release);
-                l.frame(we, period_q, &a.clock, state_now)
+                let t = l.frame(we, period_q, &a.clock, state_now);
+                if let Some(t) = t {
+                    pclock.publish(we, t);
+                }
+                t
             }
         };
         let song_s = song.unwrap_or(i64::MIN) as f64 / NS_PER_S as f64;

@@ -7,6 +7,7 @@ python -I -X utf8 cp2/tools/analyze_v2.py <runs/...> [...] [--no-audio]
    - 반주(새 소리): 같은 곡 시각 T의 자동재생이 실제로 놓인 프레임 (T 앞뒤 2초 안에 실제로 시작한 자동재생들을 곡 시각으로 보간).
    - 반주(긴 소리): T에 이미 울리고 있던 긴 자동재생 소리(2초 넘는 것)의 해당 위치 = 그 소리의 시작 + (T − 그 소리의 곡 시각).
    - 값 = 키음 − 반주 (ms, +면 키음이 늦음). PERFECT 판정을 받은 누름만 센다.
+   - 손실은 따로 센다: 키음을 버린 것, 예약 프레임을 지나 도착해 늦게 놓인 것 (정지 중에 누른 노트 — 제자리에 낼 수 없음).
    - 잔차 = 값 − 그 게임이 매긴 판정 오차. 판정이 "맞다"고 한 만큼 키음이 반주에 맞았는가 (우리 방식이 정확하면 0).
 2. 무결성 (루프백): 믹서 기록으로 재구성한 출력(시간축)을 녹음(장치 위치)과 1초 창마다 맞대어,
    어긋남이 처음과 같은지 본다. 시간축이 끊기지 않았다면 어긋남은 곡 내내 하나의 상수다. 고장으로 소리가 빠진 창은 뺀다.
@@ -68,18 +69,26 @@ def analyze(run, audio=True):
     # 자동재생: 곡 순서대로의 (곡 시각, 소리)와 실제 시작 프레임 (믹서 기록, 곡 순서로 놓인다)
     auto = [(t, s) for t, s, g, src in exp if src == "auto"]
     mix = load_csv(run / "mix_events.csv")
-    a_starts = [int(r["start"]) for r in mix if r["kind"] == "start" and r["player"] == "0"]
-    n = min(len(auto), len(a_starts))
-    aT = np.array([t for t, _ in auto[:n]], dtype=float)
-    aS = np.array([s for _, s in auto[:n]])
-    aF = np.array(a_starts[:n], dtype=float)
-    short = ~is_long[aS]
+    # 자동재생 사건(시작·버림·넘침)을 곡 순서대로 짝짓는다 (버린 것까지 넣어야 뒤가 밀리지 않는다).
+    # 기준으로는 제때 놓인 것(start == due)만 쓴다. 우리 방식은 due에서 곡 시각을 직접 복원해 검산한다.
+    rows = [r for r in mix if r["player"] == "0" and r["kind"] in ("start", "dropped", "overflow")]
+    n = min(len(auto), len(rows))
+    keep = [i for i in range(n) if rows[i]["kind"] == "start" and rows[i]["start"] == rows[i]["due"]]
+    aT = np.array([auto[i][0] for i in keep], dtype=float)
+    aS = np.array([auto[i][1] for i in keep], dtype=int)
+    aF = np.array([int(rows[i]["start"]) for i in keep], dtype=float)
+    if meta.get("profile") == "ours":
+        want = origin + d + np.floor(aT * rate / 1e9 + 0.5)
+        mism = int(np.sum(np.abs(aF - want) > 0))
+        if mism:
+            print(f"  경고: 자동재생 짝짓기 검산 불일치 {mism}개")
 
     # 플레이어 키음: 예약 프레임(due) → 실제 시작, 그리고 블록 순
     p_rows = [r for r in mix if r["kind"] == "start" and r["player"] == "1"]
-    ks_by_due = {}
+    ks_by_due, late_by_due = {}, {}
     for r in p_rows:
         ks_by_due.setdefault(int(r["due"]), int(r["start"]))
+        late_by_due.setdefault(int(r["due"]), int(r["late"]))
     p_blocks = np.array(sorted(int(r["block"]) for r in p_rows), dtype=float)
     p_start_by_block = {}
     for r in p_rows:
@@ -99,8 +108,10 @@ def analyze(run, audio=True):
             continue
         T = (int(r["t_ns"]) - int(r["err_ns"])) / 1e9  # 노트 곡 시각 (초)
         kf = int(r["key_frame"])
+        late_f = 0
         if kf >= 0:
             ks = ks_by_due.get(kf)
+            late_f = late_by_due.get(kf, 0)
         else:
             # 프레임 구동: 이 판정을 처리한 순간 이후 처음 채운 블록의 플레이어 소리
             tl_proc = np.interp(int(r["q_proc"]), bq, btl)
@@ -108,6 +119,10 @@ def analyze(run, audio=True):
             ks = p_start_by_block.get(int(p_blocks[i])) if i < len(p_blocks) and p_blocks[i] - tl_proc < 0.3 * rate else None
         if ks is None:
             hits.append(dict(T=T, grade=grade, ks=None))
+            continue
+        if late_f > 0:
+            # 예약 프레임을 지나 도착한 키음 (정지 중에 누름): 제자리에 낼 수 없었던 손실
+            hits.append(dict(T=T, grade=grade, ks=None, late_ms=late_f * 1e3 / rate))
             continue
         Tn = T * 1e9
         # 새로 울린 소리: 이 시각 앞뒤 2초 안에 시작한 자동재생들로 보간 (범위 밖으로 끝값을 끌어오지 않게)
@@ -123,7 +138,9 @@ def analyze(run, audio=True):
         nv = [h["new"] for h in pf if h["new"] is not None]
         rv = [h["new"] - h["err"] for h in pf if h["new"] is not None]
         lv = [h["long"] for h in pf if h["long"] is not None]
-        return dict(perfect=len(pf), perfect_no_keysound=sum(1 for h in hs if h["grade"] == 0 and h["ks"] is None),
+        lt = [h["late_ms"] for h in hs if h["grade"] == 0 and h.get("late_ms") is not None]
+        return dict(perfect=len(pf), perfect_no_keysound=sum(1 for h in hs if h["grade"] == 0 and h["ks"] is None and h.get("late_ms") is None),
+                    perfect_late_keysound=len(lt), late_ms=pct(lt),
                     ks_vs_new=pct(nv), ks_vs_long=pct(lv), residual=pct(rv),
                     off_new_5ms=int(sum(abs(v) > 5 for v in nv)), off_long_5ms=int(sum(abs(v) > 5 for v in lv)))
 
@@ -136,6 +153,23 @@ def analyze(run, audio=True):
     for f in faults:
         at = float(f["at_song_s"])
         rep["faults"].append({"kind": f["kind"], "at_s": at, "ms": int(f["ms"]), **summarize([h for h in hits if at <= h["T"] < at + 10])})
+
+    # 렉 감지: 고장마다 그 종류의 정지를 감지했나, 감지까지 걸린 시간, 잰 길이. 그 밖의 사건 수.
+    names = ["오디오 정지", "언더런", "시계 점프", "화면 정지", "판정 정지", "입력 정지", "상태", "재동기화 완료", "콘텐츠 건너뜀"]
+    lags = [(int(r["kind"]), int(r["q_start"]), int(r["q_detect"]), int(r["q_end"]), int(r["magnitude_us"])) for r in load_csv(run / "lag_events.csv")]
+    want = {"Audio": 0, "Render": 3, "Judge": 4, "Input": 5}
+    det = []
+    for f in faults:
+        q = int(f["q"])
+        c = [e for e in lags if e[0] == want[f["kind"]] and q - qf // 20 <= e[1] <= q + qf]
+        if c:
+            e = c[0]
+            det.append({"kind": f["kind"], "ms": int(f["ms"]), "detected": True, "after_stall_ms": round((e[2] - e[1]) * 1e3 / qf, 1), "measured_ms": round(e[4] / 1e3, 1)})
+        else:
+            det.append({"kind": f["kind"], "ms": int(f["ms"]), "detected": False})
+    counts = {names[k]: sum(1 for e in lags if e[0] == k) for k in range(len(names)) if any(e[0] == k for e in lags)}
+    skips = [round(e[4] / 1e3, 1) for e in lags if e[0] == 8]
+    rep["lag"] = {"faults": det, "counts": counts, "skips_ms": skips}
 
     # 무결성: 재구성 출력(시간축) ↔ 녹음(장치 위치)
     if audio and (run / "capture_2ch.f32").exists() and (run / "capture_packets.csv").exists():
@@ -185,10 +219,13 @@ def analyze(run, audio=True):
     print(f"  PERFECT {a['perfect']}개: 키음 vs 반주(새 소리) {fmt(a['ks_vs_new'])} · 5 ms 넘음 {a['off_new_5ms']}")
     print(f"                키음 vs 반주(긴 소리) {fmt(a['ks_vs_long'])} · 5 ms 넘음 {a['off_long_5ms']}")
     print(f"                잔차 = 키음 vs 반주(새 소리) − 판정 오차 {fmt(a['residual'])}")
-    if a["perfect_no_keysound"]:
-        print(f"  키음이 안 난 PERFECT {a['perfect_no_keysound']}개")
+    if a["perfect_no_keysound"] or a["perfect_late_keysound"]:
+        print(f"  손실: 키음을 버린 PERFECT {a['perfect_no_keysound']}개 · 키음이 늦게 놓인 PERFECT {a['perfect_late_keysound']}개 {fmt(a['late_ms'])}")
     for f in rep["faults"]:
-        print(f"  고장 {f['kind']} {f['ms']} ms @ {f['at_s']:.1f}s → 10초 안 PERFECT {f['perfect']}: 새 소리 {fmt(f['ks_vs_new'])} | 긴 소리 {fmt(f['ks_vs_long'])}")
+        print(f"  고장 {f['kind']} {f['ms']} ms @ {f['at_s']:.1f}s → 10초 안 PERFECT {f['perfect']}: 새 소리 {fmt(f['ks_vs_new'])} | 긴 소리 {fmt(f['ks_vs_long'])} | 손실 {f['perfect_no_keysound']}+{f['perfect_late_keysound']}")
+    if rep["lag"]["faults"]:
+        print("  렉 감지: " + " · ".join(f"{x['kind']} {x['ms']} ms → " + (f"감지 (멈춘 뒤 {x['after_stall_ms']} ms, 잰 길이 {x['measured_ms']} ms)" if x["detected"] else "감지 못함") for x in rep["lag"]["faults"]))
+        print(f"  사건 수 {rep['lag']['counts']} · 콘텐츠 건너뜀 {rep['lag']['skips_ms']} ms")
     if "integrity" in rep:
         g = rep["integrity"]
         print(f"  무결성: 녹음 ↔ 재구성 어긋남 {g['lag_ms']} ms, 1초 창 {g['windows']}개 중 어긋남이 바뀐 창 {g['shifted']}개 {g['shifts'][:5]}")

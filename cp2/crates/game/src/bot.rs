@@ -3,6 +3,8 @@
 //! 목표 QPC = 장치 시계의 역변환: 곡 시각 T(+오프셋+오차)가 청취되는 스트림 프레임 → 그 프레임이 나가는 QPC.
 //! 그래서 봇은 게임 내부 상태(프레임, 판정)를 보지 않고 OS 입력 경로를 그대로 탄다. 판정 오차 = 입력 도장 오차 + 시계 오차 + 의도한 오차.
 //! 롱노트는 끝까지 누르고, 단노트는 30 ms 뒤에 뗀다. 실제로 보낸 QPC를 기록한다.
+//! 프레임 구동 프로필(CP2 2차 2-4): `follow`가 있으면 장치 시계 대신 그 게임의 시계로 친다 — 그 게임 화면을 보고 PERFECT 순간에
+//! 누르는 사람. 게임이 프레임마다 (프레임 QPC, 그때의 곡 시각)을 공개하고, 봇은 시각이 1배속으로 흐른다고 보고 목표 시각을 구한다.
 //! 사람 흉내(adapt_ns > 0): 음악이 밀려 장치 시계가 새 epoch로 바뀌어도 그 뒤 adapt_ns 동안은 옛 시계(옛 박자)로 치다가 그다음에 새 박자를 따른다.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +30,31 @@ pub struct BotLog {
     pub q_sent: i64,
 }
 
+/// 프레임 구동 프로필이 공개하는 자기 시계 (마지막 프레임의 QPC와 그때의 곡 시각 ns). 쓰는 쪽: t → q 순서, 읽는 쪽: q·t·q 확인.
+#[derive(Default)]
+pub struct ProfileClock {
+    pub q: std::sync::atomic::AtomicI64,
+    pub t: std::sync::atomic::AtomicI64,
+}
+
+impl ProfileClock {
+    pub fn publish(&self, q: i64, t_ns: i64) {
+        self.q.store(0, Ordering::Release);
+        self.t.store(t_ns, Ordering::Release);
+        self.q.store(q, Ordering::Release);
+    }
+    fn read(&self) -> Option<(i64, i64)> {
+        for _ in 0..4 {
+            let q = self.q.load(Ordering::Acquire);
+            let t = self.t.load(Ordering::Acquire);
+            if q != 0 && q == self.q.load(Ordering::Acquire) {
+                return Some((q, t));
+            }
+        }
+        None
+    }
+}
+
 pub struct BotCfg {
     pub origin: i64,
     pub rate: u32,
@@ -39,6 +66,8 @@ pub struct BotCfg {
     pub seed: u64,
     /// 사람 흉내: 시계 점프를 알아채기까지 걸리는 시간 (ns, 0이면 즉시 따름).
     pub adapt_ns: i64,
+    /// 그 게임의 시계로 친다 (프레임 구동 프로필).
+    pub follow: Option<Arc<ProfileClock>>,
 }
 
 /// 봇이 믿는 시계: 같은 epoch 안에서는 최신 직선, 새 epoch는 처음 본 뒤 adapt_ns가 지나야 받아들인다.
@@ -74,6 +103,10 @@ fn send(down: bool) {
 
 /// 청취 곡 시각(ns) → 그 순간의 QPC 틱 (시계가 없으면 None).
 fn qpc_for_song(view: &mut View, clock: &SharedClock, t_ns: i64, cfg: &BotCfg) -> Option<i64> {
+    if let Some(pc) = cfg.follow.as_ref() {
+        let (q0, t0) = pc.read()?;
+        return Some(q0 + ((t_ns - t0) as i128 * qpc::frequency() as i128 / 1_000_000_000) as i64);
+    }
     let s = view.get(clock);
     if !s.valid {
         return None;
