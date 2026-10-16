@@ -288,7 +288,7 @@ impl FrameLogic {
         let auto = &self.chart.chart.auto;
         while self.auto_cur < auto.len() && auto[self.auto_cur].t <= t {
             let e = auto[self.auto_cur];
-            let _ = self.key_out.push(KeyReq::sound(NOW, e.sound, e.gain, false));
+            let _ = self.key_out.push(KeyReq::sound_t(NOW, e.sound, e.gain, false, e.t));
             self.auto_cur += 1;
         }
         // 3) 입력과 판정

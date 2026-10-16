@@ -11,6 +11,7 @@ mod audio;
 mod bot;
 mod capture;
 mod game;
+mod graph;
 mod input;
 mod judging;
 mod monitor;
@@ -130,6 +131,7 @@ fn play(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         skip_on_stall: !flag(args, "--push-on-stall"),
         asio_capture: (apath == audio::AudioPath::Asio && !flag(args, "--no-capture")).then(|| out.clone()),
         faults: faults.clone(),
+        live: None,
     };
     let autoplay = cfg.autoplay_notes;
     let t_start = qpc::now();
@@ -149,7 +151,7 @@ fn play(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut fb = BufWriter::new(File::create(out.join("audio_blocks.csv"))?);
     writeln!(fb, "qpc_wake,tl,offset,padding,frames,dev_frame,dev_qpc100,need,fill_ns,voices,injected_ms")?;
     let mut fm = BufWriter::new(File::create(out.join("mix_events.csv"))?);
-    writeln!(fm, "kind,sound,due,start,block,late,player,gain")?;
+    writeln!(fm, "kind,sound,due,start,block,late,player,gain,t_ns")?;
     let secs_limit: f64 = arg(args, "--secs", "0").parse()?;
     let mut n_blocks = 0u64;
     let mut secs_limit_hit = false;
@@ -161,10 +163,10 @@ fn play(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         while let Some(e) = mix_rx.pop() {
             match e {
-                MixEvent::Start { sound, due, start, block, late, player, gain } => writeln!(fm, "start,{sound},{due},{start},{block},{late},{},{gain}", player as u8)?,
-                MixEvent::Dropped { sound, due, block, player } => writeln!(fm, "dropped,{sound},{due},,{block},,{},", player as u8)?,
-                MixEvent::Overflow { sound, due, player } => writeln!(fm, "overflow,{sound},{due},,,,{},", player as u8)?,
-                        MixEvent::Cut { sound, at } => writeln!(fm, "cut,{sound},{at},,,,,")?,
+                MixEvent::Start { sound, due, start, block, late, player, gain, t } => writeln!(fm, "start,{sound},{due},{start},{block},{late},{},{gain},{}", player as u8, if t == rcore::mixer::NO_T { String::new() } else { t.to_string() })?,
+                MixEvent::Dropped { sound, due, block, player } => writeln!(fm, "dropped,{sound},{due},,{block},,{},,", player as u8)?,
+                MixEvent::Overflow { sound, due, player } => writeln!(fm, "overflow,{sound},{due},,,,{},,", player as u8)?,
+                        MixEvent::Cut { sound, at } => writeln!(fm, "cut,{sound},{at},,,,,,")?,
             }
         }
         if finished {

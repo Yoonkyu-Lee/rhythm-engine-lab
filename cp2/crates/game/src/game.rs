@@ -9,7 +9,7 @@
 //! 시계: 기록 시계 C = 장치 시계 + D (CP1-4). 오디오 정지는 콘텐츠를 건너뛰어 시간축을 잇는다 (우리 방식).
 //! 스레드: 화면(이 스레드) · 오디오 · 입력 · 판정 · 봇 · 녹음 · 기록. 실시간 스레드끼리는 SPSC 링과 원자 변수만 쓴다.
 //! 고장 주입: 곡 시각 예약(--faults) 또는 단축키 F1 오디오 · F2 화면 · F3 판정 · F4 입력 (길이는 + / − 로 두 배·절반, 50 ms ~ 4초).
-//! 사람이 칠 때 키: Space, J, F (봇은 F24). F5: 오토(봇) 켜기·끄기 (--bot이면 켜진 채로 시작).
+//! 사람이 칠 때 키: Space, J, F (봇은 F24). F5: 오토(봇) 켜기·끄기 (--bot이면 켜진 채로 시작). G: 실시간 싱크 그래프 숨기기·보이기.
 //! 출력: runs/<tag>-<시각>/ meta.json, audio_blocks.csv, mix_events.csv, judgments.csv, bot.csv, frames.csv, faults.csv, capture_*.
 
 use std::fs::{self, File};
@@ -39,6 +39,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::audio::{self, AudioCfg};
 use crate::bot::{self, BotCfg, BotLog, BOT_KEY};
+use crate::graph::{LiveGraph, Mark};
 use crate::judging::{self, JudgeCfg, JudgeLog};
 use crate::monitor::{self, Heartbeats, LagEvent, MonitorShared, LAG_NAMES, STATE_NAMES};
 use crate::profiles::{FrameLogic, Profile};
@@ -165,7 +166,7 @@ fn spawn_logger(dir: PathBuf, mut l: Logs, stop: Arc<AtomicBool>) -> thread::Joi
             let mut fb = BufWriter::new(File::create(dir.join("audio_blocks.csv"))?);
             writeln!(fb, "qpc_wake,tl,offset,padding,frames,dev_frame,dev_qpc100,need,fill_ns,voices,injected_ms")?;
             let mut fm = BufWriter::new(File::create(dir.join("mix_events.csv"))?);
-            writeln!(fm, "kind,sound,due,start,block,late,player,gain")?;
+            writeln!(fm, "kind,sound,due,start,block,late,player,gain,t_ns")?;
             let mut fj = BufWriter::new(File::create(dir.join("judgments.csv"))?);
             writeln!(fj, "kind,note,grade,err_ns,t_ns,q_in,q_proc,vkey,key_frame,state")?;
             let mut fl = BufWriter::new(File::create(dir.join("lag_events.csv"))?);
@@ -181,10 +182,10 @@ fn spawn_logger(dir: PathBuf, mut l: Logs, stop: Arc<AtomicBool>) -> thread::Joi
                 }
                 while let Some(e) = l.mix.pop() {
                     match e {
-                        MixEvent::Start { sound, due, start, block, late, player, gain } => writeln!(fm, "start,{sound},{due},{start},{block},{late},{},{gain}", player as u8)?,
-                        MixEvent::Dropped { sound, due, block, player } => writeln!(fm, "dropped,{sound},{due},,{block},,{},", player as u8)?,
-                        MixEvent::Overflow { sound, due, player } => writeln!(fm, "overflow,{sound},{due},,,,{},", player as u8)?,
-                        MixEvent::Cut { sound, at } => writeln!(fm, "cut,{sound},{at},,,,,")?,
+                        MixEvent::Start { sound, due, start, block, late, player, gain, t } => writeln!(fm, "start,{sound},{due},{start},{block},{late},{},{gain},{}", player as u8, if t == rcore::mixer::NO_T { String::new() } else { t.to_string() })?,
+                        MixEvent::Dropped { sound, due, block, player } => writeln!(fm, "dropped,{sound},{due},,{block},,{},,", player as u8)?,
+                        MixEvent::Overflow { sound, due, player } => writeln!(fm, "overflow,{sound},{due},,,,{},,", player as u8)?,
+                        MixEvent::Cut { sound, at } => writeln!(fm, "cut,{sound},{at},,,,,,")?,
                     }
                 }
                 while let Some(j) = l.judge.pop() {
@@ -284,7 +285,10 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (bot_tx, bot_rx) = ring::<BotLog>(1 << 13);
     let (fr_tx, fr_rx) = ring::<FrameLog>(1 << 14);
     let (lag_tx, lag_rx) = ring::<LagEvent>(4096);
+    let (live_tx, mut live_rx) = ring::<audio::SyncSample>(1 << 13);
     let mut fr_tx = fr_tx;
+    // 프레임 구동 프로필이 프레임마다 공개하는 자기 시계 (봇과 실시간 싱크 그래프가 읽는다)
+    let pclock = Arc::new(bot::ProfileClock::default());
 
     let a = audio::spawn(
         chart.clone(),
@@ -304,6 +308,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             skip_on_stall: profile == Profile::Ours,
             asio_capture: (apath == audio::AudioPath::Asio && !flag(args, "--no-capture")).then(|| dir.clone()),
             faults: vec![],
+            live: Some(audio::LiveSync { tx: live_tx, pclock: (profile != Profile::Ours).then(|| pclock.clone()) }),
         },
         key_rx,
         blk_tx,
@@ -336,7 +341,6 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let l = FrameLogic::new(profile, chart.clone(), windows_cfg, keys.clone(), origin, rate, out_offset_ns, kev_rx, key_tx, jl_tx);
         (judging::JudgeShared::new(1), None, Some(l))
     };
-    let pclock = Arc::new(bot::ProfileClock::default());
     // 봇은 늘 띄워 두고 F5로 켜고 끈다 (--bot = 켜진 채로 시작)
     let auto_on = Arc::new(AtomicBool::new(use_bot));
     let bot_join = Some({
@@ -378,6 +382,10 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut msg = MSG::default();
     let mut list = DrawList::default();
     let mut audio_gap_ms = 0.0;
+    let mut graph = LiveGraph::new(&dir, qf)?;
+    let mut prev_skipped = 0i64;
+    let mut prev_lags = [0u32; 9];
+    let (mut prev_extra, mut prev_hold) = (0u64, 0u64);
     while !quit {
         let (_ws, we) = rend.wait();
         beats.render.store(we, Ordering::Release);
@@ -429,6 +437,13 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let mut injected = 0u16;
         let mut inject = |k: FaultKind, ms: u32, src: &str, flog: &mut BufWriter<File>| -> std::io::Result<()> {
             writeln!(flog, "{k:?},{song_s:.3},{ms},{},{src}", qpc::now())?;
+            let (c, name) = match k {
+                FaultKind::Audio => (Rgba(1.0, 0.35, 0.35, 0.18), "오디오"),
+                FaultKind::Render => (Rgba(0.35, 0.65, 1.0, 0.18), "화면"),
+                FaultKind::Judge => (Rgba(1.0, 0.8, 0.3, 0.18), "판정"),
+                FaultKind::Input => (Rgba(0.6, 1.0, 0.5, 0.18), "입력"),
+            };
+            graph.mark(Mark { q: qpc::now(), len_q: ms as i64 * qf / 1000, color: c, label: format!("{name} {ms}") });
             match k {
                 FaultKind::Audio => a.monitor.inject_stall_ms.store(ms, Ordering::Release),
                 FaultKind::Judge if logic.is_none() => judge.inject_stall_ms.store(ms, Ordering::Release),
@@ -465,8 +480,33 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 auto_on.store(on, Ordering::Relaxed);
                 writeln!(alog, "{},{song_s:.3},{}", on as u8, qpc::now())?;
             }
+            0x47 => graph.visible = !graph.visible,
             0x1B => quit = true,
             _ => {}
+        }
+        // 실시간 싱크 그래프: 표본 받기 + 건너뜀·렉 감지·IIDX식 slew 표시
+        graph.ingest(&mut live_rx, now)?;
+        let sk = a.monitor.skipped_frames.load(Ordering::Relaxed);
+        if sk > prev_skipped {
+            let ms = (sk - prev_skipped) as f64 * 1e3 / rate as f64;
+            graph.skip(now, ms);
+            prev_skipped = sk;
+        }
+        for k in [0usize, 2, 3, 4, 5] {
+            let c = mon.counts[k].load(Ordering::Relaxed);
+            if c > prev_lags[k] {
+                graph.mark(Mark { q: now, len_q: 0, color: Rgba(1.0, 0.6, 0.4, 0.6), label: String::new() });
+                prev_lags[k] = c;
+            }
+        }
+        if let Some(l) = logic.as_ref() {
+            if l.slew_extra > prev_extra {
+                graph.slew(we, 1);
+            }
+            if l.slew_hold > prev_hold {
+                graph.slew(we, -1);
+            }
+            (prev_extra, prev_hold) = (l.slew_extra, l.slew_hold);
         }
 
         // 그리기
@@ -525,7 +565,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             ),
             format!(
                 "watermark 지연 {:.1} ms · 계약 위반 {} · 입력 손실 {}",
-                song.map(|s| (s - judge.watermark_song_ns.load(Ordering::Relaxed)) as f64 / 1e6).unwrap_or(0.0),
+                if logic.is_none() { song.map(|s| (s - judge.watermark_song_ns.load(Ordering::Relaxed)) as f64 / 1e6).unwrap_or(0.0) } else { f64::NAN },
                 judge.violations.load(Ordering::Relaxed),
                 input.lost.load(Ordering::Relaxed)
             ),
@@ -539,7 +579,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 mon.counts[5].load(Ordering::Relaxed)
             ),
             format!(
-                "오토 {} (F5) | 고장 {fault_ms} ms (+ / − 로 바꿈): F1 오디오 · F2 화면 · F3 판정 · F4 입력 · Esc 끝",
+                "오토 {} (F5) | 그래프 G | 고장 {fault_ms} ms (+ / − 로 바꿈): F1 오디오 · F2 화면 · F3 판정 · F4 입력 · Esc 끝",
                 if auto_on.load(Ordering::Relaxed) { "켜짐" } else { "꺼짐" }
             ),
         ];
@@ -562,6 +602,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 list.text(16.0, base_y + 34.0 + i as f32 * 20.0, 14.0, Rgba(0.9, 0.7, 0.5, 1.0), s);
             }
         }
+        graph.draw(&mut list, now, 790.0, 200.0, 430.0, 480.0);
         rend.draw(&list)?;
         let ft = rend.present(vsync);
         // 화면 주기: 첫 vblank부터의 긴 기준선 (프레임마다 짧게 재면 출렁여 평균이 1% 넘게 길게 치우친다 — IIDX 틱 길이가 틀어짐)
@@ -595,6 +636,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     flog.flush()?;
     alog.flush()?;
+    graph.flush()?;
     a.stop.store(true, Ordering::Release);
     stop.store(true, Ordering::Release);
     let st = a.join.join().map_err(|_| "오디오 스레드 패닉")??;

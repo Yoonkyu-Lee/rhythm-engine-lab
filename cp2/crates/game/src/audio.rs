@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use rcore::mixer::{LatePolicy, MixEvent, Mixer};
+use rcore::mixer::{LatePolicy, MixEvent, Mixer, NO_T};
 use rcore::ring::{ring, Consumer, Producer};
 use rcore::runtime::{ns_to_frame, Compiled};
 use synchronizer::asio::{self, AsioBufferInfo, AsioCallbacks, Driver, ASIOST_INT32_LSB};
@@ -28,6 +28,8 @@ use synchronizer::clock::ClockPolicy;
 use synchronizer::qpc;
 use synchronizer::shared_clock::{obs_ring, spawn_clock_thread, ClockSnapshot, ObsProducer, SharedClock};
 use synchronizer::timeline::ContentSkip;
+
+use crate::bot::ProfileClock;
 use synchronizer::wasapi::{self, IAudioClock, IAudioRenderClient, Mode, Stream};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Threading::WaitForSingleObject;
@@ -77,15 +79,47 @@ pub struct KeyReq {
     pub sound: u32,
     pub gain: f32,
     pub player: bool,
+    /// 이 소리가 나타내는 곡 시각 (ns, 실시간 싱크 지표용). 노트 소리는 믹서가 노트 시각을 쓴다.
+    pub t: i64,
 }
 
 impl KeyReq {
     pub fn note(frame: i64, lane: u16, note: u32) -> KeyReq {
-        KeyReq { frame, lane, note, sound: u32::MAX, gain: 1.0, player: true }
+        KeyReq { frame, lane, note, sound: u32::MAX, gain: 1.0, player: true, t: NO_T }
     }
-    pub fn sound(frame: i64, sound: u32, gain: f32, player: bool) -> KeyReq {
-        KeyReq { frame, lane: 0, note: 0, sound, gain, player }
+    /// 곡 시각 `t`(ns)의 자동재생 소리.
+    pub fn sound_t(frame: i64, sound: u32, gain: f32, player: bool, t: i64) -> KeyReq {
+        KeyReq { frame, lane: 0, note: 0, sound, gain, player, t }
     }
+}
+
+/// 실시간 싱크 그래프에 넘기는 반주 조각 수 (보이스 풀에서 먼저 올린 것부터).
+pub const LIVE_STEMS: usize = 8;
+
+/// 실시간 싱크 표본. "대응"(ms) = 소리가 놓인 시간축 프레임 − (믹서의 곡 시간 0 프레임 + 그 소리의 곡 시각): 채보대로라면 0.
+/// 같은 곡 시각에서 두 소리의 어긋남 = 두 대응의 차이 (믹서가 놓은 자리 기준. 출력 지연은 둘에 같이 붙으므로 빠진다).
+#[derive(Clone, Copy, Debug)]
+pub struct SyncSample {
+    /// 이 블록이 요청을 꺼낸 QPC (그래프의 x).
+    pub q: i64,
+    /// 키음 표본이면 true (키음이 이 블록에 놓임).
+    pub key: bool,
+    /// 채보의 대응: 우리 방식 0 (기록 시계가 곧 시간축 대응), 프레임 구동 = 이 블록 위치 − 그 프로필 시계가 말하는 지금 곡 시각의 자리.
+    /// 모르면 NaN.
+    pub chart_ms: f32,
+    pub n: u8,
+    /// 지금 울리는 반주 조각들: (식별 = 놓인 프레임과 곡 시각으로 만든 값, 대응 ms).
+    pub stems: [(i64, f32); LIVE_STEMS],
+    /// 키음의 대응 (키음 표본만).
+    pub key_ms: f32,
+    /// 최근 2초 안에 새로 놓인 자동재생의 대응 (반주 조각이 없을 때의 대체 기준). 없으면 NaN.
+    pub new_ms: f32,
+}
+
+/// 실시간 싱크 표본을 보낼 곳과, 프레임 구동 프로필이면 그 프로필의 시계.
+pub struct LiveSync {
+    pub tx: Producer<SyncSample>,
+    pub pclock: Option<Arc<ProfileClock>>,
 }
 
 /// 오디오 블록 하나의 기록.
@@ -142,6 +176,8 @@ pub struct AudioCfg {
     /// ASIO일 때 루프백 입력을 녹음할 곳 (WASAPI는 game.rs의 녹음 스레드가 따로 한다).
     pub asio_capture: Option<PathBuf>,
     pub faults: Vec<AudioFault>,
+    /// 실시간 싱크 그래프 (없으면 계산하지 않음).
+    pub live: Option<LiveSync>,
 }
 
 pub struct AudioInfo {
@@ -252,13 +288,17 @@ struct Core<'a> {
     cal_end: i64,
     need_max: f64,
     stats: AudioStats,
+    live: Option<LiveSync>,
+    /// 마지막으로 블록 표본을 보낸 시간축 프레임, 마지막 새 자동재생 (놓인 프레임, 대응 프레임).
+    live_last_tl: i64,
+    live_new: Option<(i64, i64)>,
 }
 
 impl<'a> Core<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         chart: &'a Compiled, cfg: &AudioCfg, rate: u32, origin: i64, keys: Consumer<KeyReq>, blocks: Producer<BlockLog>, mix: Producer<MixEvent>,
-        mon: Arc<AudioMonitor>,
+        mon: Arc<AudioMonitor>, live: Option<LiveSync>,
     ) -> Core<'a> {
         // D가 정해지기 전에는 자동재생을 아무 데도 놓지 않는다 (곡 시간 0을 아주 뒤로)
         let mut mixer = Mixer::new(chart, i64::MAX / 4, cfg.late, 4096);
@@ -284,6 +324,9 @@ impl<'a> Core<'a> {
             cal_end: origin - (0.3 * rate as f64) as i64,
             need_max: 0.0,
             stats: zero_stats(),
+            live,
+            live_last_tl: i64::MIN / 2,
+            live_new: None,
         };
         if let Some(d) = cfg.d_ms {
             c.set_d((d * rate as f64 / 1e3).round() as i64);
@@ -327,7 +370,7 @@ impl<'a> Core<'a> {
             if k.sound == u32::MAX {
                 self.mixer.play_note(k.lane as usize, k.note as usize, k.frame);
             } else {
-                self.mixer.play_sound(k.sound, k.gain, k.frame, k.player);
+                self.mixer.play_sound_t(k.sound, k.gain, k.frame, k.player, k.t);
             }
         }
         if self.autoplay_notes {
@@ -356,6 +399,12 @@ impl<'a> Core<'a> {
             }
         }
         let (mon, mix, st) = (&self.mon, &mut self.mix, &mut self.stats);
+        let live_on = self.live.is_some();
+        let origin_m = self.mixer.origin();
+        let rate_u = self.rate as u32;
+        let mut keys_here = [0i64; 8];
+        let mut nkeys = 0usize;
+        let mut new_auto: Option<(i64, i64)> = None;
         self.mixer.drain_each(|e| {
             if let MixEvent::Start { late, player: true, .. } = e {
                 if late > 0 {
@@ -363,14 +412,78 @@ impl<'a> Core<'a> {
                     mon.last_player_late.store(late, Ordering::Relaxed);
                 }
             }
+            if live_on {
+                if let MixEvent::Start { start, player, t, .. } = e {
+                    if t != NO_T {
+                        let o = start - (origin_m + ns_to_frame(t, rate_u));
+                        if player {
+                            if nkeys < keys_here.len() {
+                                keys_here[nkeys] = o;
+                                nkeys += 1;
+                            }
+                        } else {
+                            new_auto = Some((start, o));
+                        }
+                    }
+                }
+            }
             if !mix.push(e) {
                 st.mix_lost += 1;
             }
         });
+        if new_auto.is_some() {
+            self.live_new = new_auto;
+        }
+        if live_on {
+            self.live_sample(tl, now, &keys_here[..nkeys]);
+        }
         self.stats.blocks += 1;
         self.mon.blocks.fetch_add(1, Ordering::Relaxed);
         self.mon.voices.store(self.mixer.active_voices() as u64, Ordering::Relaxed);
         need_out
+    }
+
+    /// 실시간 싱크 표본: 10 ms마다 한 번 + 키음이 놓인 블록마다.
+    fn live_sample(&mut self, tl: i64, now: i64, keys: &[i64]) {
+        let rate = self.rate as f64;
+        if keys.is_empty() && tl - self.live_last_tl < self.rate / 100 {
+            return;
+        }
+        self.live_last_tl = tl;
+        let origin_m = self.mixer.origin();
+        let rate_u = self.rate as u32;
+        let ms = |frames: i64| (frames as f64 * 1e3 / rate) as f32;
+        let mut s = SyncSample { q: now, key: false, chart_ms: f32::NAN, n: 0, stems: [(0, 0.0); LIVE_STEMS], key_ms: f32::NAN, new_ms: f32::NAN };
+        for (start, t) in self.mixer.long_voices().take(LIVE_STEMS) {
+            // 식별: 놓인 프레임 + 곡 시각 (프레임 구동은 한 블록에 여러 조각을 같은 프레임에 놓는다)
+            let id = start.wrapping_mul(1_000_003) ^ (t / 1_000_000);
+            s.stems[s.n as usize] = (id, ms(start - (origin_m + ns_to_frame(t, rate_u))));
+            s.n += 1;
+        }
+        if let Some((at, o)) = self.live_new {
+            if tl - at < 2 * self.rate {
+                s.new_ms = ms(o);
+            }
+        }
+        let Some(live) = self.live.as_mut() else { return };
+        s.chart_ms = match &live.pclock {
+            None => 0.0,
+            Some(pc) => match pc.read() {
+                // 프로필 시계를 이 블록이 요청을 꺼낸 순간으로 늘인다. 마지막 공개가 50 ms보다 오래됐으면(게임 루프 정지) 모른다
+                Some((q0, t0)) if now - q0 <= qpc::frequency() / 20 => {
+                    let t_now = t0 as f64 + (now - q0) as f64 * 1e9 / qpc::frequency() as f64;
+                    ((tl as f64 - (origin_m as f64 + t_now * rate / 1e9)) * 1e3 / rate) as f32
+                }
+                _ => f32::NAN,
+            },
+        };
+        if keys.is_empty() {
+            let _ = live.tx.push(s);
+        } else {
+            for &o in keys {
+                let _ = live.tx.push(SyncSample { key: true, key_ms: ms(o), ..s });
+            }
+        }
     }
 
     fn log(&mut self, l: BlockLog) {
@@ -392,12 +505,13 @@ pub fn spawn(
 // ───────────────────────────── WASAPI (공유·배타) ─────────────────────────────
 
 fn spawn_wasapi(
-    chart: Arc<Compiled>, cfg: AudioCfg, keys: Consumer<KeyReq>, blocks: Producer<BlockLog>, mix: Producer<MixEvent>,
+    chart: Arc<Compiled>, mut cfg: AudioCfg, keys: Consumer<KeyReq>, blocks: Producer<BlockLog>, mix: Producer<MixEvent>,
 ) -> Result<AudioHandles, String> {
     let clock = Arc::new(SharedClock::new());
     let done = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let monitor = Arc::new(AudioMonitor { d_frames: AtomicI64::new(-1), ..Default::default() });
+    let live = cfg.live.take();
     let (info_tx, info_rx) = std::sync::mpsc::channel::<Result<AudioInfo, String>>();
     let (clock2, done2, stop2, mon) = (clock.clone(), done.clone(), stop.clone(), monitor.clone());
     let join = thread::Builder::new()
@@ -434,7 +548,7 @@ fn spawn_wasapi(
                 }));
                 let (mut obs, obs_rx) = obs_ring(4096);
                 let clock_thread = spawn_clock_thread(s.rate as f64, ClockPolicy::default(), obs_rx, clock2.clone());
-                let mut core = Core::new(&chart, &cfg, s.rate, origin, keys, blocks, mix, mon.clone());
+                let mut core = Core::new(&chart, &cfg, s.rate, origin, keys, blocks, mix, mon.clone(), live);
                 // 오디오 정지 때 건너뛰기: 2 ms 넘게 뒤처졌을 때만 (공유 모드 위치 보고의 1 ms 톱니보다 크게)
                 let mut cskip = ContentSkip::new(0.002 * rate as f64);
                 let mut scratch = vec![0.0f32; s.buffer_frames as usize * ch];
@@ -757,12 +871,13 @@ fn spawn_asio_capture_writer(dir: PathBuf, mut rx: Consumer<CapChunk>, stop: Arc
 }
 
 fn spawn_asio(
-    chart: Arc<Compiled>, cfg: AudioCfg, keys: Consumer<KeyReq>, blocks: Producer<BlockLog>, mix: Producer<MixEvent>,
+    chart: Arc<Compiled>, mut cfg: AudioCfg, keys: Consumer<KeyReq>, blocks: Producer<BlockLog>, mix: Producer<MixEvent>,
 ) -> Result<AudioHandles, String> {
     let clock = Arc::new(SharedClock::new());
     let done = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let monitor = Arc::new(AudioMonitor { d_frames: AtomicI64::new(-1), ..Default::default() });
+    let live = cfg.live.take();
     let (info_tx, info_rx) = std::sync::mpsc::channel::<Result<AudioInfo, String>>();
     let (clock2, done2, stop2, mon) = (clock.clone(), done.clone(), stop.clone(), monitor.clone());
     let join = thread::Builder::new()
@@ -798,7 +913,7 @@ fn spawn_asio(
                 };
                 // 콜백 상태는 이 스레드가 소유한다. 코어는 곡을 빌리므로, 드라이버를 멈출 때까지 `chart`가 살아 있게 한다.
                 let chart_ref: &'static Compiled = unsafe { &*Arc::as_ptr(&chart) };
-                let core = Core::new(chart_ref, &cfg, rate, origin, keys, blocks, mix, mon.clone());
+                let core = Core::new(chart_ref, &cfg, rate, origin, keys, blocks, mix, mon.clone(), live);
                 let null = std::ptr::null_mut();
                 let finished = Arc::new(AtomicBool::new(false));
                 let mut st = Box::new(AsioState {

@@ -48,13 +48,16 @@ struct Voice {
     start: i64,
     gain: f32,
     end: i64,
+    /// 이 소리가 나타내는 곡 시각 (ns, 자동재생 = 이벤트 시각, 키음 = 노트 시각). 모르면 `NO_T`.
+    t: i64,
+    player: bool,
 }
 
 /// 믹서에서 일어난 일 (개발자 로그용). 콜백에서는 미리 잡은 링에 넣고, 다른 스레드가 꺼내 기록한다.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MixEvent {
     /// 소리를 올렸다. `late` = 블록 시작 − 예정 시작 (프레임, 0 이하면 제때).
-    Start { sound: u32, due: i64, start: i64, block: i64, late: i64, player: bool, gain: f32 },
+    Start { sound: u32, due: i64, start: i64, block: i64, late: i64, player: bool, gain: f32, t: i64 },
     /// 늦어서 버렸다.
     Dropped { sound: u32, due: i64, block: i64, player: bool },
     /// 보이스 풀이 가득 차서 올리지 못했다.
@@ -67,14 +70,17 @@ pub enum MixEvent {
 /// 프레임에서 소리를 내는 구동 방식(BMS·DJMAX·IIDX식)의 즉시 재생이다.
 pub const NOW: i64 = i64::MIN;
 
+/// 곡 시각을 모르는 소리 (빈 누름 등).
+pub const NO_T: i64 = i64::MIN;
+
 pub struct Mixer<'a> {
     c: &'a Compiled,
     origin: i64,
     late: LatePolicy,
     cursor: usize,
     voices: Vec<Voice>,
-    /// 요청 대기열 (목표 프레임 또는 NOW, 소리, 이득, 플레이어?). 실시간에서는 SPSC 링이 이 자리를 채운다.
-    pending: Vec<(i64, u32, f32, bool)>,
+    /// 요청 대기열 (목표 프레임 또는 NOW, 소리, 이득, 플레이어?, 곡 시각). 실시간에서는 SPSC 링이 이 자리를 채운다.
+    pending: Vec<(i64, u32, f32, bool, i64)>,
     /// 자동재생을 믹서가 실행 데이터에서 직접 훑는가 (우리 방식). 끄면 프레임 쪽 로직이 요청으로 울린다.
     auto_from_chart: bool,
     /// 같은 소리를 다시 울리면 앞 소리를 끊는가 (P9: BMS 구동기 방식).
@@ -113,6 +119,19 @@ impl<'a> Mixer<'a> {
         self.voices.len()
     }
 
+    /// 곡 시간 0이 놓이는 프레임.
+    pub fn origin(&self) -> i64 {
+        self.origin
+    }
+
+    /// 지금 울리는 자동재생 긴 소리(반주)들: (0번 샘플이 놓인 프레임, 그 소리의 곡 시각 ns). 보이스 풀 순서(먼저 올린 것 먼저).
+    pub fn long_voices(&self) -> impl Iterator<Item = (i64, i64)> + '_ {
+        self.voices
+            .iter()
+            .filter(|v| !v.player && v.t != NO_T && self.c.chart.bank.sounds[v.sound as usize].kind == SoundKind::Long)
+            .map(|v| (v.start, v.t))
+    }
+
     /// 자동재생을 실행 데이터에서 직접 훑을지 (끄면 `play_sound`로만 울린다).
     pub fn set_auto_from_chart(&mut self, on: bool) {
         self.auto_from_chart = on;
@@ -128,7 +147,7 @@ impl<'a> Mixer<'a> {
         let n = self.c.chart.lanes[lane].notes[note];
         for s in &self.c.chart.note_sounds[n.sounds_start as usize..n.sounds_start as usize + n.sounds_len as usize] {
             if self.pending.len() < self.pending.capacity() {
-                self.pending.push((frame, s.sound, s.gain, true));
+                self.pending.push((frame, s.sound, s.gain, true, n.t));
             } else {
                 self.overflows += 1;
             }
@@ -137,8 +156,13 @@ impl<'a> Mixer<'a> {
 
     /// 소리 하나를 프레임 `frame`(또는 NOW)에서 낸다. `player`면 플레이어 키음의 늦음 정책을 따른다.
     pub fn play_sound(&mut self, sound: u32, gain: f32, frame: i64, player: bool) {
+        self.play_sound_t(sound, gain, frame, player, NO_T);
+    }
+
+    /// `play_sound`에 그 소리가 나타내는 곡 시각 `t`(ns)를 붙인다 (실시간 싱크 지표용, 소리에는 영향 없음).
+    pub fn play_sound_t(&mut self, sound: u32, gain: f32, frame: i64, player: bool, t: i64) {
         if self.pending.len() < self.pending.capacity() {
-            self.pending.push((frame, sound, gain, player));
+            self.pending.push((frame, sound, gain, player, t));
         } else {
             self.overflows += 1;
         }
@@ -169,7 +193,7 @@ impl<'a> Mixer<'a> {
         }
     }
 
-    fn admit(&mut self, sound: u32, due: i64, gain: f32, block: i64, player: bool) {
+    fn admit(&mut self, sound: u32, due: i64, gain: f32, block: i64, player: bool, t: i64) {
         let frames = self.c.chart.bank.sounds[sound as usize].frames as i64;
         let late = block - due;
         let start = if late <= 0 {
@@ -210,8 +234,8 @@ impl<'a> Mixer<'a> {
             self.log(MixEvent::Overflow { sound, due, player });
             return;
         }
-        self.voices.push(Voice { sound, start, gain, end: start + frames });
-        self.log(MixEvent::Start { sound, due, start, block, late, player, gain });
+        self.voices.push(Voice { sound, start, gain, end: start + frames, t, player });
+        self.log(MixEvent::Start { sound, due, start, block, late, player, gain, t });
     }
 
     /// 스트림 프레임 [block, block + n)을 채운다. `out`은 출력 채널 수(`out_ch`)만큼 끼워 넣은 버퍼이고 0으로 초기화돼 있어야 한다.
@@ -232,7 +256,7 @@ impl<'a> Mixer<'a> {
                 .then(|| self.origin + ns_to_frame(self.c.chart.auto[self.cursor].t, rate))
                 .filter(|&d| d < end);
             let mut best: Option<(usize, i64)> = None;
-            for (i, &(d, _, _, _)) in self.pending.iter().enumerate() {
+            for (i, &(d, _, _, _, _)) in self.pending.iter().enumerate() {
                 if d < end && best.map_or(true, |(_, b)| d < b) {
                     best = Some((i, d));
                 }
@@ -241,11 +265,11 @@ impl<'a> Mixer<'a> {
                 (Some(a), b) if b.map_or(true, |(_, p)| a <= p) => {
                     let e = self.c.chart.auto[self.cursor];
                     self.cursor += 1;
-                    self.admit(e.sound, a, e.gain, block, false);
+                    self.admit(e.sound, a, e.gain, block, false, e.t);
                 }
                 (_, Some((i, d))) => {
-                    let (_, sound, gain, player) = self.pending.remove(i);
-                    self.admit(sound, d, gain, block, player);
+                    let (_, sound, gain, player, t) = self.pending.remove(i);
+                    self.admit(sound, d, gain, block, player, t);
                 }
                 _ => break,
             }
@@ -395,7 +419,7 @@ mod tests {
         m.fill(&mut out, 2, 1000, 100);
         let mut log = Vec::new();
         m.drain_events(&mut log);
-        assert!(log.contains(&MixEvent::Start { sound: 2, due: 0, start: 0, block: 1000, late: 1000, player: false, gain: 1.0 }));
+        assert!(log.contains(&MixEvent::Start { sound: 2, due: 0, start: 0, block: 1000, late: 1000, player: false, gain: 1.0, t: 0 }));
         assert!(log.contains(&MixEvent::Dropped { sound: 1, due: 900, block: 1000, player: true }));
         let s2 = (c.chart.bank.sounds[2].offset as usize + 1000) * 2;
         assert_eq!(out[0], c.chart.bank.pcm[s2]);

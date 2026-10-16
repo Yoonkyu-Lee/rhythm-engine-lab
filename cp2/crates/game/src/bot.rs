@@ -44,7 +44,7 @@ impl ProfileClock {
         self.t.store(t_ns, Ordering::Release);
         self.q.store(q, Ordering::Release);
     }
-    fn read(&self) -> Option<(i64, i64)> {
+    pub fn read(&self) -> Option<(i64, i64)> {
         for _ in 0..4 {
             let q = self.q.load(Ordering::Acquire);
             let t = self.t.load(Ordering::Acquire);
