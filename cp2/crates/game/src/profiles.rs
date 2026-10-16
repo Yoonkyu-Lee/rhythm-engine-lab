@@ -218,7 +218,7 @@ impl FrameLogic {
             if kind == 0 {
                 self.last = Some((grade as u8, err));
             }
-            self.emit(JudgeLog { kind, note, grade: grade as u8, err_ns: err, t_ns: t, q_in: ev.qpc, q_proc, vkey: ev.vkey, key_frame: -1, state });
+            self.emit(JudgeLog { kind, note, grade: grade as u8, err_ns: err, t_ns: t, q_in: ev.qpc, q_proc, vkey: ev.vkey, key_frame: -1, state, q_recv: ev.recv_qpc, q_floor: ev.floor_qpc });
         } else {
             self.pressed = false;
             if let Some(Judged::LongEnd { note, ok, err }) = self.lane.release(notes, &self.w, t) {

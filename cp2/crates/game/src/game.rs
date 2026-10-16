@@ -4,7 +4,7 @@
 //!                [--profile ours|iidx|iidx-fine|djmax|bms] [--bot] [--bot-offset-ms 0] [--bot-jitter-ms 0] [--bot-adapt-ms 0]
 //!                [--faults audio@30:150,render@45:300,judge@60:300,input@75:300] [--fault-ms 300]
 //!                [--display-offset-ms 0] [--no-vsync] [--no-capture] [--tag run] [--out runs] [--quit-at-end] [--stop-at 곡초]
-//!                [--late-drop-ms 100] [--resync-judge void|count] [--iidx-ref bgm|device]
+//!                [--late-drop-ms 100] [--resync-judge void|count] [--iidx-ref bgm|device] [--input-mmcss]
 //!
 //! 시계: 기록 시계 C = 장치 시계 + D (CP1-4). 오디오 정지는 콘텐츠를 건너뛰어 시간축을 잇는다 (우리 방식).
 //! 스레드: 화면(이 스레드) · 오디오 · 입력 · 판정 · 봇 · 녹음 · 기록. 실시간 스레드끼리는 SPSC 링과 원자 변수만 쓴다.
@@ -168,7 +168,7 @@ fn spawn_logger(dir: PathBuf, mut l: Logs, stop: Arc<AtomicBool>) -> thread::Joi
             let mut fm = BufWriter::new(File::create(dir.join("mix_events.csv"))?);
             writeln!(fm, "kind,sound,due,start,block,late,player,gain,t_ns")?;
             let mut fj = BufWriter::new(File::create(dir.join("judgments.csv"))?);
-            writeln!(fj, "kind,note,grade,err_ns,t_ns,q_in,q_proc,vkey,key_frame,state")?;
+            writeln!(fj, "kind,note,grade,err_ns,t_ns,q_in,q_proc,vkey,key_frame,state,q_recv,q_floor")?;
             let mut fl = BufWriter::new(File::create(dir.join("lag_events.csv"))?);
             writeln!(fl, "kind,name,q_start,q_detect,q_end,magnitude_us")?;
             let mut fo = BufWriter::new(File::create(dir.join("bot.csv"))?);
@@ -189,7 +189,7 @@ fn spawn_logger(dir: PathBuf, mut l: Logs, stop: Arc<AtomicBool>) -> thread::Joi
                     }
                 }
                 while let Some(j) = l.judge.pop() {
-                    writeln!(fj, "{},{},{},{},{},{},{},{},{},{}", j.kind, j.note, j.grade, j.err_ns, j.t_ns, j.q_in, j.q_proc, j.vkey, j.key_frame, j.state)?;
+                    writeln!(fj, "{},{},{},{},{},{},{},{},{},{},{},{}", j.kind, j.note, j.grade, j.err_ns, j.t_ns, j.q_in, j.q_proc, j.vkey, j.key_frame, j.state, j.q_recv, j.q_floor)?;
                 }
                 while let Some(e) = l.lags.pop() {
                     writeln!(fl, "{},{},{},{},{},{}", e.kind, LAG_NAMES[e.kind as usize], e.q_start, e.q_detect, e.q_end, e.magnitude_us)?;
@@ -319,7 +319,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let (origin, rate) = (a.info.origin, a.info.rate);
     // 입력: BMS식은 1 kHz 폴링, 나머지는 Raw Input
-    let input = if profile == Profile::Bms { crate::input::Input::spawn_poll(kev_tx, keys.clone())? } else { crate::input::Input::spawn(kev_tx)? };
+    let input = if profile == Profile::Bms { crate::input::Input::spawn_poll(kev_tx, keys.clone())? } else { crate::input::Input::spawn(kev_tx, flag(args, "--input-mmcss"))? };
     let stop = Arc::new(AtomicBool::new(false));
     let beats = Arc::new(Heartbeats::default());
     let mon = Arc::new(MonitorShared::default());
@@ -654,6 +654,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let _ = b.join();
     }
     let input_lost = input.lost.load(Ordering::Relaxed);
+    let (input_mmcss, input_gap_max_us, input_gap_over_2ms) = (input.mmcss, input.gap_max_us.load(Ordering::Relaxed), input.gap_over_2ms.load(Ordering::Relaxed));
     input.stop();
     log_stop.store(true, Ordering::Release);
     logger.join().map_err(|_| "기록 스레드 패닉")??;
@@ -669,7 +670,7 @@ fn run_inner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let t = &view.tally;
     let snap = a.clock.load();
     let meta = format!(
-        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"{}\", \"slew\": [{}, {}],\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"period_frames\": {}, \"path\": \"{}\", \"origin\": {origin}, \"d_frames\": {}, \"need_max_frames\": {}, \"skips\": {}, \"skipped_frames\": {}, \"late_player\": {}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"display_offset_ns\": {display_offset_ns}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"lag_counts\": [{}],\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"void\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
+        "{{\n \"chart\": \"{}\", \"chart_hash\": \"{:016x}\", \"title\": \"{}\", \"profile\": \"{}\", \"slew\": [{}, {}],\n \"device\": \"{}\", \"rate\": {}, \"buffer_frames\": {}, \"period_frames\": {}, \"path\": \"{}\", \"origin\": {origin}, \"d_frames\": {}, \"need_max_frames\": {}, \"skips\": {}, \"skipped_frames\": {}, \"late_player\": {}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"out_offset_ns\": {out_offset_ns}, \"display_offset_ns\": {display_offset_ns}, \"input_mmcss\": {input_mmcss}, \"input_gap_max_us\": {input_gap_max_us}, \"input_gap_over_2ms\": {input_gap_over_2ms}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"windows_ns\": [{}, {}, {}, {}], \"render_timing_grade\": \"{}\",\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"lag_counts\": [{}],\n \"tally\": {{\"perfect\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"miss\": {}, \"empty\": {}, \"ln_ok\": {}, \"ln_break\": {}, \"void\": {}, \"max_combo\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
         path.replace('\\', "/"),
         chart.hash,
         chart.chart.title,

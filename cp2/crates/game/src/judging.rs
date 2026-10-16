@@ -43,6 +43,9 @@ pub struct JudgeLog {
     pub vkey: u16,
     /// 요청한 키음 목표 스트림 프레임 (없으면 −1).
     pub key_frame: i64,
+    /// 입력 스레드가 받은 QPC, 그때의 하한(큐가 비었음을 마지막으로 본 QPC). 입력에서 나온 행만 (진단용).
+    pub q_recv: i64,
+    pub q_floor: i64,
     /// 판정할 때의 게임 상태 (0 Running, 1 Suspect, 2 Resyncing).
     pub state: u8,
 }
@@ -200,7 +203,7 @@ pub fn spawn(
                         emit(&mut log, &mut lost, JudgeLog { kind: 6, t_ns: t, q_in, q_proc, vkey: ev.vkey, key_frame: -1, ..Default::default() });
                     }
                     let st = monitor.state.load(Ordering::Relaxed);
-                    emit(&mut log, &mut lost, JudgeLog { kind: 8, grade: ev.down as u8, t_ns: t, q_in, q_proc, vkey: ev.vkey, key_frame: -1, ..Default::default() });
+                    emit(&mut log, &mut lost, JudgeLog { kind: 8, grade: ev.down as u8, t_ns: t, q_in, q_proc, vkey: ev.vkey, key_frame: -1, q_recv: ev.recv_qpc, q_floor: ev.floor_qpc, ..Default::default() });
                     if ev.down {
                         if pressed {
                             continue; // 키 반복
@@ -229,7 +232,7 @@ pub fn spawn(
                         if kind == 0 {
                             last = Some((grade as u8, err));
                         }
-                        emit(&mut log, &mut lost, JudgeLog { kind, note, grade: grade as u8, err_ns: err, t_ns: t, q_in, q_proc, vkey: ev.vkey, key_frame, state: 0 });
+                        emit(&mut log, &mut lost, JudgeLog { kind, note, grade: grade as u8, err_ns: err, t_ns: t, q_in, q_proc, vkey: ev.vkey, key_frame, state: 0, q_recv: ev.recv_qpc, q_floor: ev.floor_qpc });
                     } else {
                         pressed = false;
                         if let Some(Judged::LongEnd { note, ok, err }) = lane.release(notes, &cfg.windows, t) {

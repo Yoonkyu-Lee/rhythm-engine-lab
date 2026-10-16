@@ -41,6 +41,11 @@ pub struct Input {
     /// QPC 틱. 0이면 아직 없음.
     pub watermark: Arc<AtomicI64>,
     pub lost: Arc<AtomicU64>,
+    /// 입력 스레드가 깨어난 간격: 최대(µs)와 2 ms 넘은 횟수 (1 ms 대기가 지켜지는지)
+    pub gap_max_us: Arc<AtomicU64>,
+    pub gap_over_2ms: Arc<AtomicU64>,
+    /// 입력 스레드를 MMCSS(Pro Audio)에 등록했나
+    pub mmcss: bool,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -50,23 +55,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 impl Input {
-    pub fn spawn(mut tx: Producer<KeyEvent>) -> Result<Input, String> {
+    pub fn spawn(mut tx: Producer<KeyEvent>, mmcss: bool) -> Result<Input, String> {
         let watermark = Arc::new(AtomicI64::new(0));
         let lost = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let gap_max_us = Arc::new(AtomicU64::new(0));
+        let gap_over_2ms = Arc::new(AtomicU64::new(0));
         let (id_tx, id_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
-        let (wm, lo, st) = (watermark.clone(), lost.clone(), stop.clone());
+        let (wm, lo, st, gm, go) = (watermark.clone(), lost.clone(), stop.clone(), gap_max_us.clone(), gap_over_2ms.clone());
         let join = thread::Builder::new()
             .name("input".into())
             .spawn(move || {
-                let r = unsafe { run(&mut tx, &wm, &lo, &st, &id_tx) };
+                if mmcss {
+                    let _ = synchronizer::wasapi::mmcss_pro_audio();
+                }
+                let r = unsafe { run(&mut tx, &wm, &lo, &st, &id_tx, &gm, &go) };
                 if let Err(e) = r {
                     let _ = id_tx.send(Err(e.to_string()));
                 }
             })
             .map_err(|e| e.to_string())?;
         let thread_id = id_rx.recv().map_err(|_| "입력 스레드가 시작하지 못함".to_string())??;
-        Ok(Input { thread_id, poll_stall: Arc::new(std::sync::atomic::AtomicU32::new(0)), watermark, lost, stop, join: Some(join) })
+        Ok(Input { thread_id, poll_stall: Arc::new(std::sync::atomic::AtomicU32::new(0)), watermark, lost, gap_max_us, gap_over_2ms, mmcss, stop, join: Some(join) })
     }
 
     /// BMS 구동기식 입력: 1 kHz로 키 상태를 폴링하고, 바뀐 것을 본 폴링 시각을 입력 시각으로 쓴다.
@@ -95,7 +105,7 @@ impl Input {
                         if d != down[i] {
                             down[i] = d;
                             let t = (q * 1000 / freq) as u32;
-                            if !tx.push(KeyEvent { vkey: k, down: d, qpc: q, msg_time_ms: t, tick_ms: t, floor_qpc: q }) {
+                            if !tx.push(KeyEvent { vkey: k, down: d, qpc: q, msg_time_ms: t, tick_ms: t, floor_qpc: q, recv_qpc: q }) {
                                 lo.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -111,7 +121,7 @@ impl Input {
                 }
             })
             .map_err(|e| e.to_string())?;
-        Ok(Input { thread_id: 0, poll_stall, watermark, lost, stop, join: Some(join) })
+        Ok(Input { thread_id: 0, poll_stall, watermark, lost, gap_max_us: Arc::new(AtomicU64::new(0)), gap_over_2ms: Arc::new(AtomicU64::new(0)), mmcss: false, stop, join: Some(join) })
     }
 
     /// 입력 스레드를 `ms` 동안 재운다 (고장 C).
@@ -144,6 +154,8 @@ unsafe fn run(
     lost: &AtomicU64,
     stop: &AtomicBool,
     id_tx: &std::sync::mpsc::Sender<Result<u32, String>>,
+    gap_max_us: &AtomicU64,
+    gap_over_2ms: &AtomicU64,
 ) -> windows::core::Result<()> {
     let hinst = GetModuleHandleW(None)?;
     let class = w!("cp2_raw_keyboard");
@@ -160,6 +172,12 @@ unsafe fn run(
     while !stop.load(Ordering::Relaxed) {
         // 1 ms마다라도 깨어 watermark를 올린다 (입력이 없어도 MISS 확정이 진행되게)
         MsgWaitForMultipleObjects(None, false, 1, QS_ALLINPUT);
+        // 깨어난 간격 (직전 '큐가 비었다' 확인부터): 1 ms 대기가 실제로 몇 ms였나
+        let gap_us = ((qpc::now() - last_empty) as i128 * 1_000_000 / freq as i128) as u64;
+        gap_max_us.fetch_max(gap_us, Ordering::Relaxed);
+        if gap_us > 2000 {
+            gap_over_2ms.fetch_add(1, Ordering::Relaxed);
+        }
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
             let q = qpc::now();
             match msg.message {
@@ -174,7 +192,7 @@ unsafe fn run(
                         if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
                             let kb = raw.data.keyboard;
                             let down = kb.Flags & 0x01 == 0;
-                            let raw_ev = KeyEvent { vkey: kb.VKey, down, qpc: q, msg_time_ms: mt, tick_ms: tk, floor_qpc: last_empty };
+                            let raw_ev = KeyEvent { vkey: kb.VKey, down, qpc: q, msg_time_ms: mt, tick_ms: tk, floor_qpc: last_empty, recv_qpc: q };
                             let est = raw_ev.estimated_qpc(freq).max(last_empty);
                             if !tx.push(KeyEvent { qpc: est, msg_time_ms: tk, ..raw_ev }) {
                                 lost.fetch_add(1, Ordering::Relaxed);

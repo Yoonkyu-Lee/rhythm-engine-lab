@@ -42,6 +42,8 @@ pub struct KeyEvent {
     pub tick_ms: u32,
     /// 이 입력을 꺼내기 전, 큐가 비어 있음을 마지막으로 확인한 QPC. 누른 시각은 이보다 이를 수 없다.
     pub floor_qpc: i64,
+    /// 입력 스레드가 이 메시지를 꺼낸 QPC (진단용: 추정 도장과 하한이 얼마나 떨어져 있었나).
+    pub recv_qpc: i64,
 }
 
 impl KeyEvent {
@@ -141,7 +143,7 @@ unsafe fn run(tx: &Sender<KeyEvent>, id_tx: &std::sync::mpsc::Sender<std::result
                         if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
                             let kb = raw.data.keyboard;
                             let down = kb.Flags & 0x01 == 0; // RI_KEY_BREAK = 1
-                            let _ = tx.send(KeyEvent { vkey: kb.VKey, down, qpc: q, msg_time_ms: mt, tick_ms: tk, floor_qpc: last_empty });
+                            let _ = tx.send(KeyEvent { vkey: kb.VKey, down, qpc: q, msg_time_ms: mt, tick_ms: tk, floor_qpc: last_empty, recv_qpc: q });
                         }
                     }
                     DispatchMessageW(&msg);
