@@ -194,7 +194,7 @@ createChannelGroup × 3 (_audioGroups[0..2]);  setCallback(_onModified, ...);
 |---|---|
 | 출력 형식 | `Configure.AudioVariety`(`FMOD.OUTPUTTYPE`). 기본 6 = WASAPI(`Configure.Validate` `IL_00e4`), 이 PC 7 = **ASIO** |
 | DSP 버퍼 | `AudioDataLength` 샘플 × 2개. 기본 256, 이 PC 64 → 48 kHz면 블록 1.33 ms, 2개 2.67 ms(계산. 장치 샘플레이트는 미확인. ASIO에서는 드라이버 버퍼 크기가 함께 작용할 수 있음 — 추정) |
-| 채널 그룹 | 0 = 배경음(BGM 레인), 1 = 키음·기본 타격음, 2 = 그 밖(추정: UI 소리) |
+| 채널 그룹 | 0 = 배경음(BGM 레인), 1 = 키음·기본 타격음, 2 = UI 효과음 (확인: `SEAudioVolume`, Qwilight_settings.md) |
 | 갱신 | `AudioSystem/<HandleSystem>d__61`: `PeriodicTimer(16.67 ms)`마다 `System.update` + 시각화 값 |
 
 ### 4-2. 플레이 중 소리를 내는 함수 `AudioSystem.Handle` (확인)
