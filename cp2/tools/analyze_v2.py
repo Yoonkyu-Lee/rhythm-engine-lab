@@ -128,6 +128,18 @@ def analyze(run, audio=True):
     bq = np.array([int(b["qpc_wake"]) for b in blocks], dtype=float)
     btl = np.array([int(b["tl"]) for b in blocks], dtype=float)
 
+    # 봇이 실제로 누른 시각 (SendInput 직후 QPC). 도장 − 실제 누름 = 입력 시각 도장의 오차 (봇 실행에서만)
+    bot_q = np.array(sorted(int(b["q_sent"]) for b in load_csv(run / "bot.csv") if b["down"] == "1"), dtype=np.int64) if (run / "bot.csv").exists() else np.array([], dtype=np.int64)
+
+    def stamp_err(q_in):
+        if not bot_q.size:
+            return None
+        i = int(np.searchsorted(bot_q, q_in))
+        c = bot_q[max(i - 1, 0):i + 1]
+        s0 = c[np.argmin(np.abs(c - q_in))]
+        e = (q_in - s0) * 1e3 / qf
+        return e if abs(e) < 50 else None
+
     hits = []
     for r in load_csv(run / "judgments.csv"):
         kind, grade = int(r["kind"]), int(r["grade"])
@@ -157,10 +169,8 @@ def analyze(run, audio=True):
         if ks is None:
             hits.append(dict(T=T, grade=grade, ks=None))
             continue
-        if late_f > 0:
-            # 예약 프레임을 지나 도착한 키음 (정지 중에 누름): 제자리에 낼 수 없었던 손실
-            hits.append(dict(T=T, grade=grade, ks=None, late_ms=late_f * 1e3 / rate))
-            continue
+        # 예약 프레임(누름 도장 + D)을 지나 도착한 키음: 목표보다 늦게 놓였다. 반주 기준으로 실제 어디 놓였는지는 아래에서 똑같이 잰다
+        late_ms = late_f * 1e3 / rate if late_f > 0 else None
         Tn = T * 1e9
         # 새로 울린 소리: 곡 시각이 가장 가까운 자동재생(2초 안)이 그 자리에서 가리키는 위치. 같은 거리면 더 크게 어긋난 쪽
         # (보간은 오디오 정지 앞뒤처럼 자동재생 자리가 계단으로 바뀌는 곳에서 없는 값을 만든다)
@@ -180,17 +190,24 @@ def analyze(run, audio=True):
         else:
             lng = np.nan
         err = int(r["err_ns"]) / 1e6  # 그 게임이 매긴 판정 오차
-        hits.append(dict(T=T, grade=grade, ks=ks, err=err, new=(ks - new) * 1e3 / rate if np.isfinite(new) else None, long=(ks - lng) * 1e3 / rate if L.size else None))
+        hits.append(dict(T=T, grade=grade, ks=ks, err=err, new=(ks - new) * 1e3 / rate if np.isfinite(new) else None, long=(ks - lng) * 1e3 / rate if L.size else None,
+                         late_ms=late_ms, stamp_ms=stamp_err(int(r["q_in"]))))
 
     def summarize(hs):
-        pf = [h for h in hs if h["grade"] == 0 and h["ks"] is not None]
+        placed = [h for h in hs if h["grade"] == 0 and h["ks"] is not None]
+        pf = [h for h in placed if h.get("late_ms") is None]           # 목표 자리에 제때 놓인 PERFECT 키음
+        lt = [h for h in placed if h.get("late_ms") is not None]       # 목표 자리보다 늦게 놓인 PERFECT 키음
         nv = [h["new"] for h in pf if h["new"] is not None]
-        rv = [h["new"] - h["err"] for h in pf if h["new"] is not None]
         lv = [h["long"] for h in pf if h["long"] is not None]
-        lt = [h["late_ms"] for h in hs if h["grade"] == 0 and h.get("late_ms") is not None]
-        return dict(perfect=len(pf), perfect_no_keysound=sum(1 for h in hs if h["grade"] == 0 and h["ks"] is None and h.get("late_ms") is None),
-                    perfect_late_keysound=len(lt), late_ms=pct(lt),
-                    ks_vs_new=pct(nv), ks_vs_long=pct(lv), residual=pct(rv),
+        # 잔차 = (키음 − 반주) − 판정 오차: 늦게 놓인 것도 넣는다. 1 ms 넘으면 판정과 소리가 서로 다른 말을 한다
+        rv_all = [(h["new"] - h["err"]) for h in placed if h["new"] is not None]
+        st = [h["stamp_ms"] for h in placed if h.get("stamp_ms") is not None]
+        return dict(perfect=len(pf), perfect_no_keysound=sum(1 for h in hs if h["grade"] == 0 and h["ks"] is None),
+                    perfect_late_keysound=len(lt), late_ms=pct([h["late_ms"] for h in lt]),
+                    late_vs_backing=pct([h["new"] for h in lt if h["new"] is not None]),
+                    ks_vs_new=pct(nv), ks_vs_long=pct(lv), residual=pct(rv_all),
+                    mismatch_1ms=int(sum(abs(v) > 1 for v in rv_all)),
+                    stamp_vs_press=pct(st), stamp_off_1ms=int(sum(abs(v) > 1 for v in st)),
                     off_new_5ms=int(sum(abs(v) > 5 for v in nv)), off_long_5ms=int(sum(abs(v) > 5 for v in lv)))
 
     rep = {"run": run.name, "profile": meta.get("profile"), "path": meta.get("path"), "d_ms": round(d * 1e3 / rate, 2),
@@ -270,7 +287,8 @@ def analyze(run, audio=True):
     print(f"                키음 vs 반주(긴 소리) {fmt(a['ks_vs_long'])} · 5 ms 넘음 {a['off_long_5ms']}")
     print(f"                잔차 = 키음 vs 반주(새 소리) − 판정 오차 {fmt(a['residual'])}")
     if a["perfect_no_keysound"] or a["perfect_late_keysound"]:
-        print(f"  손실: 키음을 버린 PERFECT {a['perfect_no_keysound']}개 · 키음이 늦게 놓인 PERFECT {a['perfect_late_keysound']}개 {fmt(a['late_ms'])}")
+        print(f"  손실: 키음을 버린 PERFECT {a['perfect_no_keysound']}개 · 키음이 목표보다 늦게 놓인 PERFECT {a['perfect_late_keysound']}개 (목표 대비 {fmt(a['late_ms'])}; 반주 대비 {fmt(a['late_vs_backing'])})")
+    print(f"  판정·소리 불일치 (|잔차| > 1 ms, 늦게 놓인 것 포함): {a['mismatch_1ms']}개" + (f" · 도장 − 실제 누름(봇) {fmt(a['stamp_vs_press'])}, 1 ms 넘음 {a['stamp_off_1ms']}개" if a['stamp_vs_press'] else ""))
     for f in rep["faults"]:
         print(f"  고장 {f['kind']} {f['ms']} ms @ {f['at_s']:.1f}s → 10초 안 PERFECT {f['perfect']}: 새 소리 {fmt(f['ks_vs_new'])} | 긴 소리 {fmt(f['ks_vs_long'])} | 손실 {f['perfect_no_keysound']}+{f['perfect_late_keysound']}")
     if rep["lag"]["faults"]:
