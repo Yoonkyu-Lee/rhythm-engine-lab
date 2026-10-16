@@ -104,6 +104,11 @@ impl<'a> Mixer<'a> {
         }
     }
 
+    /// 곡 시간 0이 놓이는 프레임을 바꾼다. 자동재생이 하나라도 놓이기 전에만 쓴다 (기록 시계의 D를 리드인 동안 잰 뒤 정할 때).
+    pub fn set_origin(&mut self, origin: i64) {
+        self.origin = origin;
+    }
+
     pub fn active_voices(&self) -> usize {
         self.voices.len()
     }
