@@ -392,7 +392,7 @@ impl<'a> Core<'a> {
                 self.need_max = need;
                 self.mon.need_max.store(need.round() as i64, Ordering::Relaxed);
             }
-            if self.calibrating {
+            if self.calibrating && need < 0.1 * self.rate as f64 {
                 self.cal_max = self.cal_max.max(need);
                 self.cal_n += 1;
             }

@@ -23,33 +23,85 @@ pub fn chart(rate: u32, with_click: bool) -> Compiled {
     calib_chart(rate, BPM, BEATS, with_click)
 }
 
-/// 실행 폴더의 judgments.csv에서 누름의 곡 시각(오프셋 A 포함 = 판정이 본 시각)을 모은다. 키 반복(같은 키의 연속 누름)은 거른다.
-pub fn presses(run_dir: &Path) -> Result<Vec<i64>, String> {
+/// 보정 실행 한 번의 결과: 분석 + 측정 범위(장치 열쇠, 실행에 쓴 B) + 적용을 막는 문제들 (리뷰 3-4 #2·#4)
+#[derive(Clone, Debug)]
+pub struct CalibOut {
+    pub c: Calib,
+    pub sound: bool,
+    /// 측정한 장치 범위 ("<경로>:<장치>") — 제안은 이 범위에만 적용한다
+    pub device_key: String,
+    /// 실행에 쓴 B (ms): 화면 보정의 제안 기준
+    pub b_ms: f64,
+    pub problems: Vec<String>,
+}
+
+impl CalibOut {
+    /// 적용할 수 있는 제안값 (ms, 정수로 반올림). 문제가 있거나 표본이 모자라면 None.
+    pub fn proposal(&self) -> Option<f64> {
+        (self.problems.is_empty() && self.c.used >= MIN_USED).then(|| proposal_ms(&self.c, self.sound, self.b_ms).round())
+    }
+}
+
+/// 적용에 필요한 최소 표본 (박 수)
+pub const MIN_USED: usize = 24;
+
+/// 실행 폴더의 judgments.csv에서 누름의 곡 시각(오프셋 A 포함 = 판정이 본 시각)을 모은다.
+/// 판정 스레드·리플레이와 같게: 같은 키의 반복은 거르고, 같은 레인에 이미 눌린 키가 있으면 겹친 누름으로 거른다.
+/// 돌려주는 값 = (누름 시각들, 재동기화 중에 들어온 누름 수).
+pub fn presses(run_dir: &Path) -> Result<(Vec<i64>, usize), String> {
     let csv = std::fs::read_to_string(run_dir.join("judgments.csv")).map_err(|e| e.to_string())?;
     let mut down: std::collections::HashMap<u16, bool> = Default::default();
-    let mut out = Vec::new();
+    let mut held: std::collections::HashMap<u16, u32> = Default::default();
+    let (mut out, mut resync) = (Vec::new(), 0);
     for l in csv.lines().skip(1) {
         let f: Vec<&str> = l.split(',').collect();
-        if f.first() != Some(&"8") || f.len() < 9 {
+        if f.first() != Some(&"8") || f.len() < 11 {
             continue;
         }
-        let (Ok(t), Ok(vkey)) = (f[5].parse::<i64>(), f[8].parse::<u16>()) else { continue };
+        let (Ok(lane), Ok(t), Ok(vkey)) = (f[1].parse::<u16>(), f[5].parse::<i64>(), f[8].parse::<u16>()) else { continue };
         let is_down = f[3] == "1";
         if down.insert(vkey, is_down).unwrap_or(false) == is_down {
-            continue;
+            continue; // 키 반복
         }
+        let h = held.entry(lane).or_insert(0);
         if is_down {
-            out.push(t);
+            *h += 1;
+            if *h == 1 {
+                out.push(t);
+                resync += (f[10] == "2") as usize;
+            }
+        } else {
+            *h = h.saturating_sub(1);
         }
     }
-    Ok(out)
+    Ok((out, resync))
 }
 
-pub fn result(run_dir: &Path) -> Result<Calib, String> {
-    Ok(analyze(&beat_grid(2_000_000_000, BPM, BEATS), &presses(run_dir)?, WARMUP, REJECT_NS, HIST_MS))
+fn meta_num(meta: &str, k: &str) -> Option<i64> {
+    let i = meta.find(&format!("\"{k}\": "))? + k.len() + 4;
+    meta[i..].split([',', '\n', '}']).next()?.trim().parse().ok()
 }
 
-/// 보정 결과 → 새 오프셋 (ms). `sound`면 A의 새 값, 아니면 B의 새 값(`cur_b_ms` 기준).
+/// 실행 폴더 → 보정 결과. 입력·판정 기록 유실, 재동기화 중 누름, 오디오 끊김이 있으면 적용 불가로 표시한다.
+pub fn result(run_dir: &Path, sound: bool, device_key: &str, b_ms: f64) -> Result<CalibOut, String> {
+    let (ps, resync) = presses(run_dir)?;
+    let c = analyze(&beat_grid(2_000_000_000, BPM, BEATS), &ps, WARMUP, REJECT_NS, HIST_MS);
+    let meta = std::fs::read_to_string(run_dir.join("meta.json")).map_err(|e| e.to_string())?;
+    let mut problems = Vec::new();
+    for (k, what) in [("input_lost", "입력 유실"), ("judge_log_lost", "판정 기록 유실"), ("log_lost", "오디오 기록 유실"), ("skips", "오디오 끊김")] {
+        match meta_num(&meta, k) {
+            Some(0) => {}
+            Some(n) => problems.push(format!("{what} {n}")),
+            None => problems.push(format!("meta.json에 {k} 없음")),
+        }
+    }
+    if resync > 0 {
+        problems.push(format!("재동기화 중 누름 {resync}"));
+    }
+    Ok(CalibOut { c, sound, device_key: device_key.to_string(), b_ms, problems })
+}
+
+/// 보정 결과 → 새 오프셋 (ms). `sound`면 A의 새 값, 아니면 B의 새 값(`cur_b_ms` = 실행에 쓴 B 기준).
 pub fn proposal_ms(c: &Calib, sound: bool, cur_b_ms: f64) -> f64 {
     let m = c.median as f64 / 1e6;
     if sound {
@@ -59,19 +111,24 @@ pub fn proposal_ms(c: &Calib, sound: bool, cur_b_ms: f64) -> f64 {
     }
 }
 
-pub fn describe(c: &Calib, sound: bool, cur_b_ms: f64) -> String {
-    let what = if sound { "소리로 맞추기 (A)" } else { "화면으로 맞추기 (B)" };
-    if c.used < 8 {
-        return format!("{what}: 쓸 수 있는 누름이 {}개뿐 (버림 {}) — 다시 해 주세요", c.used, c.dropped);
+pub fn describe(o: &CalibOut) -> String {
+    let c = &o.c;
+    let what = if o.sound { "소리로 맞추기 (A)" } else { "화면으로 맞추기 (B)" };
+    if !o.problems.is_empty() {
+        return format!("{what}: 적용 불가 — {} (다시 해 주세요)", o.problems.join(", "));
+    }
+    if c.used < MIN_USED {
+        return format!("{what}: 쓸 수 있는 누름이 {}개뿐 (버림 {}, {MIN_USED}개 필요) — 다시 해 주세요", c.used, c.dropped);
     }
     format!(
-        "{what}: 누름 {} (버림 {}), 중앙값 {:+.1} ms, 흔들림(MAD) {:.1} ms → 제안 {} {:+.0} ms  {}",
+        "{what} [{}]: 누름 {} (버림 {}), 중앙값 {:+.1} ms, 흔들림(MAD) {:.1} ms → 제안 {} {:+.0} ms  {}",
+        o.device_key,
         c.used,
         c.dropped,
         c.median as f64 / 1e6,
         c.mad as f64 / 1e6,
-        if sound { "A" } else { "B" },
-        proposal_ms(c, sound, cur_b_ms),
+        if o.sound { "A" } else { "B" },
+        proposal_ms(c, o.sound, o.b_ms),
         sparkline(c)
     )
 }
@@ -98,14 +155,25 @@ mod tests {
             let t = b + 20_000_000;
             csv += &format!("8,0,0,1,0,{t},0,0,124,-1,0,0,0\n");
             csv += &format!("8,0,0,1,0,{},0,0,124,-1,0,0,0\n", t + 30_000_000); // 키 반복: 버린다
-            csv += &format!("8,0,0,0,0,{},0,0,124,-1,0,0,0\n", t + 80_000_000);
+            csv += &format!("8,0,0,1,0,{},0,0,90,-1,0,0,0\n", t + 80_000_000); // 같은 레인의 다른 키가 겹쳐 누름: 버린다
+            csv += &format!("8,0,0,0,0,{},0,0,124,-1,0,0,0\n", t + 90_000_000);
+            csv += &format!("8,0,0,0,0,{},0,0,90,-1,0,0,0\n", t + 95_000_000);
         }
-        std::fs::write(dir.join("judgments.csv"), csv).unwrap();
-        assert_eq!(presses(&dir).unwrap().len(), BEATS);
-        let c = result(&dir).unwrap();
-        assert_eq!(c.used, BEATS - WARMUP);
-        assert_eq!(c.median, 20_000_000);
-        assert_eq!(proposal_ms(&c, true, 0.0), -20.0);
-        assert_eq!(proposal_ms(&c, false, 5.0), 25.0);
+        std::fs::write(dir.join("judgments.csv"), &csv).unwrap();
+        let meta = "{\n \"skips\": 0, \"log_lost\": 0, \"judge_log_lost\": 0, \"input_lost\": 0,\n}";
+        std::fs::write(dir.join("meta.json"), meta).unwrap();
+        assert_eq!(presses(&dir).unwrap().0.len(), BEATS);
+        let o = result(&dir, true, "shared:X", 0.0).unwrap();
+        assert_eq!(o.c.used, BEATS - WARMUP);
+        assert_eq!(o.c.median, 20_000_000);
+        assert_eq!(o.proposal(), Some(-20.0));
+        let o = result(&dir, false, "shared:X", 5.0).unwrap();
+        assert_eq!(o.proposal(), Some(25.0));
+        // 유실이 있으면 적용 불가
+        std::fs::write(dir.join("meta.json"), meta.replace("\"input_lost\": 0", "\"input_lost\": 3")).unwrap();
+        let o = result(&dir, true, "shared:X", 0.0).unwrap();
+        assert_eq!(o.proposal(), None);
+        assert!(describe(&o).contains("입력 유실 3"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

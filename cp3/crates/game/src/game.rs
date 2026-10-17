@@ -5,7 +5,8 @@
 //!                [--visible-ms 600] [--offset-a-ms 0] [--display-offset-ms 0] [--bot] [--bot-direct] [--bot-offset-ms 0] [--bot-jitter-ms 0]
 //!                [--faults audio@30:150,render@45:300,judge@60:300,input@75:300] [--fault-ms 300]
 //!                [--no-vsync] [--no-capture] [--tag run] [--out runs] [--quit-at-end] [--stop-at 곡초] [--late-drop-ms 100]
-//!                [--settings settings.toml]
+//!                [--settings settings.toml] [--seed -1] [--empty-sound chart|previous|next|none] [--scroll-base chart|start|mode|max|min]
+//!                [--bot-ignore-a]  (봇이 A를 모르는 척: 청취 시각 기준으로 누른다 — A 효과 시험용)
 //!   cp3game run calib --calib sound|screen [...]   보정 (calib_ui.rs): 합성 차분을 같은 플레이 경로로 돌리고 오프셋 제안
 //!
 //! 값의 출처: 명령줄 > `settings.toml`(3-4, settings.rs의 범위별 표) > 기본값. 설정 파일이 없으면 3-3과 같은 기본값.
@@ -97,11 +98,26 @@ struct FrameLog {
     injected_ms: u16,
 }
 
-static mut HOTKEY: u32 = 0;
+thread_local! {
+    /// 창이 받은 키 (창 스레드 = 메시지 루프 스레드에서만 쓴다). 한 프레임에 여러 키가 와도 잃지 않는다.
+    static HOTKEYS: std::cell::RefCell<std::collections::VecDeque<u32>> = std::cell::RefCell::new(std::collections::VecDeque::with_capacity(16));
+}
 
-/// 창이 받은 마지막 키 (WM_KEYDOWN)를 꺼낸다.
+/// 창이 받은 키 (WM_KEYDOWN, 들어온 순서) 하나를 꺼낸다. 없으면 0.
 pub fn take_hotkey() -> u32 {
-    unsafe { std::mem::replace(&mut *std::ptr::addr_of_mut!(HOTKEY), 0) }
+    HOTKEYS.with(|q| q.borrow_mut().pop_front().unwrap_or(0))
+}
+
+/// WM_KEYDOWN/WM_SYSKEYDOWN의 (wParam, lParam) → 가상 키. Shift·Ctrl·Alt는 왼쪽·오른쪽을 가른다
+/// (입력 스레드의 Raw Input 가상 키 0xA0~0xA5와 같게: 키 묶기 화면과 플레이 입력이 같은 번호).
+pub fn window_vkey(wp: usize, lp: isize) -> u32 {
+    let ext = (lp >> 24) & 1 == 1;
+    match wp {
+        0x10 => if ((lp >> 16) & 0xFF) == 0x36 { 0xA1 } else { 0xA0 },
+        0x11 => if ext { 0xA3 } else { 0xA2 },
+        0x12 => if ext { 0xA5 } else { 0xA4 },
+        v => v as u32,
+    }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -111,14 +127,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_KEYDOWN | WM_SYSKEYDOWN if msg == WM_KEYDOWN || wp.0 == 0x12 => {
-            // Shift·Ctrl·Alt는 왼쪽·오른쪽을 가른다 (입력 스레드의 Raw Input 가상 키와 같게: 키 묶기)
-            let ext = (lp.0 >> 24) & 1 == 1;
-            HOTKEY = match wp.0 {
-                0x10 => if ((lp.0 >> 16) & 0xFF) == 0x36 { 0xA1 } else { 0xA0 },
-                0x11 => if ext { 0xA3 } else { 0xA2 },
-                0x12 => if ext { 0xA5 } else { 0xA4 },
-                v => v as u32,
-            };
+            let v = window_vkey(wp.0, lp.0);
+            HOTKEYS.with(|q| {
+                let mut q = q.borrow_mut();
+                if q.len() < 64 {
+                    q.push_back(v);
+                }
+            });
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -256,19 +271,21 @@ pub fn gauge_of(s: &str) -> Result<engine::judge::GaugeKind, String> {
     })
 }
 
-/// 규칙 해시 (3-4, `cp3/설정창_계획.md` 3장): 판정에 영향을 주는 값의 정규 바이트열 + 엔진 노트 고르기 판 → BLAKE3 (16진 64자).
-/// 점수 비교 단위. 오프셋 A·B·음량·D는 판정 규칙이 아니므로 넣지 않는다.
-pub fn rules_hash(rules: &Rules, long_rule: LongRule) -> String {
-    let mut b = b"cp3-rules/1\0".to_vec();
+/// 규칙 해시 (3-4, `cp3/설정창_계획.md` 3장): 판정에 영향을 주는 값의 정규 바이트열 → BLAKE3 (16진 64자). 점수 비교 단위.
+/// 넣는 것: `Rules`(창·게이지 표·빈 POOR)·롱노트 규칙·재동기화 중 판정 정책(무효/집계 — 점수를 바꾼다, 리뷰 3-4 #7).
+/// 오프셋 A·B·음량·D는 판정 규칙이 아니므로 넣지 않는다.
+pub fn rules_hash(rules: &Rules, long_rule: LongRule, resync_void: bool) -> String {
+    let mut b = b"cp3-rules/2\0".to_vec();
     b.extend_from_slice(&rules.canonical_bytes(long_rule));
+    b.push(resync_void as u8);
     blake3::hash(&b).to_hex().to_string()
 }
 
 pub struct RunResult {
     /// 결과 요약 한 줄 (선곡 화면이 보여 준다)
     pub summary: String,
-    /// 보정 실행이면 분석 결과
-    pub calib: Option<engine::calib::Calib>,
+    /// 보정 실행이면 분석 결과 (측정 장치·B·문제 포함)
+    pub calib: Option<calib_ui::CalibOut>,
 }
 
 /// 플레이 한 번.
@@ -289,6 +306,7 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
     let mut set = Settings::load(std::path::Path::new(&arg(args, "--settings", "settings.toml")));
     let g = set.global();
     let render_name = arg(args, "--render", &g.render);
+    let render_key = render_name.clone();
     let apath = audio::AudioPath::parse(&arg(args, "--audio", &g.audio))?;
     let dev = set.device(&format!("{}:{render_name}", apath.key()));
     let calib = match arg(args, "--calib", "").as_str() {
@@ -349,7 +367,8 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
     let use_bot = flag(args, "--bot");
     let gauge_name = set.gauge();
     let rules = Rules::iidx(gauge_of(&arg(args, "--gauge", &gauge_name))?);
-    let rhash = rules_hash(&rules, chart.chart.long_rule);
+    let resync_void = arg(args, "--resync-judge", "void") != "count";
+    let rhash = rules_hash(&rules, chart.chart.long_rule, resync_void);
     let keymap = keys::keymap(&chart.chart.lanes, &km.keys);
     for w in &set.warnings {
         println!("  설정: {w}");
@@ -424,7 +443,7 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
     let monitor_join = monitor::spawn(mon.clone(), a.monitor.clone(), a.clock.clone(), input.watermark.clone(), beats.clone(), lag_tx, stop.clone());
     let (judge, judge_join) = judging::spawn(
         chart.clone(),
-        JudgeCfg { origin, rate, out_offset_ns, rules, keymap: keymap.clone(), resync_void: arg(args, "--resync-judge", "void") != "count", audio: a.monitor.clone() },
+        JudgeCfg { origin, rate, out_offset_ns, rules, keymap: keymap.clone(), resync_void, audio: a.monitor.clone() },
         a.clock.clone(),
         input.watermark.clone(),
         kev_rx,
@@ -439,7 +458,7 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
         let cfg = BotCfg {
             origin,
             rate,
-            out_offset_ns,
+            out_offset_ns: if flag(args, "--bot-ignore-a") { 0 } else { out_offset_ns },
             offset_ns: (arg(args, "--bot-offset-ms", "0").parse::<f64>().unwrap_or(0.0) * 1e6) as i64,
             jitter_ns: (arg(args, "--bot-jitter-ms", "0").parse::<f64>().unwrap_or(0.0) * 1e6) as i64,
             seed: 12345,
@@ -703,7 +722,7 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
             None => "",
         },
         visible_s * 1e3,
-        arg(args, "--resync-judge", "void") != "count",
+        resync_void,
         rules.gauge_kind,
         rules.key.late[0],
         rules.key.late[1],
@@ -755,11 +774,33 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
     );
     println!("  {summary} | 규칙 {}", &rhash[..8]);
     if calib.is_some() {
-        let c = calib_ui::result(&dir)?;
-        let line = calib_ui::describe(&c, calib == Some(true), display_offset_ns as f64 / 1e6);
+        let o = calib_ui::result(&dir, calib == Some(true), &format!("{}:{render_key}", apath.key()), display_offset_ns as f64 / 1e6)?;
+        let line = calib_ui::describe(&o);
         println!("  {line}");
-        return Ok(RunResult { summary: line, calib: Some(c) });
+        return Ok(RunResult { summary: line, calib: Some(o) });
     }
     let hexs: String = chart.chart.chart_hash[..4].iter().map(|b| format!("{b:02x}")).collect();
     Ok(RunResult { summary: format!("{} [{}] {hexs}: {summary} | 규칙 {}", loaded.title, chart.chart.chart_id, &rhash[..8]), calib: None })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_keys_split_left_right_and_queue() {
+        // 창 프로시저를 직접 불러 확인: 왼쪽 Shift(스캔 0x2A)·오른쪽 Shift(0x36)·오른쪽 Ctrl(확장)·왼쪽 Alt(WM_SYSKEYDOWN)·A
+        let msgs = [
+            (WM_KEYDOWN, 0x10usize, 0x2Aisize << 16),
+            (WM_KEYDOWN, 0x10, 0x36 << 16),
+            (WM_KEYDOWN, 0x11, (0x1D << 16) | (1 << 24)),
+            (WM_SYSKEYDOWN, 0x12, 0x38 << 16),
+            (WM_KEYDOWN, 0x41, 0x1E << 16),
+        ];
+        for (m, wp, lp) in msgs {
+            unsafe { wndproc(HWND::default(), m, WPARAM(wp), LPARAM(lp)) };
+        }
+        let got: Vec<u32> = (0..6).map(|_| take_hotkey()).collect();
+        assert_eq!(got, vec![0xA0, 0xA1, 0xA3, 0xA4, 0x41, 0]); // 한 프레임에 다섯 개가 와도 순서대로 다 꺼낸다
+    }
 }

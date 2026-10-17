@@ -1,4 +1,4 @@
-//! `cp3game select <라이브러리 폴더>`: CP3 단순 선곡 화면 + 미리보기 바탕 검증 (README 4-3 범위: 화면 모양은 CP4).
+//! `cp3game select [<라이브러리 폴더>]` (없으면 설정의 라이브러리 폴더): CP3 단순 선곡 화면 + 미리보기 바탕 검증 (README 4-3 범위: 화면 모양은 CP4).
 //!
 //! 키: ↑↓ 곡 · PgUp/PgDn 10곡 · ←→ 차분 · Enter 플레이 · Space 미리보기 켜기/끄기 · [ ] 10초 탐색 · Home 하이라이트로 · F1 설정 · Esc 끝.
 //! - F1 = 설정 화면(settings_ui.rs, `--settings settings.toml`). 보정은 설정 화면에서 실행하고, 끝나면 결과를 들고 설정 화면으로 돌아온다.
@@ -99,16 +99,20 @@ fn stop_audio(p: Playing) {
 }
 
 pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let lib = PathBuf::from(args.get(2).ok_or("라이브러리 폴더 (index.bin이 있는 곳)")?);
     let settings_path = PathBuf::from(arg(args, "--settings", "settings.toml"));
     let mut g = Settings::load(&settings_path).global();
+    // 라이브러리: 명령줄 위치 인자가 있으면 그것(이번 실행만), 없으면 설정의 라이브러리 폴더 (설정 화면에서 바꾸면 다시 읽음)
+    let lib_arg = args.get(2).filter(|a| !a.starts_with("--")).cloned();
+    let mut lib = PathBuf::from(lib_arg.clone().unwrap_or_else(|| g.library.clone()));
+    let pass_from = if lib_arg.is_some() { 3 } else { 2 };
     let render_name = arg(args, "--render", &g.render);
     let mut ui: Option<Ui> = None;
+    let mut pending_lib: Option<(Vec<IndexEntry>, PathBuf)> = None;
     let mut script: std::collections::VecDeque<u32> = arg(args, "--keys", "").split(',').filter_map(|k| u32::from_str_radix(k.trim(), 16).ok()).collect();
     let mut frame_no = 0u64;
     let rate = audio::device_rate(audio::AudioPath::Shared, &render_name)?;
     let t_idx = Instant::now();
-    let entries: Vec<IndexEntry> = read_index(&lib)?;
+    let mut entries: Vec<IndexEntry> = read_index(&lib).map_err(|e| format!("{}: {e}", lib.display()))?;
     let idx_ms = t_idx.elapsed().as_secs_f64() * 1e3;
     if entries.is_empty() {
         return Err("색인에 곡이 없음".into());
@@ -157,6 +161,10 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 DispatchMessageW(&msg);
             }
         }
+        if let Some((v, nl)) = pending_lib.take() {
+            *track_cache.lock().unwrap() = (usize::MAX, SlotCache::new());
+            (entries, lib, sel, chart) = (v, nl, 0, 0);
+        }
         let e = &entries[sel];
         let n_charts = e.charts.len().max(1);
         let mut hk = game::take_hotkey();
@@ -196,27 +204,51 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             match if hk != 0 { u.key(hk, shift) } else { Action::None } {
                 Action::Close => {
                     ui = None;
-                    g = Settings::load(&settings_path).global(); // 저장한 값으로 (미리보기 음량)
+                    g = Settings::load(&settings_path).global(); // 저장한 값으로 (미리보기 음량·라이브러리)
+                    if lib_arg.is_none() && PathBuf::from(&g.library) != lib {
+                        let nl = PathBuf::from(&g.library);
+                        match read_index(&nl) {
+                            Ok(v) if !v.is_empty() => {
+                                reset(&mut preview, &mut loading, &gen);
+                                last_result = format!("라이브러리 {} ({}곡)", nl.display(), v.len());
+                                pending_lib = Some((v, nl)); // 다음 프레임 처음에 바꾼다 (지금 곡 참조가 살아 있음)
+                            }
+                            Ok(_) => last_result = format!("라이브러리 {}: 색인에 곡이 없음 (그대로 둠)", nl.display()),
+                            Err(err) => last_result = format!("라이브러리 {}: {err} (그대로 둠)", nl.display()),
+                        }
+                    }
                     changed = true;
+                }
+                Action::PickLibrary => {
+                    if let Some(f) = crate::settings_ui::pick_folder() {
+                        u.global.library = f.replace('\\', "/");
+                        u.dirty = true;
+                        u.msg = if lib_arg.is_some() { "명령줄의 라이브러리 폴더가 이번 실행에서는 우선함".into() } else { "저장(S)하고 닫으면 다시 읽음".into() };
+                    }
                 }
                 Action::Calib(sound) => {
                     reset(&mut preview, &mut loading, &gen);
-                    let tmp = settings_path.with_extension("calib.toml");
-                    match u.snapshot_to(&tmp) {
-                        Err(err) => u.msg = format!("보정 준비 실패: {err}"),
-                        Ok(()) => {
-                            let mut a: Vec<String> = [args[0].as_str(), "run", "calib", "--calib", if sound { "sound" } else { "screen" }, "--settings"].iter().map(|s| s.to_string()).collect();
-                            a.push(tmp.to_string_lossy().to_string());
-                            a.extend(["--quit-at-end", "--tag", "calib"].iter().map(|s| s.to_string()));
-                            a.extend(args.iter().skip(3).cloned());
-                            match game::run(&a) {
-                                Ok(r) => match r.calib {
-                                    Some(c) => u.calib_done(sound, &c),
-                                    None => u.msg = r.summary,
-                                },
-                                Err(err) => u.msg = format!("보정 실패: {err}"),
+                    // 보정에 넘길 설정은 임시 폴더의 고유한 새 파일 (사용자 설정 파일과 겹칠 수 없음, 리뷰 3-4 #1). 만든 것만 지운다
+                    let tmp = crate::settings::unique_sibling(&std::env::temp_dir().join("cp3-calib-settings.toml"), "run");
+                    if tmp == settings_path {
+                        u.msg = "보정 준비 실패: 임시 파일 경로가 설정 파일과 같음".into();
+                    } else {
+                        match u.snapshot_to(&tmp) {
+                            Err(err) => u.msg = format!("보정 준비 실패: {err}"),
+                            Ok(()) => {
+                                let mut a: Vec<String> = [args[0].as_str(), "run", "calib", "--calib", if sound { "sound" } else { "screen" }, "--settings"].iter().map(|s| s.to_string()).collect();
+                                a.push(tmp.to_string_lossy().to_string());
+                                a.extend(["--quit-at-end", "--tag", "calib"].iter().map(|s| s.to_string()));
+                                a.extend(args.iter().skip(pass_from).cloned());
+                                match game::run(&a) {
+                                    Ok(r) => match r.calib {
+                                        Some(o) => u.calib_done(&o),
+                                        None => u.msg = r.summary,
+                                    },
+                                    Err(err) => u.msg = format!("보정 실패: {err}"),
+                                }
+                                let _ = std::fs::remove_file(&tmp);
                             }
-                            let _ = std::fs::remove_file(&tmp);
                         }
                     }
                 }
@@ -260,7 +292,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 let cid = e.charts.get(chart).map(|c| c.0.clone()).unwrap_or_default();
                 reset(&mut preview, &mut loading, &gen);
                 let mut a: Vec<String> = vec![args[0].clone(), "run".into(), path, "--chart".into(), cid, "--quit-at-end".into()];
-                a.extend(args.iter().skip(3).cloned());
+                a.extend(args.iter().skip(pass_from).cloned());
                 let handoff = {
                     let mut tc = track_cache.lock().unwrap();
                     if tc.0 == sel { std::mem::take(&mut tc.1) } else { SlotCache::new() }

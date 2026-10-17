@@ -2,6 +2,7 @@
 //!
 //! - 오차 = 누름의 청취 곡 시각 − 가장 가까운 박. 처음 `warmup`박의 누름은 버린다(맞춰 가는 중).
 //! - 박 간격의 절반보다 먼 누름, 그리고 |오차| > `reject`는 버린다(엉뚱한 박을 노린 누름).
+//! - 박마다 표본은 하나(처리 순서로 먼저 온 누름). 한 박에 여러 번 누르면 나머지는 버린다(리뷰 3-4 #4).
 //! - 제안 오프셋 = −중앙값 (A: 판정과 키음을 함께 옮겨 이 사람의 누름이 PERFECT 자리에 오게, B: 화면을 그만큼 옮김).
 //! - 중앙값을 쓴다(평균은 실수 한두 번에 끌려간다). 안정성 지표로 MAD(중앙 절대 편차)를 함께 낸다.
 
@@ -42,6 +43,7 @@ pub fn analyze(beats: &[i64], presses: &[i64], warmup: usize, reject: i64, hist_
     let mut errs = Vec::new();
     let mut dropped = 0;
     let first_ok = beats.get(warmup).copied().unwrap_or(i64::MAX);
+    let mut taken = vec![false; beats.len()];
     for &p in presses {
         let k = beats.partition_point(|&b| b < p);
         let near = [k.checked_sub(1), (k < beats.len()).then_some(k)].into_iter().flatten().min_by_key(|&i| (p - beats[i]).abs());
@@ -55,10 +57,11 @@ pub fn analyze(beats: &[i64], presses: &[i64], warmup: usize, reject: i64, hist_
             (None, None) => i64::MAX,
         };
         let e = p - beats[i];
-        if beats[i] < first_ok || e.abs() > half || e.abs() > reject {
+        if beats[i] < first_ok || e.abs() > half || e.abs() > reject || taken[i] {
             dropped += 1;
             continue;
         }
+        taken[i] = true;
         errs.push(e);
     }
     let mut hist = vec![0u32; (2 * hist_range_ms + 1) as usize];
@@ -137,8 +140,8 @@ mod tests {
         let c = analyze(&beats, &presses, 4, 150_000_000, 50);
         assert_eq!(c.suggest, -20_000_000);
         assert!(c.mad <= 3_000_000);
-        assert_eq!(c.dropped, 4 + 1); // 준비 4 + reject 1 (앞 박 기준 +100 ms는 쓴다 → 중앙값 불변)
-        assert_eq!(c.used, 36 + 1);
+        assert_eq!(c.dropped, 4 + 1 + 1); // 준비 4 + reject 1 + 앞 박 기준 +100 ms (그 박은 이미 표본이 있음: 박마다 하나)
+        assert_eq!(c.used, 36);
     }
 
     #[test]

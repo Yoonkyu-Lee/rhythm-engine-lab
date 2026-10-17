@@ -217,7 +217,7 @@ fn replay(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let rules = engine::judge::Rules::iidx(gauge);
     // 규칙 해시 (3-4): 기록과 다르면 같은 규칙의 점수가 아니므로 비교에서 뺀다 (옛 기록은 해시가 없음 → 비교)
-    let rh = game::rules_hash(&rules, c.long_rule);
+    let rh = game::rules_hash(&rules, c.long_rule, resync_void);
     if let Some(m) = field("rules_hash") {
         if m != rh {
             println!("{} [{}]: 규칙 해시 다름 (기록 {}, 지금 {}) → 비교에서 뺌", l.title, chart, &m[..8.min(m.len())], &rh[..8]);

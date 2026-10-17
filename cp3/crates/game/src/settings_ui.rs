@@ -3,11 +3,10 @@
 //! 탭 = 설정 체계 묶음: [규칙] [장비와 몸] [소리] [입력] [화면] [라이브러리] [엔진]. 항목마다 범위 꼬리표(전역·장치별·키 모드별·프리셋).
 //! 화면이 들고 있는 값은 `Settings` 문서에 범위별로 되돌려 쓴다 — 장치(경로·장치 이름)나 레이아웃을 바꾸면 앞의 범위에 먼저 쓰고 새 범위를 읽는다.
 
-use engine::calib::Calib;
 use engine::judge::Rules;
 use engine::runtime::LongRule;
 
-use crate::calib_ui;
+use crate::calib_ui::{self, CalibOut};
 use crate::game::{gauge_of, rules_hash};
 use crate::keys;
 use crate::render::{DrawList, Rgba};
@@ -21,6 +20,8 @@ pub enum Action {
     Close,
     /// 보정 실행 (true = 소리로 맞추기 A, false = 화면으로 맞추기 B)
     Calib(bool),
+    /// 라이브러리 폴더 고르기 (폴더 선택 창)
+    PickLibrary,
 }
 
 const GAUGES: [&str; 5] = ["normal", "easy", "assist", "hard", "exhard"];
@@ -48,8 +49,39 @@ pub struct Ui {
     pub keymode: KeyMode,
     pub dirty: bool,
     pub msg: String,
-    /// 보정 결과 (소리?, 새 값 ms, 설명) — 적용을 눌러야 값이 바뀐다
-    pub pending: Option<(bool, f64, String)>,
+    /// 보정 결과 — 적용을 눌러야 값이 바뀌고, 측정한 장치 범위에만 들어간다 (리뷰 3-4 #2)
+    pub pending: Option<CalibOut>,
+    /// 출력 장치 이름들 (지금 값 + WASAPI 활성 렌더 장치)
+    devices: Vec<String>,
+}
+
+/// WASAPI 활성 렌더 장치 이름 (COM을 따로 띄운 스레드에서)
+fn render_devices() -> Vec<String> {
+    std::thread::spawn(|| {
+        let _ = synchronizer::wasapi::com_init();
+        synchronizer::wasapi::endpoints(false).map(|v| v.into_iter().map(|e| e.name).collect::<Vec<_>>()).unwrap_or_default()
+    })
+    .join()
+    .unwrap_or_default()
+}
+
+/// 폴더 고르기 창 (STA 스레드에서). 취소하면 None.
+pub fn pick_folder() -> Option<String> {
+    std::thread::spawn(|| unsafe {
+        use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+        use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, FOS_PICKFOLDERS, SIGDN_FILESYSPATH};
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().ok()?;
+        let d: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        d.SetOptions(d.GetOptions().ok()? | FOS_PICKFOLDERS).ok()?;
+        d.Show(None).ok()?;
+        let p = d.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const _));
+        s
+    })
+    .join()
+    .ok()
+    .flatten()
 }
 
 impl Ui {
@@ -70,7 +102,11 @@ impl Ui {
             None => 0,
         };
         let keymode = KeyMode { keys: vec![], visible_ms: 600.0, scroll_base: "chart".into() };
-        let mut ui = Ui { set, tab: 0, row: 0, binding: None, gauge, seed, global, dev_key, device, layouts, layout_i, keymode, dirty: false, msg: String::new(), pending: None };
+        let mut devices = render_devices();
+        if !devices.contains(&global.render) {
+            devices.insert(0, global.render.clone());
+        }
+        let mut ui = Ui { set, tab: 0, row: 0, binding: None, gauge, seed, global, dev_key, device, layouts, layout_i, keymode, dirty: false, msg: String::new(), pending: None, devices };
         ui.load_keymode();
         ui.msg = ui.set.warnings.join(" · ");
         ui
@@ -129,18 +165,41 @@ impl Ui {
         self.set.save_to(path)
     }
 
-    pub fn calib_done(&mut self, sound: bool, c: &Calib) {
-        let line = calib_ui::describe(c, sound, self.device.offset_b_ms);
-        self.pending = (c.used >= 8).then(|| (sound, calib_ui::proposal_ms(c, sound, self.device.offset_b_ms).round(), line.clone()));
-        self.msg = line;
+    pub fn calib_done(&mut self, o: &CalibOut) {
+        self.pending = o.proposal().is_some().then(|| o.clone());
+        self.msg = calib_ui::describe(o);
         self.tab = 1;
-        self.row = 8;
+        self.row = 11;
+    }
+
+    /// 보정 제안 적용: 측정한 장치 범위에 (지금 보는 장치가 아니면 문서의 그 장치 표에)
+    fn apply_pending(&mut self) {
+        let Some(o) = self.pending.take() else { return };
+        let Some(v) = o.proposal() else { return };
+        let set = |d: &mut Device| {
+            if o.sound {
+                d.offset_a_ms = v.clamp(-100.0, 100.0);
+            } else {
+                d.offset_b_ms = v.clamp(-200.0, 200.0);
+            }
+        };
+        let which = if o.sound { "A" } else { "B" };
+        if o.device_key == self.dev_key {
+            set(&mut self.device);
+            self.msg = format!("오프셋 {which} = {v:+.0} ms 적용 (S로 저장)");
+        } else {
+            let mut d = self.set.device(&o.device_key);
+            set(&mut d);
+            self.set.set_device(&o.device_key, &d);
+            self.msg = format!("오프셋 {which} = {v:+.0} ms를 측정한 장치 [{}]에 적용 (지금 보는 장치는 그대로, S로 저장)", o.device_key);
+        }
+        self.dirty = true;
     }
 
     pub fn rows(&self) -> usize {
         match self.tab {
-            0 => 3,
-            1 => 9,
+            0 => 6,
+            1 => 12,
             2 => 5,
             3 => 1 + self.lanes().len(),
             4 => 3,
@@ -200,23 +259,16 @@ impl Ui {
             0x1B => return Action::Close,
             0x53 => self.save(),
             0x0D => match (self.tab, self.row) {
-                (1, 6) => return Action::Calib(true),
-                (1, 7) => return Action::Calib(false),
-                (1, 8) => {
-                    if let Some((sound, v, _)) = self.pending.take() {
-                        if sound {
-                            self.device.offset_a_ms = v.clamp(-100.0, 100.0);
-                        } else {
-                            self.device.offset_b_ms = v.clamp(-200.0, 200.0);
-                        }
-                        self.dirty = true;
-                        self.msg = format!("오프셋 {} = {v:+.0} ms 적용 (S로 저장)", if sound { "A" } else { "B" });
-                    }
-                }
+                (1, 9) => return Action::Calib(true),
+                (1, 10) => return Action::Calib(false),
+                (1, 11) => self.apply_pending(),
                 (3, r) if r >= 1 => self.binding = Some(r - 1),
+                (5, 0) => return Action::PickLibrary,
                 _ => {}
             },
             _ if d != 0 => {
+                // 값이 실제로 바뀌는 행에서만 변경 표시 (편집할 수 없는 행은 그대로, 리뷰 3-4 #10)
+                let before = self.dirty;
                 self.dirty = true;
                 let f = d as f64;
                 match (self.tab, self.row) {
@@ -226,11 +278,18 @@ impl Ui {
                         self.global.audio = cycle(&PATHS, &self.global.audio, d).to_string();
                         self.switch_device();
                     }
-                    (1, 1) => self.device.d_auto = !self.device.d_auto,
-                    (1, 2) => self.device.d_margin_ms = (self.device.d_margin_ms + f * 0.5).clamp(0.0, 50.0),
-                    (1, 3) => self.device.d_manual_ms = (self.device.d_manual_ms + f).clamp(0.0, 200.0),
-                    (1, 4) => self.device.offset_a_ms = (self.device.offset_a_ms + f).clamp(-100.0, 100.0),
-                    (1, 5) => self.device.offset_b_ms = (self.device.offset_b_ms + f).clamp(-200.0, 200.0),
+                    (1, 1) => {
+                        let names: Vec<&str> = self.devices.iter().map(|x| x.as_str()).collect();
+                        self.global.render = cycle(&names, &self.global.render, d).to_string();
+                        self.switch_device();
+                    }
+                    (1, 2) => self.global.excl_period_ms = (self.global.excl_period_ms + f * 0.5).clamp(2.0, 50.0),
+                    (1, 3) => self.global.asio_buffer = if d > 0 { (self.global.asio_buffer * 2).min(4096) } else { (self.global.asio_buffer / 2).max(16) },
+                    (1, 4) => self.device.d_auto = !self.device.d_auto,
+                    (1, 5) => self.device.d_margin_ms = (self.device.d_margin_ms + f * 0.5).clamp(0.0, 50.0),
+                    (1, 6) => self.device.d_manual_ms = (self.device.d_manual_ms + f).clamp(0.0, 200.0),
+                    (1, 7) => self.device.offset_a_ms = (self.device.offset_a_ms + f).clamp(-100.0, 100.0),
+                    (1, 8) => self.device.offset_b_ms = (self.device.offset_b_ms + f).clamp(-200.0, 200.0),
                     (2, 0) => self.global.volume_master = ((self.global.volume_master + f * 0.05) * 100.0).round().clamp(0.0, 200.0) / 100.0,
                     (2, 1) => self.global.volume_bgm = ((self.global.volume_bgm + f * 0.05) * 100.0).round().clamp(0.0, 200.0) / 100.0,
                     (2, 2) => self.global.volume_keys = ((self.global.volume_keys + f * 0.05) * 100.0).round().clamp(0.0, 200.0) / 100.0,
@@ -246,7 +305,7 @@ impl Ui {
                     }
                     (4, 1) => self.keymode.visible_ms = (self.keymode.visible_ms + f * 25.0).clamp(100.0, 5000.0),
                     (4, 2) => self.keymode.scroll_base = cycle(&SCROLL_BASES, &self.keymode.scroll_base, d).to_string(),
-                    _ => self.dirty = false,
+                    _ => self.dirty = before,
                 }
             }
             _ => {}
@@ -264,15 +323,31 @@ impl Ui {
         let rows: Vec<(String, String, &str)> = match self.tab {
             0 => {
                 let r = gauge_of(&self.gauge).map(Rules::iidx);
-                let h = |lr| r.as_ref().map(|r| rules_hash(r, lr)[..8].to_string()).unwrap_or_default();
+                let h = |lr| r.as_ref().map(|r| rules_hash(r, lr, true)[..8].to_string()).unwrap_or_default();
+                let ms = |x: i64| x as f64 / 1e6;
+                let win = |w: engine::judge::Win| {
+                    ["PG", "GR", "GD", "BD"]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| if w.early[i] == w.late[i] { format!("{n} ±{:.1}", ms(w.late[i])) } else { format!("{n} −{:.1}/+{:.1}", ms(w.early[i]), ms(w.late[i])) })
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                };
+                let (wk, ws, ep) = r.as_ref().map(|r| (win(r.key), win(r.scratch), format!("{:.0} ms 앞까지", ms(r.empty_poor)))).unwrap_or_default();
                 vec![
                     ("게이지".into(), self.gauge.clone(), "프리셋"),
                     ("규칙 해시 (점수 비교 단위) LN · CN".into(), format!("{} · {}", h(LongRule::Ln), h(LongRule::Cn)), "판정 창·롱노트 규칙은 CP3 고정"),
                     ("변형 시드".into(), if self.seed < 0 { "무작위 (원작처럼 매번)".into() } else { format!("고정 {}", self.seed) }, "프리셋"),
+                    ("판정 창 — 건반 (ms)".into(), wk, "CP3 고정 (보기만)"),
+                    ("판정 창 — 스크래치 (ms)".into(), ws, "CP3 고정 (보기만)"),
+                    ("빈 POOR · 재동기화 중 판정".into(), format!("{ep} · 무효"), "CP3 고정 (보기만)"),
                 ]
             }
             1 => vec![
                 ("오디오 경로".into(), self.global.audio.clone(), "전역"),
+                ("출력 장치".into(), self.global.render.clone(), "전역"),
+                ("배타 주기 (ms)".into(), format!("{:.1}", self.global.excl_period_ms), "전역 (배타)"),
+                ("ASIO 버퍼 (샘플)".into(), self.global.asio_buffer.to_string(), "전역 (ASIO)"),
                 ("D 자동".into(), if self.device.d_auto { "켜짐 (리드인에서 잼)".into() } else { "꺼짐 (수동 값)".into() }, "장치별"),
                 ("D 자동 여유 (ms)".into(), format!("{:.1}", self.device.d_margin_ms), "장치별"),
                 ("D 수동 (ms)".into(), format!("{:.0}", self.device.d_manual_ms), "장치별"),
@@ -283,7 +358,7 @@ impl Ui {
                 (
                     "보정 결과 적용 ▶ Enter".into(),
                     match &self.pending {
-                        Some((s, v, _)) => format!("{} → {v:+.0} ms", if *s { "A" } else { "B" }),
+                        Some(o) => format!("{} → {:+.0} ms [{}]", if o.sound { "A" } else { "B" }, o.proposal().unwrap_or(0.0), o.device_key),
                         None => "(보정을 먼저)".into(),
                     },
                     "",
@@ -328,7 +403,7 @@ impl Ui {
                     "키 모드별",
                 ),
             ],
-            5 => vec![("라이브러리 폴더".into(), self.global.library.clone(), "전역 (색인은 trackc index)")],
+            5 => vec![("라이브러리 폴더 ▶ Enter 고르기".into(), self.global.library.clone(), "전역 (색인은 trackc index)")],
             _ => vec![("미리보기 W · 디바운스 (⚑ 3-5 측정으로)".into(), "2초 · 150 ms".into(), "고정")],
         };
         for (i, (k, v, scope)) in rows.iter().enumerate() {
@@ -342,8 +417,8 @@ impl Ui {
             list.text(960.0, y, 13.0, Rgba(0.55, 0.55, 0.6, 1.0), *scope);
         }
         if self.tab == 1 {
-            list.text(50.0, 360.0, 13.0, Rgba(0.6, 0.65, 0.7, 1.0), format!("장치 범위: {}", self.dev_key));
-            list.text(50.0, 380.0, 13.0, Rgba(0.6, 0.65, 0.7, 1.0), "누름 → 판정(A) → 키음 (D + A 뒤) · 반주는 D 뒤 · 노트 그림은 B만큼 앞당김");
+            list.text(50.0, 450.0, 13.0, Rgba(0.6, 0.65, 0.7, 1.0), format!("장치 범위: {} (D·오프셋 A·B는 이 장치에 저장)", self.dev_key));
+            list.text(50.0, 470.0, 13.0, Rgba(0.6, 0.65, 0.7, 1.0), "누름 → 판정(A) → 키음 (D + A 뒤) · 반주는 D 뒤 · 노트 그림은 B만큼 앞당김");
         }
         list.text(30.0, 650.0, 14.0, Rgba(0.7, 0.7, 0.7, 1.0), "Tab 탭 · ↑↓ 항목 · ←→ 값 · Enter 실행/키 묶기 · S 저장 · Esc 닫기");
         if self.dirty {
@@ -366,13 +441,17 @@ mod tests {
         let mut u = Ui::open(&p, Some("SC K1 K2 K3 K4 K5 K6 K7".into()));
         // 장비와 몸: 오프셋 A +2, B −3
         u.key(0x09, false);
-        u.row = 4;
+        u.row = 7;
         u.key(0x27, false);
         u.key(0x27, false);
-        u.row = 5;
+        u.row = 8;
         for _ in 0..3 {
             u.key(0x25, false);
         }
+        // 편집할 수 없는 행(보정 실행 행)에서 ←→는 변경 표시를 지우지 않는다
+        u.row = 9;
+        u.key(0x27, false);
+        assert!(u.dirty);
         // 입력: 레인 K1(행 2)에 Q 묶기 → Z에 더해짐, 이어 S(레인 K2의 키)를 K1에 묶으면 K2에서 떨어짐
         u.tab = 3;
         u.row = 2;
@@ -390,7 +469,7 @@ mod tests {
         u.tab = 1;
         u.row = 0;
         u.key(0x27, false); // shared → exclusive
-        u.row = 4;
+        u.row = 7;
         u.key(0x25, false);
         u.key(0x53, false); // S 저장
         assert!(!u.dirty, "{}", u.msg);
@@ -404,12 +483,23 @@ mod tests {
         let u2 = Ui::open(&p, Some("SC K1 K2 K3 K4 K5 K6 K7".into()));
         assert_eq!(u2.device.offset_a_ms, -1.0);
         assert!(u2.keymode.keys[2].is_empty());
-        // 보정 결과는 적용을 눌러야 바뀐다
+        // 보정 결과는 적용을 눌러야 바뀌고, 측정한 장치에만 들어간다
         let mut u3 = Ui::open(&p, None);
-        let c = Calib { used: 36, dropped: 4, median: 20_000_000, mad: 0, suggest: -20_000_000, hist: vec![0; 121], hist_range_ms: 60 };
-        u3.calib_done(true, &c);
+        let c = engine::calib::Calib { used: 36, dropped: 4, median: 20_000_000, mad: 0, suggest: -20_000_000, hist: vec![0; 121], hist_range_ms: 60 };
+        let o = CalibOut { c, sound: true, device_key: "exclusive:Playback 1/2".into(), b_ms: 0.0, problems: vec![] };
+        u3.calib_done(&o);
         assert_eq!(u3.device.offset_a_ms, -1.0);
         u3.key(0x0D, false);
         assert_eq!(u3.device.offset_a_ms, -20.0);
+        // 다른 장치(shared)에서 잰 결과 → 지금 보는 exclusive는 그대로, 문서의 shared 표에
+        u3.calib_done(&CalibOut { device_key: "shared:Playback 1/2".into(), ..o.clone() });
+        u3.key(0x0D, false);
+        assert_eq!(u3.device.offset_a_ms, -20.0);
+        u3.key(0x53, false);
+        assert_eq!(Settings::load(&p).device("shared:Playback 1/2").offset_a_ms, -20.0);
+        // 문제가 있는 측정은 적용할 수 없다
+        u3.calib_done(&CalibOut { problems: vec!["입력 유실 1".into()], ..o });
+        assert!(u3.pending.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
