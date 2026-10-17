@@ -325,7 +325,7 @@
 |---|---|---|
 | B-0 | 2차 연구(3장) | Q1~Q10 답, 이 문서 갱신 — **완료 (2026-10-17, 3-4)** |
 | B-1 | 파서: BMS/BMSON → 차분 (레인 대응·롱노트·#RANDOM 변형·시각 유리수) | 표본 전부에서 원본 발음 목록과 1:1. 범위는 3-4 Q9 (LNOBJ·LN 채널·#LNMODE, #STOP, BPM 변화·마디 길이, #RANDOM 0.5%, BMSON 소수) — **완료 (2026-10-17, bms2track 0.2, 4-1)** |
-| B-2 | 같은 곡 판정 + 합치기 → 작성 형식 Track | 폴더 안 채보 묶음 나누기(소리 집합 + 제목) 포함. 대표 예 10곡 + Q7 오판 사례(由蘭 편곡들, Memory Of Sunrise/OneviA, Platinum/platinum garden, Rosario, macaron)에서 사람 판단과 일치 |
+| B-2 | (CP3에서 하지 않음 — CP4 이후 컨버터 작업) 같은 곡 판정 + 합치기 → 작성 형식 Track | 폴더 안 채보 묶음 나누기(소리 집합 + 제목) 포함. 대표 예 10곡 + Q7 오판 사례(由蘭 편곡들, Memory Of Sunrise/OneviA, Platinum/platinum garden, Rosario, macaron)에서 사람 판단과 일치 |
 | B-3 | 라이브러리 정체성 색인 + 편입 | Q6 모의 실험: 기존 차분 렌더 해시(소리 내용 해시 기준) 불변, 새 차분 1:1, 가져오는 순서와 무관 |
 | B-4 | 변환 보고서 (`../design/BMS_to_Track.md` 3-6의 항목 + 편입 기록) | 모든 Track에 보고서. 이동 확실성, 판 관계(2-5), 차분 사이 다른 이벤트 수 포함 |
 

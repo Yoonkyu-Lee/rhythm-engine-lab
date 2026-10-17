@@ -5,7 +5,9 @@ python -I -X utf8 cp3/tools/analyze_sync.py <runs/...> [...] [--no-audio]   (환
 1. PERFECT 키음 vs 반주 (믹서 기록, 샘플 단위). 모든 레인의 PGREAT 판정마다:
    - 키음: 그 노트의 소리 하나하나(`cp3game notes`: 소리 번호, 노트 시각 + offset)를 믹서 기록의 플레이어 발음(소리 번호, 곡 시각 t_ns)과
      **일대일로** 짝짓는다(같은 짝은 한 번만 쓴다 — 리뷰 3-5 #2: 같은 프레임의 다른 레인 키음이 누락을 가리지 않게). 짝이 없는 소리는 "키음 누락"으로 센다.
-     키음 vs 반주·잔차는 노트의 첫 소리(offset 0 쪽)로 잰다.
+     키음 vs 반주·잔차는 **소리마다** 그 소리의 기준 시각(노트 시각 + offset)에서 잰다(CP3 마감 리뷰 #2: 둘째 소리부터 검사하지 않던 것, 아르페지오 offset을 오차로 세던 것).
+   - 오프셋 A: 판정 오차(err)가 이미 A를 포함한다(판정 시각 = 청취 시각 + A, 키음 목표 = 판정 시각 + offset). 그래서 "키음 vs 반주" = err이고
+     잔차 = (키음 vs 반주) − err 이 A와 무관하게 0이어야 한다. A를 따로 빼지 않는다(마감 리뷰 #2: A를 두 번 빼던 것).
    - 반주(새 소리): 곡 시각이 노트 시각 T에 가장 가까운 자동재생(2초 안, 제때 놓인 것)이 그 자리에서 본 T의 위치. 같은 거리면 더 크게 어긋난 쪽.
    - 반주(긴 소리): T에 울리고 있는 긴 자동재생 소리들의 T 위치 중 키음과 가장 크게 어긋난 것.
    - 값 = 키음 − 반주 (ms, +면 키음이 늦음). 잔차 = 값 − 판정 오차 (판정이 맞다고 한 만큼 소리도 맞았나, |잔차| > 1 ms = 판정·소리 불일치).
@@ -139,37 +141,39 @@ def analyze(run, audio=True):
         for off, sound, t_snd in note_snd.get((lane, note), []):
             q = ks_pool.get((sound, t_snd))
             if q:
-                got.append(q.pop(0))
+                st_, lf_ = q.pop(0)
+                got.append((st_, lf_, off))
             else:
                 missing += 1
         if not got:
             hits.append(dict(T=T, lane=lane, grade=grade, ks=None, missing=missing))
             continue
-        ks, late_f = got[0]
-        late_ms = late_f * 1e3 / rate if late_f > 0 else None
-        Tn = T * 1e9
-        dist = np.abs(aT - Tn)
-        if dist.size and dist.min() <= 2e9:
-            cand = np.nonzero(dist <= dist.min() + 1)[0]
-            pos = aF[cand] + (Tn - aT[cand]) / 1e9 * rate
-            new = pos[np.argmax(np.abs(ks - pos))]
-        else:
-            new = np.nan
-        L = np.nonzero(is_long[aS] & (aT <= Tn) & (aT + snd_len[aS] * 1e9 > Tn) & (aF + (Tn - aT) / 1e9 * rate < cut_end))[0] if aS.size else np.array([], dtype=int)
-        if L.size:
-            devs = ks - (aF[L] + (Tn - aT[L]) / 1e9 * rate)
-            lng = ks - devs[np.argmax(np.abs(devs))]
-        else:
-            lng = np.nan
         err = int(r["err_ns"]) / 1e6
-        a_ms = a_ns / 1e6
-        hits.append(dict(T=T, lane=lane, grade=grade, ks=ks, err=err, missing=missing, late_any=any(lf > 0 for _, lf in got),
-                         new=(ks - new) * 1e3 / rate - a_ms if np.isfinite(new) else None,
-                         long=(ks - lng) * 1e3 / rate - a_ms if L.size else None,
-                         late_ms=late_ms, stamp_ms=stamp_err(lane, note, int(r["q_in"]))))
+        stamp = stamp_err(lane, note, int(r["q_in"]))
+        # 소리마다: 기준 시각 = 노트 시각 + offset, 그 시각의 반주 위치와 비교
+        for si, (ks, late_f, off) in enumerate(got):
+            late_ms = late_f * 1e3 / rate if late_f > 0 else None
+            Tn = T * 1e9 + off
+            dist = np.abs(aT - Tn)
+            if dist.size and dist.min() <= 2e9:
+                cand = np.nonzero(dist <= dist.min() + 1)[0]
+                pos = aF[cand] + (Tn - aT[cand]) / 1e9 * rate
+                new = pos[np.argmax(np.abs(ks - pos))]
+            else:
+                new = np.nan
+            L = np.nonzero(is_long[aS] & (aT <= Tn) & (aT + snd_len[aS] * 1e9 > Tn) & (aF + (Tn - aT) / 1e9 * rate < cut_end))[0] if aS.size else np.array([], dtype=int)
+            if L.size:
+                devs = ks - (aF[L] + (Tn - aT[L]) / 1e9 * rate)
+                lng = ks - devs[np.argmax(np.abs(devs))]
+            else:
+                lng = np.nan
+            hits.append(dict(T=T, lane=lane, grade=grade, ks=ks, err=err, sound_i=si, missing=missing if si == 0 else 0,
+                             new=(ks - new) * 1e3 / rate if np.isfinite(new) else None,
+                             long=(ks - lng) * 1e3 / rate if L.size else None,
+                             late_ms=late_ms, stamp_ms=stamp if si == 0 else None))
 
     def summarize(hs):
-        placed = [h for h in hs if h["grade"] == 0 and h["ks"] is not None]
+        placed = [h for h in hs if h["grade"] == 0 and h["ks"] is not None]  # 소리 단위
         pf = [h for h in placed if h.get("late_ms") is None]
         lt = [h for h in placed if h.get("late_ms") is not None]
         nv = [h["new"] for h in pf if h["new"] is not None]
@@ -177,7 +181,7 @@ def analyze(run, audio=True):
         rv_all = [(h["new"] - h["err"]) for h in placed if h["new"] is not None]
         rv_long = [(h["long"] - h["err"]) for h in placed if h["long"] is not None]
         st = [h["stamp_ms"] for h in placed if h.get("stamp_ms") is not None]
-        return dict(perfect=len(pf), perfect_no_keysound=sum(1 for h in hs if h["grade"] == 0 and h["ks"] is None),
+        return dict(perfect=sum(1 for h in pf if h.get("sound_i", 0) == 0), sounds=len(placed), perfect_no_keysound=sum(1 for h in hs if h["grade"] == 0 and h["ks"] is None),
                     keysound_missing=sum(h.get("missing", 0) for h in hs if h["grade"] == 0),
                     stamp_over_50ms=int(sum(abs(v) > 50 for v in st)),
                     perfect_late_keysound=len(lt), late_ms=pct([h["late_ms"] for h in lt]),
@@ -255,7 +259,7 @@ def analyze(run, audio=True):
     s = rep["score"] or {}
     print(f"{run.name}  {rep['title']} [{rep['chart']}] 레인 {rep['lanes']} · {rep['path']} · D {rep['d_ms']} ms · 건너뜀 {rep['skips']} · A {rep['offset_a_ms']:+.1f} ms")
     print(f"  점수 PG {s.get('pgreat')} GR {s.get('great')} GD {s.get('good')} BD {s.get('bad')} PR {s.get('poor')} | 늦은 키음 {late} · 버린 키음 {dropped}")
-    print(f"  PGREAT {a['perfect']}개: 키음 vs 반주(새 소리) {fmt(a['ks_vs_new'])} · 5 ms 넘음 {a['off_new_5ms']}")
+    print(f"  PGREAT {a['perfect']}개 (키음 {a['sounds']}개, 소리마다 기준 = 노트 시각 + offset): 키음 vs 반주(새 소리) {fmt(a['ks_vs_new'])} · 5 ms 넘음 {a['off_new_5ms']}")
     print(f"                키음 vs 반주(긴 소리) {fmt(a['ks_vs_long'])} · 5 ms 넘음 {a['off_long_5ms']}")
     print(f"                잔차 = 키음 vs 반주 − 판정 오차: 새 소리 {fmt(a['residual'])}")
     print(f"                                              긴 소리 {fmt(a['residual_long'])}")

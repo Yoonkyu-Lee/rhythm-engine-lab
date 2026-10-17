@@ -62,6 +62,11 @@ pub const NOW: i64 = i64::MIN;
 /// 곡 시각을 모르는 소리 (빈 누름 등).
 pub const NO_T: i64 = i64::MIN;
 
+/// 정규 발음 순서 열쇠 (명세 3-4): (곡 시각 ns, 종류 0 자동재생 · 1 노트 소리 · 2 빈 누름 소리 · 3 시각 모름, 레인(자동재생은 순번), 노트, 노트 소리).
+/// 같은 **프레임**에 놓이는 발음도 이 열쇠로 줄 세운다 — 실시간과 정답 렌더가 같은 순서로 올려야 끊기·choke 뒤 살아남는 소리가 같다
+/// (CP3 마감 리뷰 #1: 시각이 다른데 같은 프레임인 키음·반주가 도착 순서로 섞이던 것).
+pub type Ord5 = (i64, u8, u32, u32, u32);
+
 /// 발음 일정 한 줄: 자동재생, 또는 (자동 연주일 때) PERFECT 자리의 노트 소리.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Sched {
@@ -69,6 +74,18 @@ struct Sched {
     sound: u32,
     gain: f32,
     player: bool,
+    ord: Ord5,
+}
+
+/// 대기 중인 요청 (목표 프레임 또는 NOW, 소리, 이득, 플레이어?, 곡 시각, 정규 순서 열쇠)
+#[derive(Clone, Copy, Debug)]
+struct Req {
+    frame: i64,
+    sound: u32,
+    gain: f32,
+    player: bool,
+    t: i64,
+    ord: Ord5,
 }
 
 pub struct Mixer<'a> {
@@ -89,7 +106,7 @@ pub struct Mixer<'a> {
     pub paused_frames: u64,
     voices: Vec<Voice>,
     /// 요청 대기열 (목표 프레임 또는 NOW, 소리, 이득, 플레이어?, 곡 시각)
-    pending: Vec<(i64, u32, f32, bool, i64)>,
+    pending: Vec<Req>,
     auto_from_chart: bool,
     events: Vec<MixEvent>,
     events_cap: usize,
@@ -107,7 +124,7 @@ impl<'a> Mixer<'a> {
             c,
             origin,
             late,
-            sched: c.chart.auto.iter().map(|e| Sched { t: e.t, sound: e.sound, gain: e.gain, player: false }).collect(),
+            sched: c.chart.auto.iter().enumerate().map(|(i, e)| Sched { t: e.t, sound: e.sound, gain: e.gain, player: false, ord: (e.t, 0, i as u32, 0, 0) }).collect(),
             cursor: 0,
             quiet: false,
             lookahead: 0,
@@ -151,13 +168,13 @@ impl<'a> Mixer<'a> {
     pub fn set_autoplay_notes(&mut self) {
         let c = &self.c.chart;
         let mut v: Vec<(i64, u8, usize, usize, usize, Sched)> =
-            c.auto.iter().enumerate().map(|(i, e)| (e.t, 0, i, 0, 0, Sched { t: e.t, sound: e.sound, gain: e.gain, player: false })).collect();
+            c.auto.iter().enumerate().map(|(i, e)| (e.t, 0, i, 0, 0, Sched { t: e.t, sound: e.sound, gain: e.gain, player: false, ord: (e.t, 0, i as u32, 0, 0) })).collect();
         for (l, lane) in c.lanes.iter().enumerate() {
             for (i, n) in lane.notes.iter().enumerate() {
                 for k in 0..n.sounds_len as usize {
                     let s = c.note_sounds[n.sounds_start as usize + k];
                     let t = n.t + s.offset;
-                    v.push((t, 1, l, i, k, Sched { t, sound: s.sound, gain: s.gain, player: true }));
+                    v.push((t, 1, l, i, k, Sched { t, sound: s.sound, gain: s.gain, player: true, ord: (t, 1, l as u32, i as u32, k as u32) }));
                 }
             }
         }
@@ -207,8 +224,8 @@ impl<'a> Mixer<'a> {
             v.gate += n;
             v.end += n;
         }
-        for p in self.pending.iter_mut().filter(|p| p.0 != NOW) {
-            p.0 += n;
+        for p in self.pending.iter_mut().filter(|p| p.frame != NOW) {
+            p.frame += n;
         }
         self.pauses += 1;
         self.paused_frames += n as u64;
@@ -259,31 +276,35 @@ impl<'a> Mixer<'a> {
     pub fn play_note(&mut self, lane: usize, note: usize, frame: i64) {
         let n = self.c.chart.lanes[lane].notes[note];
         let rate = self.c.chart.bank.rate;
-        for s in &self.c.chart.note_sounds[n.sounds_start as usize..n.sounds_start as usize + n.sounds_len as usize] {
+        for (k, s) in self.c.chart.note_sounds[n.sounds_start as usize..n.sounds_start as usize + n.sounds_len as usize].iter().enumerate() {
             let f = if frame == NOW || s.offset == 0 { frame } else { frame + ns_to_frame(s.offset, rate) };
-            self.push_req(f, s.sound, s.gain, true, n.t + s.offset);
+            let t = n.t + s.offset;
+            self.push_req(f, s.sound, s.gain, true, t, (t, 1, lane as u32, note as u32, k as u32));
         }
     }
 
     /// 노트 소리를 (누른 시각의 청취 곡 ns + D) 기준으로 예약: 소리마다 `frame_of(press_ns + offset)` 하나로 바꾼다 (명세 3-4).
     pub fn play_note_at(&mut self, lane: usize, note: usize, press_frame_of: impl Fn(i64) -> i64, press_ns: i64) {
         let n = self.c.chart.lanes[lane].notes[note];
-        for s in &self.c.chart.note_sounds[n.sounds_start as usize..n.sounds_start as usize + n.sounds_len as usize] {
-            self.push_req(press_frame_of(press_ns + s.offset), s.sound, s.gain, true, n.t + s.offset);
+        for (k, s) in self.c.chart.note_sounds[n.sounds_start as usize..n.sounds_start as usize + n.sounds_len as usize].iter().enumerate() {
+            let t = n.t + s.offset;
+            self.push_req(press_frame_of(press_ns + s.offset), s.sound, s.gain, true, t, (t, 1, lane as u32, note as u32, k as u32));
         }
     }
 
     pub fn play_sound(&mut self, sound: u32, gain: f32, frame: i64, player: bool) {
-        self.push_req(frame, sound, gain, player, NO_T);
+        self.push_req(frame, sound, gain, player, NO_T, (i64::MAX, 3, 0, 0, 0));
     }
 
+    /// 곡 시각 `t`의 소리 하나 (빈 누름 소리: 같은 프레임이면 노트 소리 뒤)
     pub fn play_sound_t(&mut self, sound: u32, gain: f32, frame: i64, player: bool, t: i64) {
-        self.push_req(frame, sound, gain, player, t);
+        let ord = if t == NO_T { (i64::MAX, 3, 0, 0, 0) } else { (t, 2, 0, 0, 0) };
+        self.push_req(frame, sound, gain, player, t, ord);
     }
 
-    fn push_req(&mut self, frame: i64, sound: u32, gain: f32, player: bool, t: i64) {
+    fn push_req(&mut self, frame: i64, sound: u32, gain: f32, player: bool, t: i64, ord: Ord5) {
         if self.pending.len() < self.pending.capacity() {
-            self.pending.push((frame, sound, gain, player, t));
+            self.pending.push(Req { frame, sound, gain, player, t, ord });
         } else {
             self.overflows += 1;
         }
@@ -432,25 +453,26 @@ impl<'a> Mixer<'a> {
         }
         let rate = self.c.chart.bank.rate;
         for p in self.pending.iter_mut() {
-            if p.0 == crate::mixer::NOW {
-                p.0 = block;
+            if p.frame == crate::mixer::NOW {
+                p.frame = block;
             }
         }
         let mut pos = block;
         loop {
             // 다음 발음: 자동재생(같은 프레임이면 먼저) 또는 요청 (가장 이른 예정 프레임, 같으면 들어온 순서)
+            // 다음 발음 = (예정 프레임, 정규 순서 열쇠)가 가장 작은 것 — 자동재생과 요청을 같은 규칙으로 (정답 렌더와 같은 순서)
             let auto_due = (self.auto_from_chart && self.cursor < self.sched.len())
-                .then(|| self.origin + ns_to_frame(self.sched[self.cursor].t, rate))
-                .filter(|&d| d < end);
-            let mut best: Option<(usize, i64)> = None;
-            for (i, &(d, _, _, _, _)) in self.pending.iter().enumerate() {
-                if d < end && best.map_or(true, |(_, b)| d < b) {
-                    best = Some((i, d));
+                .then(|| (self.origin + ns_to_frame(self.sched[self.cursor].t, rate), self.sched[self.cursor].ord))
+                .filter(|&(d, _)| d < end);
+            let mut best: Option<(usize, i64, Ord5)> = None;
+            for (i, r) in self.pending.iter().enumerate() {
+                if r.frame < end && best.map_or(true, |(_, b, bo)| (r.frame, r.ord) < (b, bo)) {
+                    best = Some((i, r.frame, r.ord));
                 }
             }
             let (due, is_auto) = match (auto_due, best) {
-                (Some(a), b) if b.map_or(true, |(_, p)| a <= p) => (a, true),
-                (_, Some((_, d))) => (d, false),
+                (Some((a, ao)), b) if b.map_or(true, |(_, p, po)| (a, ao) <= (p, po)) => (a, true),
+                (_, Some((_, d, _))) => (d, false),
                 _ => break,
             };
             // 그 시각까지 먼저 섞고, 그 시각에 끝난 보이스를 내보낸다
@@ -465,9 +487,9 @@ impl<'a> Mixer<'a> {
                 self.cursor += 1;
                 self.admit(e.sound, due, e.gain, pos, block, e.player, e.t);
             } else {
-                let (i, _) = best.unwrap();
-                let (_, sound, gain, player, t) = self.pending.remove(i);
-                self.admit(sound, due, gain, pos, block, player, t);
+                let (i, _, _) = best.unwrap();
+                let r = self.pending.swap_remove(i);
+                self.admit(r.sound, due, r.gain, pos, block, r.player, r.t);
             }
         }
         self.mix_range(out, out_ch, block, pos, end);
@@ -865,10 +887,40 @@ mod tests {
         // 반주(긴 소리 3초)가 0초에 시작 → 소리 끝 ≥ 3초 (곡 끝 `end`는 마지막 이벤트라 소리 길이를 모른다)
         assert_eq!(sound, ch.bank.duration_ns(2).max(1_001_000_000 + late + ch.bank.duration_ns(1)));
         assert!(sound >= 3_000_000_000 && session == ch.end.max(judge).max(sound) + crate::runtime::SESSION_MARGIN_NS);
-        // 비정상적으로 긴 꼬리는 곡 끝 + 상한에서 자른다
+        // 마지막 이벤트가 0초이고 그때 시작한 반주가 60초여도 끝까지 (상한 없음 — 마감 리뷰 #4 반례)
         let mut long = tiny(16, false);
-        long.chart.bank.sounds[2].frames = 44_100 * 600;
-        long.chart.end = 2_000_000_000;
-        assert_eq!(long.chart.session_end(late).1, 2_000_000_000 + crate::runtime::SOUND_TAIL_CAP_NS);
+        long.chart.bank.sounds[2].frames = 44_100 * 60;
+        long.chart.lanes[0].notes.clear();
+        long.chart.end = 0;
+        let (_, snd, ses) = long.chart.session_end(late);
+        assert_eq!(snd, long.chart.bank.duration_ns(2));
+        assert_eq!(ses, snd + crate::runtime::SESSION_MARGIN_NS);
+    }
+
+    #[test]
+    fn same_frame_order_live_equals_render() {
+        // 반례 (CP3 마감 리뷰 #1): 키음 A(소리 1, cut 없음)를 0.25초 노트로, 같은 choke 묶음의 반주 B(소리 0)를 0.25초 + 5 μs에 둔다.
+        // 둘 다 같은 프레임 → 정규 순서는 A(시각이 이름) → B이므로 B가 A를 끊고 남는다. 실시간 요청도 같아야 한다.
+        let mut c = tiny(16, false);
+        c.chart.bank.sounds[0].choke = 7;
+        c.chart.bank.sounds[1].choke = 7;
+        c.chart.auto = vec![SoundEvent { t: 250_005_000, sound: 0, gain: 1.0 }];
+        c.chart.lanes[0].notes.truncate(1); // 노트 0.25초 (소리 1)
+        let (perfect, log_r) = render_perfect(&c, 256);
+        // 실시간: 노트 요청을 같은 프레임에 (도착은 블록 시작 전, 자동재생보다 먼저 쌓여도 순서는 열쇠로)
+        let mut m = Mixer::new(&c, 0, LatePolicy::DEFAULT, 1024);
+        m.play_note_at(0, 0, |ns| ns_to_frame(ns, 44_100), 250_000_000);
+        let mut live = vec![0f32; perfect.len()];
+        let mut f = 0;
+        let mut log_l = Vec::new();
+        while (f as usize) * 2 < live.len() {
+            let n = 256.min(live.len() / 2 - f as usize);
+            m.fill(&mut live[f as usize * 2..(f as usize + n) * 2], 2, f, n);
+            m.drain_events(&mut log_l);
+            f += n as i64;
+        }
+        let starts = |log: &Vec<MixEvent>| log.iter().filter_map(|e| if let MixEvent::Start { sound, start, .. } = e { Some((*sound, *start)) } else { None }).collect::<Vec<_>>();
+        assert_eq!(starts(&log_l), starts(&log_r));
+        assert_eq!(live, perfect);
     }
 }

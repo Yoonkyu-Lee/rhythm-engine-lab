@@ -641,13 +641,15 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
                     if view.done.get(li).and_then(|d| d.get(i)).copied().unwrap_or(false) {
                         continue;
                     }
+                    // 노트마다 화면과 겹치는지 본다 (CP3 마감 리뷰 #3: 시간순 ≠ 화면 위치순 — 역스크롤·위치 점프에서 뒤 노트가 다시 화면에 들어온다).
+                    // 롱노트는 머리·꼬리 사이 구간이 화면과 겹치면 그린다.
                     let y_head = JUDGE_Y as f64 - (chart.chart.scroll_pos(n.t) - pos_now) * px_per_beat;
-                    if y_head < -40.0 && chart.chart.scroll_pos(n.t) >= pos_now {
-                        break;
-                    }
                     let y_tail = JUDGE_Y as f64 - (chart.chart.scroll_pos(n.end) - pos_now) * px_per_beat;
+                    if y_head.max(y_tail) < -40.0 || y_head.min(y_tail) > H as f64 {
+                        continue;
+                    }
                     match n.kind {
-                        NoteKind::Long => list.rect(x + w * 0.2, y_tail as f32, w * 0.6, (y_head - y_tail) as f32, Rgba(col.0 * 0.6, col.1 * 0.6, col.2 * 0.6, 0.8)),
+                        NoteKind::Long => list.rect(x + w * 0.2, y_head.min(y_tail) as f32, w * 0.6, (y_head - y_tail).abs() as f32, Rgba(col.0 * 0.6, col.1 * 0.6, col.2 * 0.6, 0.8)),
                         NoteKind::Mine => {
                             list.rect(x + 4.0, y_head as f32 - 8.0, w - 8.0, 8.0, Rgba(0.9, 0.2, 0.2, 0.9));
                             drawn += 1;

@@ -844,11 +844,21 @@ def decode_float(src, kind, rep):
     return np.frombuffer(r.stdout, dtype="<f4").reshape(-1, out_ch).astype(np.float64), rate
 
 
+def channels_of(src):
+    try:
+        return sf.info(str(src)).channels
+    except RuntimeError:
+        return 0
+
+
 def sniff(b, src):
+    # 엔진은 1·2채널만 그대로 받는다 → 3채널 이상 Ogg·FLAC은 보존하지 않고 다운믹스 경로로 (CP3 마감 리뷰 #5)
     if b[:4] == b"OggS":
-        return "ogg" if b"\x01vorbis" in b[:64] else "other"
+        if b"\x01vorbis" not in b[:64]:
+            return "other"
+        return "ogg" if channels_of(src) <= 2 else "other"
     if b[:4] == b"fLaC":
-        return "flac"
+        return "flac" if channels_of(src) <= 2 else "other"
     if b[:4] == b"RIFF" and b[8:12] == b"WAVE":
         try:
             info = sf.info(str(src))

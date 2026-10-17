@@ -7,8 +7,6 @@
 pub const NS_PER_S: i64 = 1_000_000_000;
 /// 세션 끝 여유 (모든 소리·판정이 끝난 뒤)
 pub const SESSION_MARGIN_NS: i64 = 500_000_000;
-/// 소리 끝이 곡 끝(마지막 이벤트)보다 늦어질 수 있는 상한 ⚑
-pub const SOUND_TAIL_CAP_NS: i64 = 30_000_000_000;
 
 /// 늦게 시작할 때의 처리를 가르는 기준: 이보다 긴 소리는 "긴 소리"(늦으면 앞부분을 잘라 원래 자리에 맞춤, CP1 3-3).
 pub const LONG_SOUND_NS: i64 = 2 * NS_PER_S;
@@ -297,7 +295,8 @@ impl Chart {
     /// 플레이 세션 끝 (곡 시각 ns). **채보만으로** 정하고 플레이어 입력과 무관하다 — 끝난 뒤 계속 눌러도 늦춰지지 않는다.
     /// - 판정 끝 = 마지막 노트(롱노트는 끝) + `late_ns`(가장 늦은 판정 창). 노트가 없으면 곡 끝(`end`).
     /// - 소리 끝 = 채보가 정한 소리가 다 울리는 시각: 자동재생(반주 포함)은 시작 + 길이, 노트 키음은 가장 늦게 쳤을 때(노트 + offset + `late_ns`) + 길이.
-    ///   빈 누름 소리처럼 입력이 만드는 소리는 넣지 않는다. 비정상적으로 긴 꼬리가 끝을 끌지 않게 곡 끝 + `SOUND_TAIL_CAP_NS`로 자른다 ⚑.
+    ///   빈 누름 소리처럼 입력이 만드는 소리는 넣지 않는다. 소리 길이는 실제 길이 그대로 쓴다(상한 없음 — CP3 마감 리뷰 #4: 곡 끝 + 30초
+    ///   상한이 정상적인 긴 반주를 자르던 것). 길이는 소리 표에서 정해진 유한한 값이라 입력으로 늘어나지 않는다.
     /// - 세션 끝 = max(곡 끝, 판정 끝, 소리 끝) + `SESSION_MARGIN_NS`. 돌려주는 값 = (판정 끝, 소리 끝, 세션 끝).
     pub fn session_end(&self, late_ns: i64) -> (i64, i64, i64) {
         let notes = self.lanes.iter().flat_map(|l| l.notes.iter());
@@ -308,7 +307,7 @@ impl Chart {
             .flat_map(|n| self.note_sounds[n.sounds_start as usize..n.sounds_start as usize + n.sounds_len as usize].iter().map(move |x| n.t + x.offset + late_ns + bank.duration_ns(x.sound)))
             .max()
             .unwrap_or(0);
-        let sound_end = auto_end.max(note_end).min(self.end + SOUND_TAIL_CAP_NS);
+        let sound_end = auto_end.max(note_end);
         (judge_end, sound_end, self.end.max(judge_end).max(sound_end) + SESSION_MARGIN_NS)
     }
 
