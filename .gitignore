@@ -22,6 +22,7 @@ __pycache__/
 cp0/IIDX_vs_BMS.md
 cp0/IIDX_timing_policy.md
 cp0/IIDX_scroll_judge_gauge.md
+cp0/IIDX_preview_memory.md
 cp0/iidx/tools/re_disasm_index.py
 cp0/bms/third_party/_partial_copy_beatoraja/
 
