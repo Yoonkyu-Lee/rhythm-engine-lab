@@ -260,6 +260,8 @@ fn lane_geometry(c: &Compiled) -> Vec<(f32, f32, Rgba)> {
     let gap = 2.0;
     let total: f32 = widths.iter().sum::<f32>() + gap * (widths.len().saturating_sub(1)) as f32;
     let mut x = (W as f32 - total) / 2.0 - 120.0;
+    // 건반 색은 양 끝에서 대칭으로: k번째 건반은 min(k, n−1−k)가 짝수면 흰색 (6건반 백청백백청백, 7건반 백청백청백청백, DP 14건반은 양쪽 7개씩)
+    let n_keys = c.chart.lanes.iter().filter(|l| !matches!(l.role, Role::Scratch | Role::Side | Role::Trigger)).count();
     let mut key_i = 0;
     let mut out = Vec::new();
     for (l, w) in c.chart.lanes.iter().zip(&widths) {
@@ -268,8 +270,9 @@ fn lane_geometry(c: &Compiled) -> Vec<(f32, f32, Rgba)> {
             Role::Side => Rgba(0.95, 0.75, 0.3, 1.0),
             Role::Trigger => Rgba(0.6, 0.9, 0.5, 1.0),
             _ => {
+                let mirror = key_i.min(n_keys - 1 - key_i);
                 key_i += 1;
-                if key_i % 2 == 1 { Rgba(0.95, 0.95, 0.95, 1.0) } else { Rgba(0.35, 0.6, 1.0, 1.0) }
+                if mirror % 2 == 0 { Rgba(0.95, 0.95, 0.95, 1.0) } else { Rgba(0.35, 0.6, 1.0, 1.0) }
             }
         };
         out.push((x, *w, col));
