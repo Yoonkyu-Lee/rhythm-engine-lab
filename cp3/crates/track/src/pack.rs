@@ -20,6 +20,8 @@ pub const K_SOUND_DATA: u32 = 8;
 pub const K_GRAPHICS: u32 = 9;
 pub const K_STATS: u32 = 10;
 pub const K_SOURCE: u32 = 11;
+/// v1.5: 차분별 변환 손실 (있을 때만)
+pub const K_LOSSES: u32 = 12;
 
 pub const DECODERS: &str = "vorbis=lewton-0.10 flac=claxon-0.4 msadpcm=track-1(ms-spec)";
 
@@ -99,7 +101,8 @@ pub fn encode_chart(c: &ChartSec) -> Vec<u8> {
         w.u8(s.retrigger);
         w.zeros(3);
         w.u32(s.choke);
-        w.zeros(8);
+        w.u32(s.length);
+        w.zeros(4);
     }
     tabs.push((w.0, c.sounds.len() as u32));
     // 1 레인 (노트·빈 레인 소리 구간은 아래에서 계산)
@@ -437,6 +440,19 @@ pub fn write_bundle(t: &TrackOut) -> Vec<u8> {
     }
     sections.push((K_SOURCE, w.0));
 
+    // LOSSES (v1.5): 손실이 있는 차분이 하나라도 있을 때만 — u32 n, { str 차분 id, u32 m, str × m } × n
+    let lossy: Vec<&ChartOut> = t.charts.iter().filter(|c| !c.losses.is_empty()).collect();
+    if !lossy.is_empty() {
+        let mut w = W::default();
+        w.u32(lossy.len() as u32);
+        for c in lossy {
+            w.str(&c.id);
+            w.u32(c.losses.len() as u32);
+            c.losses.iter().for_each(|l| w.str(l));
+        }
+        sections.push((K_LOSSES, w.0));
+    }
+
     // 배치: 머리 128 + 색인, 구역은 64 B 정렬, SOUND_DATA는 4 KiB 정렬
     let n = sections.len();
     let mut out = W::default();
@@ -582,6 +598,22 @@ impl Bundle {
     pub fn section(&self, kind: u32, nth: usize) -> Option<&[u8]> {
         self.sections.iter().filter(|s| s.0 == kind).nth(nth).map(|&(_, o, l)| &self.bytes[o..o + l])
     }
+}
+
+/// LOSSES 구역 (v1.5): (차분 id, 손실 목록). 구역이 없으면 빈 목록.
+pub fn read_losses(b: &Bundle) -> Result<Vec<(String, Vec<String>)>, String> {
+    let Some(sec) = b.section(K_LOSSES, 0) else { return Ok(Vec::new()) };
+    let mut r = R::new(sec);
+    let n = r.u32()? as usize;
+    r.need(n, 8)?;
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let id = r.str()?;
+        let m = r.u32()? as usize;
+        r.need(m, 4)?;
+        out.push((id, (0..m).map(|_| r.str()).collect::<Result<Vec<_>, _>>()?));
+    }
+    Ok(out)
 }
 
 /// 묶음에서 읽은 소리 데이터 (디코딩용).
@@ -739,7 +771,8 @@ pub fn decode_chart(sec: &[u8]) -> Result<ChartSec, String> {
         let retrigger = r.u8()?;
         r.bytes(3)?;
         let choke = r.u32()?;
-        sounds.push(LocalSound { hash, start, gain, retrigger, choke });
+        let length = r.u32()?;
+        sounds.push(LocalSound { hash, start, length, gain, retrigger, choke });
     }
     let mut notes_all = Vec::new();
     for i in 0..dir[4].1 {

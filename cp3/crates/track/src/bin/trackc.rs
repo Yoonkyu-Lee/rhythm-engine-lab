@@ -90,13 +90,20 @@ fn run(args: &[String]) -> Result<(), String> {
                 r.u32()?;
                 names.push(r.str()?);
             }
+            let losses = pack::read_losses(&b)?;
             for c in pack::read_charts(&b)? {
                 let s = pack::decode_chart(b.section(pack::K_CHART, c.section as usize).ok_or("CHART 없음")?)?;
                 if c.local_to_track.len() != s.sounds.len() || c.local_to_track.iter().any(|&x| x as usize >= names.len()) {
                     return Err(format!("차분 {}: 소리 대응 표 오류", c.id));
                 }
                 let nm = |l: u32| names[c.local_to_track[l as usize] as usize].clone();
-                println!("chart {} shift {} end {} hash {}", c.id, s.shift, s.end, hex(&c.hash[..8]));
+                println!("chart {} shift {} end {} hash {} budget {}", c.id, s.shift, s.end, hex(&c.hash[..8]), s.voice_budget);
+                for (i, x) in s.sounds.iter().enumerate() {
+                    println!("sound {i} {} {} {} {} {} {}", x.start, x.length, x.gain, x.retrigger, x.choke, nm(i as u32));
+                }
+                for (_, ls) in losses.iter().filter(|(id, _)| *id == c.id) {
+                    ls.iter().for_each(|l| println!("loss {l}"));
+                }
                 for (i, v) in s.variants.iter().enumerate() {
                     println!("variant {i} {} {}", v.0, v.1.len());
                 }

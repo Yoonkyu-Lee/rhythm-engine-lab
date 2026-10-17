@@ -85,6 +85,12 @@ file = "audio/piano_c_alt.wav"
 start = "3"                          # 앞 3샘플을 버림 (WMA 변환분 보정과 같은 칸)
 retrigger = "cut"                    # 다시 울리면 이전 것을 끊음
 
+[[sound]]
+id = "bass_slice"                    # bass_long의 1초부터 0.5초만 (v1.5 length: BMSON 이어 재생 조각과 같은 칸)
+file = "audio/bass_long.flac"        # 같은 파일 → 소리 데이터는 하나, 논리 소리는 따로
+start = "44100"
+length = "22050"
+
 [[media]]
 hash = "blake3:00000000000000000000000000000000000000000000000000000000000000e1"
 kind = "video"                       # 실체 없음 → 그리지 않고 표시만 (README 2-1)

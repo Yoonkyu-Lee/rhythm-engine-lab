@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 pub const FORMAT_MAJOR: u16 = 1;
-pub const FORMAT_MINOR: u16 = 4;
+pub const FORMAT_MINOR: u16 = 5;
 pub const BIN_NS: i64 = 250_000_000;
 /// 자원 상한 (악성·손상 입력에서 과대 할당 방지, 리뷰 3-1 #9)
 pub const MAX_CHART_NS: i64 = 24 * 3600 * 1_000_000_000;
@@ -81,6 +81,8 @@ pub struct SoundIdOut {
     pub id: String,
     pub data: u32,
     pub start: u32,
+    /// 0 = 끝까지 (v1.5)
+    pub length: u32,
     pub gain: Q,
     pub retrigger: u8,
     /// 0 = 없음, 그 밖 = Track choke 이름 번호 + 1
@@ -97,6 +99,8 @@ pub struct SoundDataOut {
 pub struct LocalSound {
     pub hash: [u8; 32],
     pub start: u32,
+    /// 0 = 끝까지 (v1.5, 레코드의 예약 칸 48..52)
+    pub length: u32,
     pub gain: f32,
     pub retrigger: u8,
     pub choke: u32,
@@ -164,6 +168,8 @@ pub struct ChartOut {
     /// 차분 안 소리 번호 → Track 논리 소리 번호
     pub local_to_track: Vec<u32>,
     pub stats: ChartStats,
+    /// 변환 손실 (v1.5, LOSSES 구역)
+    pub losses: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -333,14 +339,20 @@ pub fn compile_dir(dir: &Path) -> Result<TrackOut, String> {
     let mut sound_ids = Vec::new();
     let mut chokes: Vec<String> = Vec::new();
     let mut sound_dur: Vec<(u64, u32)> = Vec::new(); // (start 뒤 샘플 수, rate) — 보이스 예산용
+    // 같은 파일을 여러 논리 소리가 쓰면(BMS의 #WAV 여럿, BMSON 조각) 한 번만 읽고 디코딩한다
+    let mut by_file: HashMap<&str, (audio::Packed, [u8; 32])> = HashMap::new();
     for s in &tr.sound {
-        let bytes = std::fs::read(dir.join(&s.file)).map_err(|e| format!("소리 {} ({}): {e}", s.id, s.file))?;
-        let packed = audio::pack_file(&bytes).map_err(|e| format!("소리 {} ({}): {e}", s.id, s.file))?;
-        let pcm = audio::decode(&packed).map_err(|e| format!("소리 {}: {e}", s.id))?;
-        if packed.frames == 0 {
-            return Err(format!("소리 {}: 샘플 수 0", s.id));
+        if !by_file.contains_key(s.file.as_str()) {
+            let bytes = std::fs::read(dir.join(&s.file)).map_err(|e| format!("소리 {} ({}): {e}", s.id, s.file))?;
+            let packed = audio::pack_file(&bytes).map_err(|e| format!("소리 {} ({}): {e}", s.id, s.file))?;
+            let pcm = audio::decode(&packed).map_err(|e| format!("소리 {}: {e}", s.id))?;
+            if packed.frames == 0 {
+                return Err(format!("소리 {}: 샘플 수 0", s.id));
+            }
+            let hash = audio::content_hash(&packed, &pcm);
+            by_file.insert(s.file.as_str(), (packed, hash));
         }
-        let hash = audio::content_hash(&packed, &pcm);
+        let (packed, hash) = by_file[s.file.as_str()].clone();
         let start = match &s.start {
             None => 0,
             Some(x) => {
@@ -354,6 +366,20 @@ pub fn compile_dir(dir: &Path) -> Result<TrackOut, String> {
         if start as u64 >= packed.frames {
             return Err(format!("소리 {}: start {start}가 길이 {} 이상", s.id, packed.frames));
         }
+        let length = match &s.length {
+            None => 0,
+            Some(x) => {
+                let q = parse(x)?;
+                if !q.is_integer() || !q.is_positive() {
+                    return Err(format!("소리 {}: length는 1 이상의 정수 샘플 수", s.id));
+                }
+                let l = q.to_integer().to_u32().ok_or("length가 너무 큼")?;
+                if start as u64 + l as u64 > packed.frames {
+                    return Err(format!("소리 {}: start + length {}가 길이 {}를 넘음", s.id, start as u64 + l as u64, packed.frames));
+                }
+                l
+            }
+        };
         let gain = parse(s.gain.as_deref().unwrap_or("1"))?;
         if gain.is_negative() {
             return Err(format!("소리 {}: 이득이 음수", s.id));
@@ -377,12 +403,12 @@ pub fn compile_dir(dir: &Path) -> Result<TrackOut, String> {
                 i as u32 + 1
             }
         };
-        sound_dur.push((packed.frames - start as u64, packed.rate));
+        sound_dur.push((if length > 0 { length as u64 } else { packed.frames - start as u64 }, packed.rate));
         let data = *data_by_hash.entry(hash).or_insert_with(|| {
             datas.push(SoundDataOut { hash, packed });
             datas.len() as u32 - 1
         });
-        sound_ids.push(SoundIdOut { id: s.id.clone(), data, start, gain, retrigger, choke });
+        sound_ids.push(SoundIdOut { id: s.id.clone(), data, start, length, gain, retrigger, choke });
     }
 
     // 정보
@@ -478,6 +504,7 @@ pub fn compile_dir(dir: &Path) -> Result<TrackOut, String> {
                     ("note", !c.note.is_empty()),
                     ("lane_sound", !c.lane_sound.is_empty()),
                     ("variant", !c.variant.is_empty()),
+                    ("losses", !c.losses.is_empty()),
                 ] {
                     if present {
                         return Err(format!("{cid}: 배속 변형은 '{k}'를 물려받으므로 적을 수 없음 (G6)"));
@@ -516,6 +543,10 @@ pub fn compile_dir(dir: &Path) -> Result<TrackOut, String> {
             sec,
             local_to_track,
             stats,
+            losses: match &c.base {
+                None => c.losses.clone(),
+                Some(b) => raw.iter().find(|(s, _)| s == b).map(|(_, bc)| bc.losses.clone()).unwrap_or_default(),
+            },
         });
     }
     warnings.extend(layer_warnings(&charts, layer_in));
@@ -823,7 +854,7 @@ fn finalize(cid: &str, q: &QChart, scale: &Q, shift: &Q, refs: &Q, ctx: &Ctx) ->
                     }
                 }
             };
-            LocalSound { hash: [0; 32], start: sid.start, gain: to_f32(&sid.gain), retrigger: sid.retrigger, choke } // gain은 compile_dir에서 f32 범위 검사됨
+            LocalSound { hash: [0; 32], start: sid.start, length: sid.length, gain: to_f32(&sid.gain), retrigger: sid.retrigger, choke } // gain은 compile_dir에서 f32 범위 검사됨
         })
         .collect();
     // 자동재생
@@ -968,15 +999,15 @@ fn chart_stats(_q: &QChart, sec: &ChartSec, _scale: &Q, track_highlight: Option<
     ChartStats { notes: ts.len() as u32, bins, highlight, max_nps }
 }
 
-/// 음악 레이어 항목: (차분 번호, Track 시각 ns, 소리 해시, start, 최종 이득(유리수), 조건부인가)
-type LayerEv = (usize, i64, [u8; 32], u32, Q, bool);
+/// 음악 레이어 항목: (차분 번호, Track 시각 ns, 소리 해시, (start, length), 최종 이득(유리수), 조건부인가)
+type LayerEv = (usize, i64, [u8; 32], (u32, u32), Q, bool);
 
 fn layer_events(ci: usize, q: &QChart, scale: &Q, shift: i64, sids: &[SoundIdOut], datas: &[SoundDataOut]) -> Result<Vec<LayerEv>, String> {
     let mut out = Vec::new();
     let mut push = |t: &Q, s: u32, g: &Q, cond: bool| -> Result<(), String> {
         let sid = &sids[s as usize];
         let tt = sec_to_ns(&(t / scale))?.checked_add(shift).ok_or("Track 시각이 i64 범위 밖")?;
-        out.push((ci, tt, datas[sid.data as usize].hash, sid.start, &sid.gain * g, cond));
+        out.push((ci, tt, datas[sid.data as usize].hash, (sid.start, sid.length), &sid.gain * g, cond));
         Ok(())
     };
     for a in &q.auto {
@@ -990,11 +1021,11 @@ fn layer_events(ci: usize, q: &QChart, scale: &Q, shift: i64, sids: &[SoundIdOut
     Ok(out)
 }
 
-/// 음악 레이어 경고 (명세 3-6): 같은 (Track 시각, 소리 해시, start, 유리수 이득)을 하나로 세고, 차분 ID 집합으로 공유를 센다.
+/// 음악 레이어 경고 (명세 3-6): 같은 (Track 시각, 소리 해시, start·length, 유리수 이득)을 하나로 세고, 차분 ID 집합으로 공유를 센다.
 /// 조건부(변형) 발음은 따로 센다. 같은 소리가 차분 사이에서 1 ms 안으로 어긋난 쌍도 센다 (명세 3-3 경고).
 fn layer_warnings(charts: &[ChartOut], evs: Vec<LayerEv>) -> Vec<String> {
     let n = charts.len();
-    let mut by_key: BTreeMap<(i64, [u8; 32], u32, String), (BTreeSet<usize>, bool)> = BTreeMap::new();
+    let mut by_key: BTreeMap<(i64, [u8; 32], (u32, u32), String), (BTreeSet<usize>, bool)> = BTreeMap::new();
     for (ci, t, h, st, g, cond) in &evs {
         let e = by_key.entry((*t, *h, *st, g.to_string())).or_default();
         e.0.insert(*ci);
@@ -1008,8 +1039,8 @@ fn layer_warnings(charts: &[ChartOut], evs: Vec<LayerEv>) -> Vec<String> {
             w.push(format!("음악 레이어 {}개 중 {partial}개는 모든 차분에 있지 않음 (차분마다 소리가 다름; 변형 조건부 {cond}개)", by_key.len()));
         }
     }
-    // 1 ms 안 어긋남: 같은 (소리, start, 이득)의 시각을 차분별로 모아 다른 차분끼리 0 < |Δ| ≤ 1 ms
-    let mut times: BTreeMap<([u8; 32], u32, String), Vec<(i64, usize)>> = BTreeMap::new();
+    // 1 ms 안 어긋남: 같은 (소리, start·length, 이득)의 시각을 차분별로 모아 다른 차분끼리 0 < |Δ| ≤ 1 ms
+    let mut times: BTreeMap<([u8; 32], (u32, u32), String), Vec<(i64, usize)>> = BTreeMap::new();
     for (ci, t, h, st, g, _) in &evs {
         times.entry((*h, *st, g.to_string())).or_default().push((*t, *ci));
     }

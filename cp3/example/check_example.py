@@ -44,11 +44,11 @@ KEYS = {
     "layout": {"id", "lanes", "groups"},
     "lane": {"id", "role"},
     "group": {"id", "lanes"},
-    "sound": {"id", "file", "gain", "start", "retrigger", "choke"},
+    "sound": {"id", "file", "gain", "start", "length", "retrigger", "choke"},
     "media": {"hash", "kind", "role", "start"},
     "source": {"format", "converter", "files"},
     "chart": {"id", "name", "level", "layout", "shift", "reference_scroll", "rules", "timing", "scroll",
-              "event", "note", "lane_sound", "variant"},
+              "event", "note", "lane_sound", "variant", "losses"},
     "variant_chart": {"id", "name", "level", "base", "time_scale", "shift", "reference_scroll"},
     "rules": {"long_note", "empty_lane"},
     "timing": {"unit", "ticks_per_beat", "tempo", "meter", "stops", "bars"},
@@ -327,13 +327,13 @@ def main():
         for e in c["starts"]:
             t = ns(e["t"]) + sh
             g = rat(sounds[e["sound"]].get("gain", "1")) * e["gain"]
-            layer[(t, pcm_h[e["sound"]], rat(sounds[e["sound"]].get("start", "0")), g)].add(cid)
+            layer[(t, pcm_h[e["sound"]], (rat(sounds[e["sound"]].get("start", "0")), rat(sounds[e["sound"]].get("length", "0"))), g)].add(cid)
             if t < 0:
                 negative.append((cid, t, e["sound"]))
     shared = {k: v for k, v in layer.items() if len(v) > 1}
     print(f"== 음악 레이어: 이벤트 {len(layer)}개, 둘 이상 차분이 공유 {len(shared)}개")
     for k, v in sorted(shared.items()):
-        name = next(s for s in sounds if pcm_h[s] == k[1] and rat(sounds[s].get("start", "0")) == k[2])
+        name = next(s for s in sounds if pcm_h[s] == k[1] and (rat(sounds[s].get("start", "0")), rat(sounds[s].get("length", "0"))) == k[2])
         print(f"  Track {k[0]:>13,} ns  {name:10} 이득 {k[3]}  {sorted(v)}")
     print("== 음수 Track 시각:", sorted(negative))
 
@@ -355,6 +355,8 @@ def main():
         ("7k-b 13박 정지 뒤 14박 노트 = 6.5초", ns(next(n["t"] for n in charts["7k-b"]["notes"] if n["lane"] == "K5")), 6_500_000_000),
         ("8b-a 아르페지오 offset = 1/4박(120 BPM) = 125 ms", report["8b-a"]["arp_offsets"], [125_000_000]),
         ("7k-b 변형 조합 4개 (r1 × r2)", report["7k-b"]["combos"], 4),
+        ("bass_slice: bass_long과 같은 PCM, start 1초·length 0.5초인 별도 레이어 항목 (v1.5)",
+         any(k[1] == pcm_h["bass_long"] and k[2] == (44100, 22050) for k in layer), True),
         ]
       except Exception as ex:  # 앞의 오류로 차분·소리가 빠지면 기대값을 셀 수 없음
         bad(f"기대값을 계산할 수 없음: {type(ex).__name__} {ex}")
@@ -541,7 +543,8 @@ def finish_chart(c, sounds):
                 choke += 1
                 live = [(end, sid) for end, sid in live if sounds[sid].get("choke") != ch]
             fi = sf.info(ROOT / s["file"])
-            live.append((t + fi.frames * 10**9 // fi.samplerate, e["sound"]))
+            n_fr = int(s["length"]) if "length" in s else fi.frames - int(s.get("start", "0"))  # v1.5 length
+            live.append((t + n_fr * 10**9 // fi.samplerate, e["sound"]))
     scroll = [(ns(t), float(p), float(s)) for t, p, s in c["scroll"]]
     return dict(combos=len(combos), cut=cut, choke=choke, scroll=scroll, bars=[ns(b) for b in c["bars"]], arp_offsets=arp)
 

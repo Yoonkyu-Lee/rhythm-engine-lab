@@ -77,6 +77,8 @@ pub struct SoundDef {
     pub file: String,
     pub gain: Option<String>,
     pub start: Option<String>,
+    /// 선택 (v1.5): start 뒤로 이 샘플 수만 낸다 (BMSON 조각). 없으면 끝까지
+    pub length: Option<String>,
     pub retrigger: Option<String>,
     pub choke: Option<String>,
 }
@@ -129,6 +131,9 @@ pub struct ChartToml {
     pub lane_sound: Vec<LaneSoundDef>,
     #[serde(default)]
     pub variant: Vec<VariantDef>,
+    /// 선택 (v1.5): 변환에서 원작과 달라진 점 (판정 노트 손실 등). 있으면 "불완전 변환" 차분
+    #[serde(default)]
+    pub losses: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -6,6 +6,7 @@ level = "11"
 layout = "7+1"
 shift = "0"
 reference_scroll = "120"             # IIDX: 시작 BPM
+losses = ["예시: 변환에서 원작과 달라진 점을 적는 칸 (v1.5, 불완전 변환 표시)"]
 
 [rules]
 long_note = "cn"                     # 떼기 판정
@@ -43,6 +44,10 @@ gain = "0.8"                         # 이벤트 이득: 8b-a의 같은 시각 k
 [[event]]
 at = "3000"
 sound = "kick"
+
+[[event]]
+at = "4500"
+sound = "bass_slice"                 # 조각 소리 (start·length)
 
 [[event]]
 at = "4000"

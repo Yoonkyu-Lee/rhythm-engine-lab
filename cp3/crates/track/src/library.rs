@@ -41,3 +41,57 @@ pub fn build_index(lib: &Path) -> Result<usize, String> {
     std::fs::write(lib.join("index.bin"), &w.0).map_err(|e| e.to_string())?;
     Ok(paths.len())
 }
+
+/// 색인 한 줄 (선곡 화면용).
+#[derive(Clone, Debug)]
+pub struct IndexEntry {
+    pub path: String,
+    pub size: u64,
+    pub title: String,
+    pub artist: String,
+    /// 차분마다 (id, 노트 수, 최대 NPS, 하이라이트 ns, 250 ms 칸 노트 수)
+    pub charts: Vec<(String, u32, u32, i64, Vec<u16>)>,
+}
+
+/// `index.bin`을 읽는다 (곡 묶음을 열지 않음).
+pub fn read_index(lib: &Path) -> Result<Vec<IndexEntry>, String> {
+    use crate::pack::R;
+    let bytes = std::fs::read(lib.join("index.bin")).map_err(|e| format!("index.bin: {e}"))?;
+    if bytes.len() < 12 || &bytes[0..4] != b"TIDX" {
+        return Err("index.bin이 아님".into());
+    }
+    let mut r = R::new(&bytes[8..]);
+    let n = r.u32()? as usize;
+    let mut out = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        r.bytes(16)?;
+        r.u32()?;
+        r.bytes(32)?;
+        let size = r.u64()?;
+        let path = r.str()?;
+        let li = r.u32()? as usize;
+        let info = r.bytes(li)?;
+        let ls = r.u32()? as usize;
+        let stats = r.bytes(ls)?;
+        let mut ri = R::new(info);
+        let title = ri.str()?;
+        let _sort = ri.str()?;
+        let artist = ri.str()?;
+        let mut rs = R::new(stats);
+        let nc = rs.u32()? as usize;
+        let mut charts = Vec::new();
+        for _ in 0..nc {
+            let id = rs.str()?;
+            let _bin = rs.i64()?;
+            let notes = rs.u32()?;
+            let nps = rs.u32()?;
+            let hl = rs.i64()?;
+            let nb = rs.u32()? as usize;
+            rs.need(nb, 2)?;
+            let bins = (0..nb).map(|_| rs.u16()).collect::<Result<Vec<_>, _>>()?;
+            charts.push((id, notes, nps, hl, bins));
+        }
+        out.push(IndexEntry { path, size, title, artist, charts });
+    }
+    Ok(out)
+}

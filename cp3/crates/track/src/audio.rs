@@ -230,9 +230,12 @@ fn pack_ogg_vorbis(bytes: &[u8]) -> Result<Packed, String> {
     // 첫 오디오 granule이 있는 페이지와 마지막 granule
     let (first_n, first_g, first_eos) = *granules.iter().find(|(n, _, _)| *n > 3).ok_or("오디오 granule 없음")?;
     let (_, last_g, _) = *granules.last().unwrap();
-    // 출력 샘플 0의 granule. 첫 오디오 페이지가 곧 마지막 페이지(EOS)면 그 granule은 끝 자르기라 앞은 0 (Vorbis I 명세 A.2)
-    let base = if first_eos { 0 } else { first_g - cum[first_n] };
-    let skip_front = if base < 0 { (-base) as u64 } else { 0 };
+    // 출력 샘플 0의 granule. 첫 오디오 페이지가 곧 마지막 페이지(EOS)면 그 granule은 끝 자르기라 앞은 0 (Vorbis I 명세 A.2).
+    // 앞 자르기는 하지 않는다 (v1.5): 첫 페이지 granule이 그 페이지의 디코딩 샘플 수보다 작은 스트림도 libsndfile·ffmpeg는
+    // 처음부터 내고 끝을 마지막 granule에 맞춘다(BMS 실측 35개, 3-2 리뷰 처리 중 확인). 원작 재생기와 같은 소리가 기준이다.
+    // 첫 granule이 더 큰 스트림(중간부터 자른 것)은 그 차이만큼 끝을 당긴다.
+    let base = if first_eos { 0 } else { (first_g - cum[first_n]).max(0) };
+    let skip_front = 0u64;
     let end = (last_g - base).min(decoded);
     if end <= skip_front as i64 {
         return Err("Vorbis 길이 0".into());
