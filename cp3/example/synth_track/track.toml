@@ -1,0 +1,102 @@
+# 합성 예시 Track — Track 형식 명세 v1(cp3/Track_형식.md)의 받는 쪽 테스트벤치 (README 7장 3-0)
+# 곡: 120 BPM 8박(0~4초) → 180 BPM 8박(4~6.67초). 반주 stem 하나 + 키음.
+format = "1.0"
+id = "0192f3a0-0000-7000-8000-00000000e001"
+revision = 1
+
+[info]
+title = "Synth Example"
+title_sort = "synth example"
+artist = "rhythm-engine-lab"
+genre = "Test"
+tags = ["example", "synthetic", "pack:cp3"]
+highlight = "4000"
+
+[info.lang.ko]
+title = "합성 예시"
+
+[origin]
+anchor_chart = "8b-a"
+
+[[layout]]
+id = "8B"
+lanes = [
+  { id = "SL", role = "side" },
+  { id = "K1", role = "key" }, { id = "K2", role = "key" }, { id = "K3", role = "key" },
+  { id = "L1", role = "trigger" },
+  { id = "R1", role = "trigger" },
+  { id = "K4", role = "key" }, { id = "K5", role = "key" }, { id = "K6", role = "key" },
+  { id = "SR", role = "side" },
+]
+groups = [{ id = "main", lanes = ["K1", "K2", "K3", "K4", "K5", "K6"] }]
+
+[[layout]]
+id = "7+1"
+lanes = [
+  { id = "SC", role = "scratch" },
+  { id = "K1", role = "key" }, { id = "K2", role = "key" }, { id = "K3", role = "key" },
+  { id = "K4", role = "key" }, { id = "K5", role = "key" }, { id = "K6", role = "key" },
+  { id = "K7", role = "key" },
+]
+groups = [{ id = "main", lanes = ["K1", "K2", "K3", "K4", "K5", "K6", "K7"] }]
+
+[[sound]]
+id = "kick"
+file = "audio/kick.ogg"
+
+[[sound]]
+id = "snare"
+file = "audio/snare.ogg"             # 48 kHz (리샘플링 대상)
+
+[[sound]]
+id = "side_swell"
+file = "audio/side_swell.ogg"
+
+[[sound]]
+id = "hat_closed"
+file = "audio/hat_closed.flac"
+choke = "hat"                        # 열린 하이햇을 끊음
+
+[[sound]]
+id = "hat_open"
+file = "audio/hat_open.flac"
+choke = "hat"
+
+[[sound]]
+id = "bass_long"
+file = "audio/bass_long.flac"        # 24비트, 8초 반주 stem
+
+[[sound]]
+id = "tick_odd"
+file = "audio/tick_odd.flac"         # 30,697 Hz 비표준 레이트
+
+[[sound]]
+id = "piano_c"
+file = "audio/piano_c.wav"           # MS-ADPCM
+
+[[sound]]
+id = "piano_e"
+file = "audio/piano_e.wav"
+gain = "0.5"
+
+[[sound]]
+id = "piano_c_alt"                   # piano_c와 바이트까지 같은 내용, 다른 ID (데이터는 한 번만, ID는 따로)
+file = "audio/piano_c_alt.wav"
+start = "3"                          # 앞 3샘플을 버림 (WMA 변환분 보정과 같은 칸)
+retrigger = "cut"                    # 다시 울리면 이전 것을 끊음
+
+[[media]]
+hash = "blake3:00000000000000000000000000000000000000000000000000000000000000e1"
+kind = "video"                       # 실체 없음 → 그리지 않고 표시만 (README 2-1)
+role = "bga"
+start = "0"
+
+[[media]]
+hash = "blake3:00000000000000000000000000000000000000000000000000000000000000e2"
+kind = "thumbnail"
+role = "select"
+
+[source]
+format = "manual"
+converter = "hand-written"
+files = []

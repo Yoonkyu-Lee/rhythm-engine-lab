@@ -1,0 +1,112 @@
+# DJMAX 8B 모양, tick 단위. 원점 기준 차분(anchor).
+id = "8b-a"
+name = "8B A"
+level = "7"
+layout = "8B"
+shift = "0"
+reference_scroll = "180"             # DJMAX식: 곡 정보 BPM
+
+[rules]
+long_note = "cn"
+empty_lane = "previous_note"
+
+[timing]
+unit = "tick"
+ticks_per_beat = 192
+tempo = [ { at = "0", bpm = "120" }, { at = "1536", bpm = "180" } ]   # 8박째부터 180
+meter = [ { measure = 0, length = "4" } ]
+
+[scroll]                             # 템포 그대로 + 2400~2496 tick 동안 화면만 멈춤 (시간은 흐름 — osu! SV 같은 연출)
+points = [
+  { at = "0", pos = "0", speed = "120" },
+  { at = "1536", pos = "8", speed = "180" },
+  { at = "2400", pos = "12.5", speed = "0" },
+  { at = "2496", pos = "12.5", speed = "180" },
+]
+
+# 자동재생
+[[event]]
+at = "0"
+sound = "bass_long"
+
+[[event]]
+at = "0"
+sound = "kick"
+
+[[event]]
+at = "384"
+sound = "kick"
+
+[[event]]
+at = "768"
+sound = "kick"
+
+[[event]]
+at = "1152"
+sound = "kick"
+
+[[event]]
+at = "1536"
+sound = "hat_closed"
+
+[[event]]
+at = "1728"
+sound = "snare"
+
+# 노트
+[[note]]
+at = "192"
+lane = "K1"
+kind = "tap"
+sounds = ["snare"]
+
+[[note]]
+at = "576"
+lane = "K3"
+kind = "tap"
+sounds = ["piano_c", "piano_e"]      # 화음: 노트 하나에 소리 둘
+
+[[note]]
+at = "960"
+lane = "K4"
+kind = "tap"
+sounds = [ { sound = "piano_c", at = "+0" }, { sound = "piano_e", at = "+48" } ]   # 아르페지오: 1/4박 뒤
+
+[[note]]
+at = "1152"
+lane = "L1"
+kind = "long"
+end = "1536"
+sounds = ["hat_open"]
+
+[[note]]
+at = "1536"
+lane = "R1"
+kind = "long"
+end = "1920"
+sounds = ["hat_closed"]              # hat_open을 choke로 끊음
+
+[[note]]
+at = "1920"
+lane = "SL"
+kind = "long"
+end = "2688"
+sounds = ["side_swell"]
+
+[[note]]
+at = "2112"
+lane = "K2"
+kind = "tap"
+sounds = ["kick"]
+
+[[note]]
+at = "2304"
+lane = "K6"
+kind = "tap"
+sounds = ["snare"]
+
+[[note]]
+at = "2688"
+lane = "SR"
+kind = "tap"
+sounds = ["tick_odd"]

@@ -1,0 +1,104 @@
+# BMS 모양, 박 단위("마디:박"), 7+1. 다른 팩에서 편입된 차분을 흉내 냄:
+# 앞에 1박(500 ms) 픽업이 더 있어서 shift = -500 → 자기 1박째 = Track 0, 픽업 kick은 Track -500 (음수 시각).
+id = "7k-b"
+name = "7K B"
+level = "9"
+layout = "7+1"
+shift = "-500"
+reference_scroll = "120"
+
+[rules]
+long_note = "ln"                     # BMS LN: 끝 판정 없음
+empty_lane = "previous_note"
+
+[timing]
+unit = "beat"
+tempo = [ { at = "0", bpm = "120" }, { at = "9", bpm = "180" } ]
+meter = [
+  { measure = 0, length = "4" },
+  { measure = 2, length = "3" },     # 마디 2만 3박 (BMS 마디 길이 0.75)
+  { measure = 3, length = "4" },
+]
+stops = [ { at = "13", beats = "1" } ]   # 13박째에서 1박(180 BPM이라 1/3초) 멈춤
+
+[[variant]]
+id = "r1"
+choices = ["a", "b"]
+
+# 자동재생
+[[event]]
+at = "0"
+sound = "kick"                       # 픽업 → Track -500 ms
+
+[[event]]
+at = "1"
+sound = "bass_long"                  # Track 0 → 8b-a의 반주와 같은 이벤트 (레이어에서 하나)
+
+[[event]]
+at = "3"
+sound = "kick"
+
+[[event]]
+at = "5"
+sound = "kick"
+
+[[event]]
+at = "7"
+sound = "kick"
+
+# 노트
+[[note]]
+at = "0:2"
+lane = "SC"
+kind = "tap"
+sounds = ["snare"]
+
+[[note]]
+at = "1:1.5"                         # 마디 1(4박부터) + 1.5박 = 5.5박
+lane = "K1"
+kind = "tap"
+sounds = ["hat_closed"]
+
+[[note]]
+at = "2:0"                           # 8박
+lane = "K4"
+kind = "long"
+end = "2:2"                          # 10박
+sounds = ["piano_c"]
+
+[[note]]
+at = "2:1"                           # 9박
+lane = "K7"
+kind = "mine"
+sounds = []
+
+[[note]]
+at = "6"
+lane = "K3"
+kind = "tap"
+sounds = ["piano_e"]
+when = "r1=a"
+
+[[note]]
+at = "6"
+lane = "K3"
+kind = "tap"
+sounds = ["piano_c_alt"]
+when = "r1=b"
+
+[[note]]
+at = "3:0"                           # 마디 3 = 4 + 4 + 3 = 11박
+lane = "K2"
+kind = "tap"
+sounds = ["snare"]
+
+[[note]]
+at = "14"                            # 13박의 정지 뒤
+lane = "K5"
+kind = "tap"
+sounds = ["kick"]
+
+[[lane_sound]]                       # BMS 투명 노트: 4박부터 K6을 빈 손으로 치면 hat_open
+at = "4"
+lane = "K6"
+sound = "hat_open"

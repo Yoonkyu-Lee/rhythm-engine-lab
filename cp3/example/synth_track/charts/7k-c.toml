@@ -1,0 +1,79 @@
+# IIDX 모양, ms 단위, 7+1. 템포는 스크롤·마디선용, 시각에는 쓰지 않음.
+# 두 번째 템포가 179.94인데 스크롤은 IIDX처럼 정수 반올림(180)으로 따로 적음.
+id = "7k-c"
+name = "7K C"
+level = "11"
+layout = "7+1"
+shift = "0"
+reference_scroll = "120"             # IIDX: 시작 BPM
+
+[rules]
+long_note = "cn"                     # 떼기 판정
+empty_lane = "previous_note"
+
+[timing]
+unit = "ms"
+tempo = [ { at = "0", bpm = "120" }, { at = "4000", bpm = "179.94" } ]
+bars = ["0", "2000", "4000", "16000/3"]   # 원작이 마디선을 따로 가짐
+
+[scroll]
+points = [
+  { at = "0", pos = "0", speed = "120" },
+  { at = "4000", pos = "8", speed = "180" },   # 179.94 → 180 (IIDX 정수 반올림)
+]
+
+# 자동재생 (8b-a와 Track 시각·소리가 같은 것들은 레이어에서 하나)
+[[event]]
+at = "0"
+sound = "bass_long"
+
+[[event]]
+at = "0"
+sound = "kick"
+
+[[event]]
+at = "1000"
+sound = "kick"
+
+[[event]]
+at = "2000"
+sound = "kick"
+
+[[event]]
+at = "3000"
+sound = "kick"
+
+[[event]]
+at = "4000"
+sound = "hat_closed"
+
+[[event]]
+at = "13000/3"                       # 4333.33… ms = 8b-a의 tick 1728과 같은 ns
+sound = "snare"
+
+# 노트
+[[note]]
+at = "500"
+lane = "SC"
+kind = "long"                        # 스크래치 롱노트 (BSS 모양)
+end = "1500"
+sounds = ["hat_open"]
+
+[[note]]
+at = "500"
+lane = "K1"
+kind = "tap"
+sounds = ["snare"]
+
+[[note]]
+at = "3500"
+lane = "K7"
+kind = "tap"
+sounds = ["piano_c", "piano_e"]
+
+[[note]]
+at = "4000"
+lane = "K4"
+kind = "long"
+end = "4666.5"
+sounds = ["piano_c_alt"]
