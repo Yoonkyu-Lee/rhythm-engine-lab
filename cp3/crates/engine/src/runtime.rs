@@ -5,6 +5,10 @@
 //! 소리 번호는 차분 안 소리 번호(명세 3-5)라, 같은 내용이라도 논리 ID가 다르면 다른 소리다(같은 소리 끊기는 이 번호로 판단).
 
 pub const NS_PER_S: i64 = 1_000_000_000;
+/// 세션 끝 여유 (모든 소리·판정이 끝난 뒤)
+pub const SESSION_MARGIN_NS: i64 = 500_000_000;
+/// 소리 끝이 곡 끝(마지막 이벤트)보다 늦어질 수 있는 상한 ⚑
+pub const SOUND_TAIL_CAP_NS: i64 = 30_000_000_000;
 
 /// 늦게 시작할 때의 처리를 가르는 기준: 이보다 긴 소리는 "긴 소리"(늦으면 앞부분을 잘라 원래 자리에 맞춤, CP1 3-3).
 pub const LONG_SOUND_NS: i64 = 2 * NS_PER_S;
@@ -288,6 +292,24 @@ impl Chart {
             _ => None,
         };
         bps.map_or(self.reference_scroll, |v| v * 60.0)
+    }
+
+    /// 플레이 세션 끝 (곡 시각 ns). **채보만으로** 정하고 플레이어 입력과 무관하다 — 끝난 뒤 계속 눌러도 늦춰지지 않는다.
+    /// - 판정 끝 = 마지막 노트(롱노트는 끝) + `late_ns`(가장 늦은 판정 창). 노트가 없으면 곡 끝(`end`).
+    /// - 소리 끝 = 채보가 정한 소리가 다 울리는 시각: 자동재생(반주 포함)은 시작 + 길이, 노트 키음은 가장 늦게 쳤을 때(노트 + offset + `late_ns`) + 길이.
+    ///   빈 누름 소리처럼 입력이 만드는 소리는 넣지 않는다. 비정상적으로 긴 꼬리가 끝을 끌지 않게 곡 끝 + `SOUND_TAIL_CAP_NS`로 자른다 ⚑.
+    /// - 세션 끝 = max(곡 끝, 판정 끝, 소리 끝) + `SESSION_MARGIN_NS`. 돌려주는 값 = (판정 끝, 소리 끝, 세션 끝).
+    pub fn session_end(&self, late_ns: i64) -> (i64, i64, i64) {
+        let notes = self.lanes.iter().flat_map(|l| l.notes.iter());
+        let judge_end = notes.clone().map(|n| n.end.max(n.t)).max().map_or(self.end, |e| e + late_ns);
+        let bank = &self.bank;
+        let auto_end = self.auto.iter().map(|e| e.t + bank.duration_ns(e.sound)).max().unwrap_or(0);
+        let note_end = notes
+            .flat_map(|n| self.note_sounds[n.sounds_start as usize..n.sounds_start as usize + n.sounds_len as usize].iter().map(move |x| n.t + x.offset + late_ns + bank.duration_ns(x.sound)))
+            .max()
+            .unwrap_or(0);
+        let sound_end = auto_end.max(note_end).min(self.end + SOUND_TAIL_CAP_NS);
+        (judge_end, sound_end, self.end.max(judge_end).max(sound_end) + SESSION_MARGIN_NS)
     }
 
     /// 판정 대상 수 (게이지 회복량 계산의 N): 탭 1, 롱노트 1(LN) 또는 2(CN·HCN: 머리 + 끝), 지뢰 제외.

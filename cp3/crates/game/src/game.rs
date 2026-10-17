@@ -14,6 +14,8 @@
 
 //! 시계·스레드·고장 주입·기록은 CP2와 같다(우리 방식만; CP2의 프레임 구동 프로필은 비교 실험용이라 가져오지 않았다).
 //! 키: 레이아웃마다 설정의 배치 또는 기본 배치(`keys::keymap`), 봇은 레인마다 F13~ 키. F5 오토, G 그래프, F1~F4 고장, Esc 끝.
+//! 세션 끝: `Chart::session_end` — 채보만으로 정한 시각(판정 끝·정해진 소리가 다 울리는 시각 중 늦은 쪽 + 0.5초)에 오디오를 멈추고 닫는다.
+//! 끝난 뒤 계속 눌러도 늦춰지지 않고, 아웃트로·마지막 키음 꼬리는 끝까지 나온다.
 //! 노출 시간: 기준 스크롤(차분의 reference_scroll, 박/분)일 때 노트가 나타나 판정선에 닿기까지 `--visible-ms`.
 
 use std::fs::{self, File};
@@ -407,6 +409,9 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
     let rules = Rules::iidx(gauge_of(&arg(args, "--gauge", &gauge_name))?);
     let resync_void = arg(args, "--resync-judge", "void") != "count";
     let rhash = rules_hash(&rules, chart.chart.long_rule, resync_void);
+    // 세션 끝: 채보만으로 정한다 (판정 끝 = 마지막 노트 + 가장 늦은 판정 창, 소리 끝 = 정해진 소리가 다 울리는 시각) — 입력과 무관
+    let late_ns = rules.key.late[3].max(rules.scratch.late[3]);
+    let (judge_end, sound_end, session_end) = chart.chart.session_end(late_ns);
     let keymap = keys::keymap(&chart.chart.lanes, &km.keys);
     for w in &set.warnings {
         println!("  설정: {w}");
@@ -454,7 +459,7 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
             asio_buffer: arg(args, "--asio-buffer", &g.asio_buffer.to_string()).parse().map_err(|_| "--asio-buffer 샘플")?,
             excl_period_ms: arg(args, "--excl-period-ms", &g.excl_period_ms.to_string()).parse().map_err(|_| "--excl-period-ms ms")?,
             lead_in_s: 2.0,
-            tail_s: 1.0,
+            end_ns: Some(session_end),
             master_gain: gain,
             late: LatePolicy { drop_after: late_drop_frames, ..LatePolicy::DEFAULT },
             autoplay_notes: false,
@@ -711,7 +716,7 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
         if stop_at > 0.0 && song_s > stop_at {
             quit = true;
         }
-        if a.done.load(Ordering::Acquire) && (flag(args, "--quit-at-end") || song_s > chart.chart.end as f64 / 1e9 + 3.0) {
+        if a.done.load(Ordering::Acquire) && (flag(args, "--quit-at-end") || song_s > session_end as f64 / 1e9 + 2.0) {
             quit = true;
         }
     }
@@ -748,7 +753,7 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
     let snap = a.clock.load();
     let hex: String = chart.chart.chart_hash.iter().map(|b| format!("{b:02x}")).collect();
     let meta = format!(
-        "{{\n \"track\": \"{}\", \"chart\": \"{}\", \"chart_hash\": \"{hex}\", \"title\": \"{}\", \"variant_choice\": {:?}, \"lanes\": {}, \"load_ms\": {load_ms:.1},\n \"device\": \"{}\", \"rate\": {rate}, \"buffer_frames\": {}, \"period_frames\": {}, \"path\": \"{}\", \"origin\": {origin}, \"d_frames\": {}, \"skips\": {}, \"skipped_frames\": {}, \"late_player\": {}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"display_offset_ns\": {display_offset_ns}, \"offset_a_ns\": {out_offset_ns}, \"rules_hash\": \"{rhash}\", \"volumes\": [{}, {}, {}], \"d_margin_ms\": {}, \"calib\": \"{}\", \"seed\": {seed_set}, \"empty_sound\": \"{empty_sound}\", \"scroll_base\": \"{scroll_base}\", \"base_bpm\": {base_bpm}, \"visible_ms\": {}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"bot_direct\": {direct}, \"bot_skipped_not_front\": {}, \"resync_void\": {}, \"gauge\": \"{:?}\", \"windows_ns\": [{}, {}, {}, {}], \"scratch_windows_ns\": [{}, {}, {}, {}],\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost}, \"input\": {input_diag}, \"channels\": {}, \"audio_mmcss\": {},\n \"score\": {{\"ex\": {}, \"pgreat\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"poor\": {}, \"empty_poor\": {}, \"mines\": {}, \"max_combo\": {}, \"fast\": {}, \"slow\": {}, \"gauge\": {}, \"cleared\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
+        "{{\n \"track\": \"{}\", \"chart\": \"{}\", \"chart_hash\": \"{hex}\", \"title\": \"{}\", \"variant_choice\": {:?}, \"lanes\": {}, \"load_ms\": {load_ms:.1},\n \"device\": \"{}\", \"rate\": {rate}, \"buffer_frames\": {}, \"period_frames\": {}, \"path\": \"{}\", \"origin\": {origin}, \"d_frames\": {}, \"skips\": {}, \"skipped_frames\": {}, \"late_player\": {}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"display_offset_ns\": {display_offset_ns}, \"offset_a_ns\": {out_offset_ns}, \"rules_hash\": \"{rhash}\", \"volumes\": [{}, {}, {}], \"d_margin_ms\": {}, \"calib\": \"{}\", \"seed\": {seed_set}, \"empty_sound\": \"{empty_sound}\", \"scroll_base\": \"{scroll_base}\", \"base_bpm\": {base_bpm}, \"visible_ms\": {}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"bot_direct\": {direct}, \"bot_skipped_not_front\": {}, \"resync_void\": {}, \"end_ns\": {}, \"judge_end_ns\": {judge_end}, \"sound_end_ns\": {sound_end}, \"session_end_ns\": {session_end}, \"gauge\": \"{:?}\", \"windows_ns\": [{}, {}, {}, {}], \"scratch_windows_ns\": [{}, {}, {}, {}],\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost}, \"input\": {input_diag}, \"channels\": {}, \"audio_mmcss\": {},\n \"score\": {{\"ex\": {}, \"pgreat\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"poor\": {}, \"empty_poor\": {}, \"mines\": {}, \"max_combo\": {}, \"fast\": {}, \"slow\": {}, \"gauge\": {}, \"cleared\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
         if calib.is_some() { "calib".to_string() } else { path.replace('\\', "/") },
         chart.chart.chart_id,
         loaded.title.replace('"', "'"),
@@ -774,6 +779,7 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
         visible_s * 1e3,
         bot::SKIPPED_NOT_FRONT.load(Ordering::Relaxed),
         resync_void,
+        chart.chart.end,
         rules.gauge_kind,
         rules.key.late[0],
         rules.key.late[1],

@@ -854,4 +854,21 @@ mod tests {
         m.fill(&mut out, 2, ns_to_frame(t2, 44_100), 1024);
         assert_eq!(m.pauses, 1);
     }
+
+    #[test]
+    fn session_end_waits_for_scheduled_sounds_only() {
+        let c = tiny(16, false);
+        let ch = &c.chart;
+        let late = 283_333_334;
+        let (judge, sound, session) = ch.session_end(late);
+        assert_eq!(judge, 1_000_000_000 + late); // 마지막 노트(롱노트 끝 1초) + 늦은 창
+        // 반주(긴 소리 3초)가 0초에 시작 → 소리 끝 ≥ 3초 (곡 끝 `end`는 마지막 이벤트라 소리 길이를 모른다)
+        assert_eq!(sound, ch.bank.duration_ns(2).max(1_001_000_000 + late + ch.bank.duration_ns(1)));
+        assert!(sound >= 3_000_000_000 && session == ch.end.max(judge).max(sound) + crate::runtime::SESSION_MARGIN_NS);
+        // 비정상적으로 긴 꼬리는 곡 끝 + 상한에서 자른다
+        let mut long = tiny(16, false);
+        long.chart.bank.sounds[2].frames = 44_100 * 600;
+        long.chart.end = 2_000_000_000;
+        assert_eq!(long.chart.session_end(late).1, 2_000_000_000 + crate::runtime::SOUND_TAIL_CAP_NS);
+    }
 }

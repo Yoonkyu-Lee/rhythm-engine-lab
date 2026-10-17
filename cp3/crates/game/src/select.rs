@@ -72,7 +72,7 @@ fn start_audio(store: &Store, t0: i64, render: &str, g: &Global) -> Result<Playi
             asio_buffer: 64,
             excl_period_ms: 5.0,
             lead_in_s: 0.03,
-            tail_s: 0.0,
+            end_ns: None,
             master_gain: 0.5 * g.volume_master as f32, // 미리보기는 정답 렌더 최댓값을 아직 모른다 (전체 준비 전) — 고정 −6 dB
             late: LatePolicy::DEFAULT,
             autoplay_notes: false,

@@ -164,7 +164,8 @@ pub struct AudioCfg {
     /// WASAPI 배타 주기 (ms). 이 장치는 3 ms 최소 주기에서 간헐적으로 33 ms씩 끊긴다(CP1-4) → 기본 5 ms.
     pub excl_period_ms: f64,
     pub lead_in_s: f64,
-    pub tail_s: f64,
+    /// 오디오를 멈출 곡 시각 (ns, 세션 끝 — `Chart::session_end`). None = 끝없음(미리보기).
+    pub end_ns: Option<i64>,
     pub master_gain: f32,
     pub late: LatePolicy,
     /// 노트 소리도 제때 자동으로 낸다 (입력 없이 정답과 비교할 때).
@@ -571,7 +572,10 @@ fn spawn_wasapi(
                 let rate = s.rate as i64;
                 let ch = s.channels as usize;
                 let origin = (cfg.lead_in_s * rate as f64).round() as i64;
-                let end = if cfg.preview.is_some() { i64::MAX / 4 } else { origin + ns_to_frame(chart.chart.end, s.rate) + (cfg.tail_s * rate as f64).round() as i64 };
+                let end = match (cfg.preview, cfg.end_ns) {
+                    (None, Some(e)) => origin + ns_to_frame(e, s.rate),
+                    _ => i64::MAX / 4,
+                };
                 let _ = info_tx.send(Ok(AudioInfo {
                     device: ep.name.clone(),
                     path: cfg.path,
@@ -936,7 +940,10 @@ fn spawn_asio(
                     }
                 }
                 let origin = (cfg.lead_in_s * rate as f64).round() as i64;
-                let end = if cfg.preview.is_some() { i64::MAX / 4 } else { origin + ns_to_frame(chart.chart.end, rate) + (cfg.tail_s * rate as f64).round() as i64 }; // 리뷰 3-3 #15
+                let end = match (cfg.preview, cfg.end_ns) {
+                    (None, Some(e)) => origin + ns_to_frame(e, rate),
+                    _ => i64::MAX / 4,
+                }; // 리뷰 3-3 #15
                 let (obs, obs_rx) = obs_ring(8192);
                 let clock_thread = spawn_clock_thread(rate as f64, ClockPolicy::default(), obs_rx, clock2.clone());
                 let cap_stop = Arc::new(AtomicBool::new(false));
