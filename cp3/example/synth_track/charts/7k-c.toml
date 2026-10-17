@@ -38,6 +38,7 @@ sound = "kick"
 [[event]]
 at = "2000"
 sound = "kick"
+gain = "0.8"                         # 이벤트 이득: 8b-a의 같은 시각 kick(이득 1)과 레이어에서 다른 이벤트
 
 [[event]]
 at = "3000"
@@ -77,3 +78,11 @@ lane = "K4"
 kind = "long"
 end = "4666.5"
 sounds = ["piano_c_alt"]
+
+[[event]]
+at = "4050"
+sound = "piano_c"                     # 같은 PCM, 다른 ID → piano_c_alt를 끊지 않고 겹침
+
+[[event]]
+at = "4100"
+sound = "piano_c_alt"                 # 4000의 piano_c_alt(0.64초)가 울리는 중 + retrigger = "cut" → 앞 것을 끊음

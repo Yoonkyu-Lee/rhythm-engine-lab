@@ -21,9 +21,22 @@ meter = [
 ]
 stops = [ { at = "13", beats = "1" } ]   # 13박째에서 1박(180 BPM이라 1/3초) 멈춤
 
+[scroll]                             # BMS #SCROLL: 6~8박은 화면 속도 절반. STOP 구간은 컴파일러가 넣음(명세 3-2)
+points = [
+  { at = "0", speed = "120" },
+  { at = "6", speed = "60" },
+  { at = "8", speed = "120" },
+  { at = "9", speed = "180" },
+]
+
 [[variant]]
 id = "r1"
 choices = ["a", "b"]
+
+[[variant]]
+id = "r2"
+choices = ["a", "b"]
+weights = ["3", "1"]
 
 # 자동재생
 [[event]]
@@ -70,6 +83,7 @@ sounds = ["piano_c"]
 at = "2:1"                           # 9박
 lane = "K7"
 kind = "mine"
+damage = "4"
 sounds = []
 
 [[note]]
@@ -97,6 +111,11 @@ at = "14"                            # 13박의 정지 뒤
 lane = "K5"
 kind = "tap"
 sounds = ["kick"]
+
+[[event]]
+at = "12"
+sound = "hat_open"
+when = ["r1=a", "r2=b"]               # 두 조건이 모두 참일 때만 (AND)
 
 [[lane_sound]]                       # BMS 투명 노트: 4박부터 K6을 빈 손으로 치면 hat_open
 at = "4"

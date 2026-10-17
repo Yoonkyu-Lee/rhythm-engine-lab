@@ -1,0 +1,14 @@
+numpy 2.5.3
+soundfile 0.14.0 / 1.2.2
+ffmpeg version 9.0.2-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers
+
+bass_long.flac  284017 B  file 597a90f4e5579305c52ec27ed1a758ab  pcm 4a55c7b33a1a66de691e754b97557fc6
+hat_closed.flac  12736 B  file ba365956662497b10f7ad88c6824947c  pcm 97aa7cb9ab57f6dff7799f78e92cb1bf
+hat_open.flac  38668 B  file 12ddf2a65d0837d109641f15f0d6d940  pcm 9d2f692e8b27ad5fe8fdaf8ec4e28c68
+kick.ogg  5162 B  file 89543150af94da2d0a1c1f97a4fd1f4c  pcm 29b370ef8912a4f80d84f196a30a1ed3
+piano_c.wav  14426 B  file 1139589e28627d53498a3c3f420ed7b8  pcm 2daf7da98765698ebc9e0d85cb7553e6
+piano_c_alt.wav  14426 B  file 1139589e28627d53498a3c3f420ed7b8  pcm 2daf7da98765698ebc9e0d85cb7553e6
+piano_e.wav  14426 B  file 2e95b2d31bd00da634a83fa88396df7a  pcm 8b7fe7664783f01aa14a4c7cae07b09a
+side_swell.ogg  8992 B  file 00dbbb262b725520fe0ec0f75d56a481  pcm 1f6577d0cd6660ae5d6f462494d6bbea
+snare.ogg  6607 B  file 68fcd4fb04bc8855f983c1ecff0c3d6d  pcm 1eeb7deb8af0e89ae942da82043c2553
+tick_odd.flac  9227 B  file 59bd96071bb5f328d53c7a8ae7c671b9  pcm 6c098f0365625537cc712c895e37457f

@@ -46,6 +46,10 @@ at = "1152"
 sound = "kick"
 
 [[event]]
+at = "1200"
+sound = "hat_closed"                # 1152의 hat_open(0.4초)이 아직 울리는 중 → choke "hat"으로 끊음
+
+[[event]]
 at = "1536"
 sound = "hat_closed"
 
@@ -84,7 +88,7 @@ at = "1536"
 lane = "R1"
 kind = "long"
 end = "1920"
-sounds = ["hat_closed"]              # hat_open을 choke로 끊음
+sounds = ["hat_closed"]
 
 [[note]]
 at = "1920"

@@ -14,7 +14,8 @@ import numpy as np
 import soundfile as sf
 
 OUT = pathlib.Path(__file__).parent / "synth_track" / "audio"
-rng = np.random.default_rng(20261017)
+SEED = 20261017
+rng = None  # main()에서 실행마다 같은 씨앗으로 초기화
 
 
 def env(n, attack, rate):
@@ -63,6 +64,8 @@ def encode(name, pcm, rate, codec):
 
 
 def main():
+    global rng
+    rng = np.random.default_rng(SEED)
     OUT.mkdir(parents=True, exist_ok=True)
     encode("kick.ogg", stereo(kick(44100)), 44100, "vorbis")
     encode("snare.ogg", stereo(noise(0.2, 48000, 0.05) * 0.6 + tone([190], 0.2, 48000) * 0.4), 48000, "vorbis")
@@ -78,8 +81,19 @@ def main():
     encode("piano_e.wav", stereo(tone([329.63, 659.25], 0.6, 22050)), 22050, "adpcm")
     # 같은 내용 다른 ID 확인용: 바이트까지 같은 사본
     shutil.copyfile(OUT / "piano_c.wav", OUT / "piano_c_alt.wav")
+    # 재현 기록: 도구 버전 + 파일 해시 + PCM 해시. 같은 버전이면 같은 바이트가 나와야 한다(다른 버전에서는 바이트가
+    # 달라질 수 있음 — 컴파일러 결정성은 저장된 오디오를 입력으로 하므로 이것과 별개).
+    import hashlib
+    ff = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True).stdout.splitlines()[0]
+    lines = [f"numpy {np.__version__}", f"soundfile {sf.__version__} / {sf.__libsndfile_version__}", ff, ""]
     for p in sorted(OUT.iterdir()):
-        print(f"{p.name:16} {p.stat().st_size:7} B")
+        if p.suffix not in (".ogg", ".flac", ".wav"):
+            continue
+        a, _ = sf.read(p, dtype="float32", always_2d=True)
+        lines.append(f"{p.name}  {p.stat().st_size} B  file {hashlib.blake2b(p.read_bytes(), digest_size=16).hexdigest()}"
+                     f"  pcm {hashlib.blake2b(a.tobytes(), digest_size=16).hexdigest()}")
+    (OUT / "MANIFEST.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("\n".join(lines))
 
 
 if __name__ == "__main__":
