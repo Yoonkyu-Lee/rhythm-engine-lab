@@ -97,6 +97,12 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
                 let nm = |l: u32| names[c.local_to_track[l as usize] as usize].clone();
                 println!("chart {} shift {} end {} hash {}", c.id, s.shift, s.end, hex(&c.hash[..8]));
+                for (i, v) in s.variants.iter().enumerate() {
+                    println!("variant {i} {} {}", v.0, v.1.len());
+                }
+                for (i, cd) in s.conds.iter().enumerate() {
+                    println!("cond {i}{}", cd.iter().map(|(v, ch)| format!(" {v}:{ch}")).collect::<String>());
+                }
                 for a in &s.auto {
                     println!("auto {} {} {} {}", a.0, nm(a.1), a.2, a.3);
                 }

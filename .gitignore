@@ -37,5 +37,10 @@ cp2/tools/check_expected.py
 
 # CP3 빌드·실행 결과
 cp3/target/
+cp3/target-dev/
 cp3/runs/
 cp3/content/
+cp3/converters/djmax2track.py
+cp3/converters/check_djmax.py
+cp3/converters/iidx2track.py
+cp3/converters/check_iidx.py
