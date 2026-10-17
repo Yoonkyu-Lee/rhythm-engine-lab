@@ -1,6 +1,7 @@
 //! 렌더러 인터페이스와 D3D11 백엔드.
 //!
-//! 게임은 `Renderer`만 쓴다: 프레임 대기 → 그리기 목록 → present → 프레임 시각 보고. CP3-1에서 같은 인터페이스 뒤에 wgpu를 붙인다.
+//! 게임은 `Renderer`만 쓴다: 프레임 대기 → 그리기 목록 → present → 프레임 시각 보고. 그리기 목록은 꽉 찬 사각형과 글자 두 종류뿐(CP3).
+//! CP4 렌더러는 `cp4/실험_목록.md` A의 실험으로 정한다(CP2 때 적은 "wgpu를 붙인다"는 실행되지 않은 계획이었다).
 //! D3D11 백엔드: DXGI flip 모델(FLIP_DISCARD), 대기 가능한 스왑체인 + 최대 프레임 지연 1, Direct2D/DirectWrite로 사각형·글자.
 //! 프레임 시각: present 전후 QPC와 DXGI 프레임 통계(마지막 vblank의 SyncQPCTime, PresentCount)를 보고한다.
 //! SyncQPCTime은 refresh에 연결된 QPC이지 픽셀이 빛난 시각이 아니다 (설계안 10장) — 등급 "dxgi_stats"로 표시한다.
