@@ -34,3 +34,8 @@ cp2/tools/check_expected.py
 
 # 로컬 도구 등록 (rea MCP)
 .mcp.json
+
+# CP3 빌드·실행 결과
+cp3/target/
+cp3/runs/
+cp3/content/

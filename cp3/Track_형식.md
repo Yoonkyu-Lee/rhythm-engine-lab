@@ -1,9 +1,10 @@
-# Track 형식 명세 v1.2
+# Track 형식 명세 v1.3
 
 > 작성일 2026-10-17. CP3 3-0 산출물. 엔진의 곡 객체 **Track**의 작성 형식(텍스트), 컴파일 규칙, 실행 형식(바이너리), 묶음 파일 배치를 구현할 수 있는 수준으로 정한다.
 > 근거와 결정 과정: `README.md`(2·2-1·3·3-1·4장), `BMS_컨버터.md`(1-2, 2-4), `../design/곡 데이터 형식.md`(구상). 이 문서와 그 문서들이 어긋나면 **이 문서가 맞다**(구상 문서의 "음악 레이어를 작성"·"묶이지 않은 이벤트 = 자동재생"은 화이트리스트 결정으로 바뀜).
 > v1.1 (2026-10-17): 합성 예시 Track(`example/synth_track/`)을 쓰며 막힌 곳 G1~G11을 고침 — 목록은 `example/synth_track/report.md`.
 > v1.2 (2026-10-17): Codex 3-0 리뷰(`reviews/2026-10-17_codex_3-0.md`) 반영 — 차분 안 소리 표로 논리 ID 보존(해시), 노트 소리 offset 반올림 규칙과 정규 발음 순서·프레임 변환(3-4), STOP + 명시 스크롤, `damage`, 바이트 단위 레코드·표 디렉터리·stride 확장, 정규 해시 바이트열, 코덱 구역·트림, 변형 조건 AND.
+> v1.3 (2026-10-17): 3-1 컴파일러 구현으로 확정 — 차분 안 소리 레코드 패딩(52 → 56 B로 명세의 합산 오류 수정), CHART 밖 구역 바이트 배치(5-5), Vorbis EOS 트림·MS-ADPCM 반올림 규칙, 라이브러리 색인 형식.
 > 이름 규칙: 엔진 임시 이름(Unison)은 문서에서만 쓴다. 코드·필드·매직 넘버·확장자에는 쓰지 않는다. "Track"은 곡 객체의 이름이라 코드에 써도 된다.
 
 ---
@@ -276,7 +277,7 @@ time_scale = "21/20"                # 템포 배율 (> 0). 이 차분 시각 = b
 **표 (디렉터리 순서 고정)**
 | # | 표 | 레코드 | stride |
 |---|---|---|---|
-| 0 | 차분 안 소리 | `{ sound_hash [32], start u32, gain f32, retrigger u8 (0 overlap, 1 cut), _pad [3], choke u32 (0 없음, 그 밖 = 차분 안 choke 번호 + 1), _pad u32 }` | 56 |
+| 0 | 차분 안 소리 | `{ sound_hash [32], start u32, gain f32, retrigger u8 (0 overlap, 1 cut), _pad [3], choke u32 (0 없음, 그 밖 = 차분 안 choke 번호 + 1), _pad [8] }` | 56 |
 | 1 | 레인 | `{ id_off u32, id_len u32 (문자열 표), role u8 (0 key, 1 scratch, 2 side, 3 trigger, 4 pedal, 255 기타), _pad [3], note_start u32, note_count u32, lsnd_start u32, lsnd_count u32, _pad u32 }` | 32 |
 | 2 | 묶음 | `{ id_off u32, id_len u32, lanes u64 (레인 비트, 64레인까지) }` | 16 |
 | 3 | 자동재생 | `{ t i64, sound u32, gain f32, cond u32, _pad u32 }` — (t, 작성 순서) 정렬 | 24 |
@@ -343,7 +344,32 @@ offset 128  구역 색인 × n: { kind u32, flags u32, offset u64, length u64, h
 ```
 
 ### 5-4. 시험 벡터
-- 3-1 컴파일러의 첫 산출물로 예시 Track(`example/synth_track/`)의 묶음 바이트·각 구역 해시·차분 해시·소리 해시·되살린 PCM 해시를 `example/golden/`에 둔다. 이후 컴파일러를 고치면 이 값과 비교한다.
+- 예시 Track(`example/synth_track/`)의 묶음 해시·구역 해시·차분 해시·소리 해시를 `example/golden/golden.txt`(`trackc info` 출력)에 둔다. `cargo test`(`crates/track/tests/golden.rs`)가 결정성(두 번 컴파일 = 같은 바이트)·정답 해시·차분 왕복을 확인한다. 형식이나 컴파일러를 의도적으로 바꾸면 golden.txt를 함께 갱신한다.
+
+### 5-5. 구역 바이트 배치 (v1.3, 3-1 컴파일러 `cp3/crates/track/src/pack.rs`와 같음)
+
+표기: `str` = u32 길이 + UTF-8, `none` 시각 = i64::MIN. 모든 수 little-endian.
+
+| 구역 | 바이트 |
+|---|---|
+| `INFO` | str title, str title_sort, str artist, str genre, u32 n + str × n (tags), i64 highlight (Track 시각 ns), u32 n + (str 언어, str × 4: title·title_sort·artist·genre) × n, str source_format, str converter, u32 n + (str path, str hash) × n |
+| `LAYOUTS` | u32 n, 레이아웃마다 { str id, u16 레인 수, (str id, u8 role) × 레인, u16 묶음 수, (str id, u64 레인 비트) × 묶음 } |
+| `CHARTS` | u32 n, 차분마다 { str id, str name, str level, [32] 차분 해시, u32 CHART 구역 순번, u32 base (u32::MAX = 없음), i64 time_scale 분자, i64 분모, i64 shift ns, u32 m, u32 × m (차분 안 소리 → Track 소리 번호) } |
+| `SOUND_IDS` | u32 n, 논리 소리마다 { u32 data(SOUNDS 번호), u32 start, f32 gain, u8 retrigger, [3] 0, u32 choke, str id }, u32 k + str × k (choke 이름) |
+| `SOUNDS` | str 기준 디코더 이름·버전, u32 n, 소리 데이터마다 72 B { [32] 소리 해시, u8 codec, u8 channels, u8 int16, u8 0, u32 rate, u64 frames, u32 skip_front, u32 codec_table 번호, u64 data 오프셋(SOUND_DATA 기준), u64 data 길이 } |
+| `CODEC_TABLES` | u32 n, (u32 길이 + 바이트) × n. 같은 바이트의 표는 한 번(곡 안 Vorbis 설정 머리 공유). Vorbis 표 = (u32 길이 + identification 머리) ‖ (u32 길이 + setup 머리) |
+| `SOUND_DATA` | 소리 데이터를 SOUNDS 순서로 빈틈없이. Vorbis 데이터 = u32 패킷 수 n ‖ u32 × n (패킷 길이) ‖ 패킷들 |
+| `GRAPHICS` | u32 n, (str hash, str kind, str role, i64 start) × n |
+| `STATS` | u32 n, 차분마다 { str id, i64 칸 길이 ns (250 ms), u32 노트 수(지뢰 제외, 변형은 첫 선택지), u32 최대 NPS(이동 1초 창), i64 하이라이트(차분 자기 시각 ns: Track 하이라이트 − shift, 없으면 노트가 가장 많은 10초 창의 시작, 같으면 앞), u32 칸 수, u16 × 칸 } |
+| `SOURCE` | u32 n, (str 상대 경로, u64 길이, 바이트) × n — `track.toml`, `charts/*.toml`(이름순), `report.md`(있으면) |
+
+**코덱 세부 (기준 디코더)**
+- **Vorbis 트림**: 출력 샘플 0의 granule = (첫 오디오 granule 페이지의 granule − 그 페이지까지 디코딩한 샘플 수). 음수면 그만큼 `skip_front`. **단, 첫 오디오 페이지가 곧 마지막 페이지(EOS)면 그 granule은 끝 자르기이므로 앞은 0** (짧은 키음에서 흔함 — 이 규칙이 없으면 앞 815샘플을 잘못 버린 사례를 3-1에서 확인). `frames` = 마지막 granule − 샘플 0의 granule − `skip_front`(디코딩 길이를 넘지 않게). 연결(chained)·다중 스트림 Ogg는 거부.
+- **FLAC**: STREAMINFO의 총 샘플 수가 `frames`(0이면 디코딩 길이). 샘플은 원래 정수 값.
+- **MS-ADPCM**: 예측값 = (s1·c1 + s2·c2) / 256 **0 쪽 버림**(Microsoft 명세, Windows ACM·ffmpeg와 같음), delta = max(16, ADAPT[n]·delta / 256), 블록 머리는 sample2 → sample1 순으로 출력, 니블은 높은 쪽 먼저(스테레오는 높은 = 왼쪽). `frames` = `fact` 청크 값(없으면 디코딩 길이) — 마지막 블록을 블록 끝까지 채운 디코더(ffmpeg·libsndfile)보다 짧을 수 있다.
+- 3-1 대조(예시 Track 소리 10개): FLAC·MS-ADPCM은 libsndfile·ffmpeg와 비트까지 같음, Vorbis(lewton)는 libvorbis와 최대 차 3×10⁻⁷.
+
+**라이브러리 색인 `index.bin`**: `"TIDX"` ‖ major u16 ‖ minor u16 ‖ u32 n ‖ Track마다 { [16] Track ID, u32 revision, [32] 묶음 해시, u64 묶음 크기, str 상대 경로(`tracks/…`), u32 길이 + INFO 구역 바이트, u32 길이 + STATS 구역 바이트 } — 경로 순.
 
 ---
 

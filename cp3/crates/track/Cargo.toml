@@ -1,0 +1,15 @@
+[package]
+name = "track"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+blake3 = "1"
+lewton = "0.10"
+claxon = "0.4"
+num-rational = "0.4"
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
