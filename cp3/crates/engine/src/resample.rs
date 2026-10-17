@@ -69,6 +69,46 @@ impl Filter {
         Ok(Filter { l, m, taps })
     }
 
+    /// 출력 [o0, o1)을 만드는 데 필요한 입력 프레임 [a, b) (소리 경계 밖을 포함할 수 있다 — 부르는 쪽이 [0, frames)로 자른다).
+    pub fn src_span(&self, o0: usize, o1: usize) -> (i64, i64) {
+        let i0 = (o0 * self.m / self.l) as i64;
+        let i1 = ((o1.max(o0 + 1) - 1) * self.m / self.l) as i64;
+        (i0 - (HALF as i64 - 1), i1 - (HALF as i64 - 1) + 2 * HALF as i64)
+    }
+
+    /// `run_stereo`와 같은 계산을 출력 [o0, o1)에만 (부분 디코딩, 3-5): `win` = 입력 프레임 [win_off, win_off + len)의 스테레오 끼움,
+    /// `frames` = 소리 전체 입력 길이(밖은 0 — 전체 계산과 같다). 같은 순서로 더하므로 전체 결과의 같은 구간과 비트까지 같다.
+    pub fn run_stereo_range(&self, win: &[f32], win_off: i64, frames: usize, o0: usize, o1: usize, stop: &dyn Fn() -> bool) -> Result<Vec<f32>, String> {
+        let wlen = (win.len() / 2) as i64;
+        let n = 2 * HALF;
+        let mut out = vec![0f32; o1.saturating_sub(o0) * 2];
+        for o in o0..o1 {
+            if (o - o0) % 8192 == 8191 && stop() {
+                return Err(track::audio::CANCELLED.into());
+            }
+            let pos = o * self.m;
+            let i = pos / self.l;
+            let p = pos % self.l;
+            let row = &self.taps[p * n..(p + 1) * n];
+            let base = i as isize - (HALF as isize - 1);
+            let (mut a0, mut a1) = (0f32, 0f32);
+            for (k, &t) in row.iter().enumerate() {
+                let j = base + k as isize;
+                if j >= 0 && (j as usize) < frames {
+                    let w = j as i64 - win_off;
+                    if w < 0 || w >= wlen {
+                        return Err(format!("리샘플링 입력 창 부족: {j} ∉ [{win_off}, {})", win_off + wlen));
+                    }
+                    a0 += win[w as usize * 2] * t;
+                    a1 += win[w as usize * 2 + 1] * t;
+                }
+            }
+            out[(o - o0) * 2] = a0;
+            out[(o - o0) * 2 + 1] = a1;
+        }
+        Ok(out)
+    }
+
     /// 출력 프레임 수 = 올림(frames × L / M).
     pub fn out_len(&self, frames: usize) -> usize {
         (frames * self.l + self.m - 1) / self.m
@@ -76,11 +116,19 @@ impl Filter {
 
     /// 스테레오 끼움 `src`(frames 프레임) → 스테레오 끼움 출력.
     pub fn run_stereo(&self, src: &[f32]) -> Vec<f32> {
+        self.run_stereo_with(src, &|| false).unwrap_or_default()
+    }
+
+    /// 취소할 수 있는 리샘플링: 출력 8192프레임마다 `stop()`을 확인해 참이면 None.
+    pub fn run_stereo_with(&self, src: &[f32], stop: &dyn Fn() -> bool) -> Option<Vec<f32>> {
         let frames = src.len() / 2;
         let out_frames = self.out_len(frames);
         let mut out = vec![0f32; out_frames * 2];
         let n = 2 * HALF;
         for o in 0..out_frames {
+            if o % 8192 == 8191 && stop() {
+                return None;
+            }
             let pos = o * self.m;
             let i = pos / self.l;
             let p = pos % self.l;
@@ -97,7 +145,7 @@ impl Filter {
             out[o * 2] = a0;
             out[o * 2 + 1] = a1;
         }
-        out
+        Some(out)
     }
 }
 
@@ -146,5 +194,20 @@ mod tests {
         // 예시 Track의 30,697 Hz (CP2 상한 8192에서는 거부되던 것)
         let f = Filter::new(30_697, 48_000).unwrap();
         assert_eq!(f.out_len(30_697), 48_000);
+    }
+
+    #[test]
+    fn range_equals_full_slice() {
+        let f = Filter::new(44_100, 48_000).unwrap();
+        let frames = 30_000usize;
+        let src: Vec<f32> = (0..frames * 2).map(|k| ((k as f32) * 0.0137).sin() * 0.5 + ((k % 13) as f32) * 0.01).collect();
+        let full = f.run_stereo(&src);
+        for (o0, o1) in [(0usize, 100usize), (5_000, 9_000), (32_000, f.out_len(frames)), (17, 18)] {
+            let (a, b) = f.src_span(o0, o1);
+            let (a, b) = (a.max(0), b.min(frames as i64));
+            let win = &src[a as usize * 2..b as usize * 2];
+            let part = f.run_stereo_range(win, a, frames, o0, o1, &|| false).unwrap();
+            assert_eq!(part, full[o0 * 2..o1 * 2].to_vec(), "{o0}..{o1}");
+        }
     }
 }

@@ -61,26 +61,32 @@ pub fn pack_file(bytes: &[u8]) -> Result<Packed, String> {
 
 /// 기준 디코더: 묶음 형태 → PCM (코덱 트림 적용, `start` 적용 전).
 pub fn decode(p: &Packed) -> Result<Pcm, String> {
+    decode_with(p, &|| false)
+}
+
+/// 취소할 수 있는 디코딩 (README 4-3 4, 3-5): 긴 소리도 코덱 블록 사이에서 `stop()`을 확인해 참이면 `Err(CANCELLED)`.
+/// Vorbis 64패킷·FLAC 16프레임·MS-ADPCM 64블록마다 확인한다(긴 반주 stem 하나가 수백 ms 걸려 취소 회수가 늦던 것).
+pub fn decode_with(p: &Packed, stop: &dyn Fn() -> bool) -> Result<Pcm, String> {
     let ch = p.channels as usize;
     let want = p.frames as usize * ch;
     let skip = p.skip_front as usize * ch;
     match p.codec {
         Codec::Vorbis => {
-            let v = decode_vorbis(&p.codec_table, &p.data)?;
+            let v = decode_vorbis(&p.codec_table, &p.data, stop)?;
             if v.len() < skip + want {
                 return Err(format!("Vorbis 디코딩 길이 부족: {} < {}", v.len(), skip + want));
             }
             Ok(Pcm::Float(v[skip..skip + want].to_vec()))
         }
         Codec::Flac => {
-            let v = decode_flac(&p.codec_table, &p.data)?;
+            let v = decode_flac(&p.codec_table, &p.data, stop)?;
             if v.len() < want {
                 return Err(format!("FLAC 디코딩 길이 부족: {} < {}", v.len(), want));
             }
             Ok(Pcm::Int(v[..want].to_vec()))
         }
         Codec::MsAdpcm => {
-            let v = decode_adpcm(&p.codec_table, &p.data)?;
+            let v = decode_adpcm(&p.codec_table, &p.data, stop)?;
             if v.len() < want {
                 return Err(format!("ADPCM 디코딩 길이 부족: {} < {}", v.len(), want));
             }
@@ -267,22 +273,113 @@ fn pack_ogg_vorbis(bytes: &[u8]) -> Result<Packed, String> {
     })
 }
 
-fn decode_vorbis(table: &[u8], data: &[u8]) -> Result<Vec<f32>, String> {
-    let rd = |b: &[u8], o: usize| -> Result<u32, String> {
-        b.get(o..o + 4).map(|x| u32::from_le_bytes(x.try_into().unwrap())).ok_or_else(|| "Vorbis 표가 잘림".to_string())
-    };
-    let l0 = rd(table, 0)? as usize;
+/// 취소된 디코딩의 오류 문구 (부르는 쪽이 실패와 가른다)
+pub const CANCELLED: &str = "취소됨";
+
+fn rd32(b: &[u8], o: usize) -> Result<u32, String> {
+    b.get(o..o + 4).map(|x| u32::from_le_bytes(x.try_into().unwrap())).ok_or_else(|| "Vorbis 표가 잘림".to_string())
+}
+
+fn vorbis_headers(table: &[u8]) -> Result<(lewton::header::IdentHeader, lewton::header::SetupHeader), String> {
+    let l0 = rd32(table, 0)? as usize;
     let ident_b = table.get(4..4 + l0).ok_or("Vorbis 표가 잘림")?;
-    let l2 = rd(table, 4 + l0)? as usize;
+    let l2 = rd32(table, 4 + l0)? as usize;
     let setup_b = table.get(8 + l0..8 + l0 + l2).ok_or("Vorbis 표가 잘림")?;
     let ident = lewton::header::read_header_ident(ident_b).map_err(|e| format!("Vorbis ident: {e:?}"))?;
     let setup = lewton::header::read_header_setup(setup_b, ident.audio_channels, (ident.blocksize_0, ident.blocksize_1))
         .map_err(|e| format!("Vorbis setup: {e:?}"))?;
+    Ok((ident, setup))
+}
+
+/// 보존한 패킷 목록: (패킷 수, 패킷마다 (바이트 위치, 길이))
+fn vorbis_packets(data: &[u8]) -> Result<Vec<(usize, usize)>, String> {
+    let n = rd32(data, 0)? as usize;
+    let mut off = 4 + 4 * n;
+    let mut v = Vec::with_capacity(n);
+    for i in 0..n {
+        let len = rd32(data, 4 + 4 * i)? as usize;
+        if off + len > data.len() {
+            return Err("Vorbis 데이터가 잘림".into());
+        }
+        v.push((off, len));
+        off += len;
+    }
+    Ok(v)
+}
+
+/// Vorbis 구간 디코딩 (README 4-3 3 부분 디코딩, 3-5): 프레임 [a, b)(코덱 트림 뒤, `decode`와 같은 좌표)를 덮는 패킷만 디코딩한다.
+/// 패킷 k의 출력 = 패킷 k−1의 오른쪽 창 + 패킷 k의 왼쪽 창(겹쳐 더하기)이므로, 출력 위치를 디코딩 없이 센 뒤(`get_decoded_sample_count`)
+/// a를 덮는 패킷의 **한 패킷 앞부터** 디코딩하면(그 패킷 출력은 버림) 전체 디코딩의 같은 구간과 비트까지 같다(시험·`partcheck`로 확인).
+/// 돌려주는 값 = (첫 프레임, 끼운 PCM). 첫 프레임 ≤ a, 끝 ≥ min(b, frames).
+pub fn decode_vorbis_range(p: &Packed, a: u64, b: u64, stop: &dyn Fn() -> bool) -> Result<(u64, Vec<f32>), String> {
+    if p.codec != Codec::Vorbis {
+        return Err("Vorbis가 아님".into());
+    }
+    let ch = p.channels as usize;
+    let skip = p.skip_front as u64;
+    let b = b.min(p.frames);
+    if a >= b {
+        return Err(format!("빈 구간 {a}..{b}"));
+    }
+    let (ident, setup) = vorbis_headers(&p.codec_table)?;
+    let pk = vorbis_packets(&p.data)?;
+    // 패킷 i의 출력 시작(트림 전 원시 프레임): 패킷 0은 0개, i ≥ 1은 앞 패킷들의 개수 합
+    let mut start = vec![0u64; pk.len() + 1];
+    for i in 1..pk.len() {
+        if i % 1024 == 0 && stop() {
+            return Err(CANCELLED.into());
+        }
+        let (o, l) = pk[i];
+        let c = lewton::audio::get_decoded_sample_count(&ident, &setup, &p.data[o..o + l]).map_err(|e| format!("Vorbis 패킷 {i}: {e:?}"))? as u64;
+        start[i + 1] = start[i] + c;
+    }
+    start[1] = 0;
+    let (ra, rb) = (a + skip, b + skip);
+    // a를 덮는 패킷 k0 (≥ 1): start[k0] ≤ ra < start[k0 + 1]
+    let k0 = (1..pk.len()).rev().find(|&i| start[i] <= ra).ok_or("Vorbis 패킷 없음")?;
+    let mut pwr = lewton::audio::PreviousWindowRight::new();
+    let mut out = Vec::new();
+    let mut first: Option<u64> = None;
+    for (cnt, i) in (k0 - 1..pk.len()).enumerate() {
+        if cnt % 64 == 63 && stop() {
+            return Err(CANCELLED.into());
+        }
+        if i >= k0 && start[i] >= rb {
+            break;
+        }
+        let (o, l) = pk[i];
+        let smp: lewton::samples::InterleavedSamples<f32> =
+            lewton::audio::read_audio_packet_generic(&ident, &setup, &p.data[o..o + l], &mut pwr).map_err(|e| format!("Vorbis 패킷 {i}: {e:?}"))?;
+        if i >= k0 {
+            if first.is_none() {
+                first = Some(start[i]);
+            }
+            out.extend_from_slice(&smp.samples);
+        }
+    }
+    let raw0 = first.ok_or("Vorbis 구간 비어 있음")?;
+    // 트림 좌표로: 앞 자르기 안쪽이면 그만큼 버린다
+    let (f0, drop) = if raw0 < skip { (0, (skip - raw0) as usize) } else { (raw0 - skip, 0) };
+    let mut v: Vec<f32> = out.get(drop * ch..).unwrap_or(&[]).to_vec();
+    let max = (p.frames - f0) as usize * ch;
+    v.truncate(max);
+    if f0 + ((v.len() / ch) as u64) < b || f0 > a {
+        return Err(format!("Vorbis 구간 디코딩 길이 부족: {f0}+{} < {b}", v.len() / ch));
+    }
+    Ok((f0, v))
+}
+
+fn decode_vorbis(table: &[u8], data: &[u8], stop: &dyn Fn() -> bool) -> Result<Vec<f32>, String> {
+    let rd = rd32;
+    let (ident, setup) = vorbis_headers(table)?;
     let n = rd(data, 0)? as usize;
     let mut off = 4 + 4 * n;
     let mut pwr = lewton::audio::PreviousWindowRight::new();
     let mut out = Vec::new();
     for i in 0..n {
+        if i % 64 == 63 && stop() {
+            return Err(CANCELLED.into());
+        }
         let len = rd(data, 4 + 4 * i)? as usize;
         let pkt = data.get(off..off + len).ok_or("Vorbis 데이터가 잘림")?;
         off += len;
@@ -324,12 +421,12 @@ fn pack_flac(bytes: &[u8]) -> Result<Packed, String> {
     let frames = if total > 0 {
         total
     } else {
-        (decode_flac(&si, &data)?.len() / channels as usize) as u64
+        (decode_flac(&si, &data, &|| false)?.len() / channels as usize) as u64
     };
     Ok(Packed { codec: Codec::Flac, channels, rate, frames, skip_front: 0, int16: bps == 16, codec_table: si, data })
 }
 
-fn decode_flac(streaminfo: &[u8], frames: &[u8]) -> Result<Vec<i32>, String> {
+fn decode_flac(streaminfo: &[u8], frames: &[u8], stop: &dyn Fn() -> bool) -> Result<Vec<i32>, String> {
     let mut file = Vec::with_capacity(8 + 34 + frames.len());
     file.extend_from_slice(b"fLaC");
     file.extend_from_slice(&[0x80, 0, 0, 34]); // 마지막 블록, STREAMINFO, 길이 34
@@ -340,7 +437,12 @@ fn decode_flac(streaminfo: &[u8], frames: &[u8]) -> Result<Vec<i32>, String> {
     let mut out = Vec::new();
     let mut blocks = r.blocks();
     let mut buf = Vec::new();
+    let mut k = 0u32;
     loop {
+        k += 1;
+        if k % 16 == 0 && stop() {
+            return Err(CANCELLED.into());
+        }
         match blocks.read_next_or_eof(buf) {
             Ok(Some(b)) => {
                 for i in 0..b.duration() as usize {
@@ -418,7 +520,7 @@ fn pack_wav_adpcm(bytes: &[u8]) -> Result<Packed, String> {
     let fmt_b = fmt.ok_or("WAV fmt 없음")?;
     let data = data.ok_or("WAV data 없음")?;
     let f = parse_adpcm_fmt(&fmt_b)?;
-    let decoded = decode_adpcm(&fmt_b, &data)?.len() / f.channels as usize;
+    let decoded = decode_adpcm(&fmt_b, &data, &|| false)?.len() / f.channels as usize;
     let frames = match fact {
         Some(n) if (n as usize) <= decoded => n as u64,
         Some(n) => return Err(format!("ADPCM fact 길이 {n}가 실제 디코딩 길이 {decoded}보다 큼 (손상)")),
@@ -430,11 +532,14 @@ fn pack_wav_adpcm(bytes: &[u8]) -> Result<Packed, String> {
 const ADAPT: [i32; 16] = [230, 230, 230, 230, 307, 409, 512, 614, 768, 614, 512, 409, 307, 230, 230, 230];
 
 /// MS-ADPCM 블록열 → i16 값(i32로). 마지막 블록이 짧으면 그만큼만.
-fn decode_adpcm(fmt_b: &[u8], data: &[u8]) -> Result<Vec<i32>, String> {
+fn decode_adpcm(fmt_b: &[u8], data: &[u8], stop: &dyn Fn() -> bool) -> Result<Vec<i32>, String> {
     let f = parse_adpcm_fmt(fmt_b)?;
     let ch = f.channels as usize;
     let mut out = Vec::new();
-    for block in data.chunks(f.block_align) {
+    for (bi, block) in data.chunks(f.block_align).enumerate() {
+        if bi % 64 == 63 && stop() {
+            return Err(CANCELLED.into());
+        }
         if block.len() < 7 * ch {
             break;
         }
@@ -665,10 +770,33 @@ mod tests {
         fmt.extend_from_slice(&0i16.to_le_bytes());
         let mut block = vec![0u8, 0xff, 0x7f, 0, 0, 0, 0]; // pred 0, delta 32767, s1 0, s2 0
         block.extend(std::iter::repeat(0x88).take(57));
-        let out = decode_adpcm(&fmt, &block).unwrap();
+        let out = decode_adpcm(&fmt, &block, &|| false).unwrap();
         assert_eq!(out.len(), 116);
         assert!(out.iter().all(|&s| (-32768..=32767).contains(&s)));
         // fmt가 짧으면 패닉 없이 거부
-        assert!(decode_adpcm(&fmt[..21], &block).is_err());
+        assert!(decode_adpcm(&fmt[..21], &block, &|| false).is_err());
+        // 취소: 64블록마다 확인 → 블록 64개 이상이면 멈춘다 (3-5)
+        let many: Vec<u8> = block.iter().copied().cycle().take(block.len() * 200).collect();
+        assert_eq!(decode_adpcm(&fmt, &many, &|| true).unwrap_err(), CANCELLED);
+        assert_eq!(decode_adpcm(&fmt, &many, &|| false).unwrap().len(), 116 * 200);
+    }
+
+    #[test]
+    fn vorbis_range_equals_full_slice() {
+        // 예시 Track의 Vorbis 소리들: 구간 디코딩 = 전체 디코딩의 같은 구간 (비트까지), 패킷 경계·처음·끝 포함
+        for name in ["side_swell.ogg", "kick.ogg", "snare.ogg"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example/synth_track/audio").join(name);
+            let p = pack_file(&std::fs::read(&path).unwrap()).unwrap();
+            let Pcm::Float(full) = decode(&p).unwrap() else { panic!() };
+            let ch = p.channels as usize;
+            let n = p.frames;
+            for (a, b) in [(0, n), (0, 1), (n / 3, n / 2), (n - 1, n), (777.min(n - 1), (777 + 4096).min(n)), (n / 2, n)] {
+                let (f0, v) = decode_vorbis_range(&p, a, b, &|| false).unwrap();
+                assert!(f0 <= a, "{name} {a}..{b}: 시작 {f0}");
+                let want = &full[f0 as usize * ch..(f0 as usize * ch + v.len())];
+                assert_eq!(v.as_slice(), want, "{name} {a}..{b}");
+                assert!(f0 + (v.len() / ch) as u64 >= b);
+            }
+        }
     }
 }

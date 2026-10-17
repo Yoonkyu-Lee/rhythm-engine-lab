@@ -79,6 +79,11 @@ fn cut_frames(p: &Packed, start: u32, length: u32) -> u64 {
 
 /// 슬롯 하나 디코딩 (작업 스레드에서). `pcm`은 같은 소리 데이터의 디코딩 결과를 재사용할 때 넘긴다.
 pub fn decode_slot(p: &Packed, pcm: &Pcm, start: u32, length: u32, rate: u32, filters: &Filters) -> Result<Pcm2, String> {
+    decode_slot_with(p, pcm, start, length, rate, filters, &|| false)
+}
+
+/// `decode_slot` + 리샘플링 조각 사이 취소 확인 (`stop()`이 참이면 `Err(audio::CANCELLED)`).
+pub fn decode_slot_with(p: &Packed, pcm: &Pcm, start: u32, length: u32, rate: u32, filters: &Filters, stop: &dyn Fn() -> bool) -> Result<Pcm2, String> {
     let ch = p.channels as usize;
     if ch == 0 || ch > 2 {
         return Err(format!("채널 {ch}개는 지원하지 않음"));
@@ -87,19 +92,27 @@ pub fn decode_slot(p: &Packed, pcm: &Pcm, start: u32, length: u32, rate: u32, fi
     let e = s + cut_frames(p, start, length) as usize;
     let bits = int_bits(p);
     let need_resample = p.rate != rate;
-    let stereo_f32 = |get: &dyn Fn(usize) -> f32| -> Vec<f32> {
+    // 형식 바꾸기도 긴 소리면 오래 걸린다 → 65,536프레임마다 취소 확인 (리뷰 3-5 #7)
+    let cancelled = |f: usize| (f - s) % 65_536 == 65_535 && stop();
+    let stereo_f32 = |get: &dyn Fn(usize) -> f32| -> Result<Vec<f32>, String> {
         let mut v = Vec::with_capacity((e - s) * 2);
         for f in s..e {
+            if cancelled(f) {
+                return Err(track::audio::CANCELLED.into());
+            }
             let l = get(f * ch);
             v.push(l);
             v.push(if ch == 2 { get(f * ch + 1) } else { l });
         }
-        v
+        Ok(v)
     };
     let v = match pcm {
         Pcm::Int(x) if bits == 16 && !need_resample => {
             let mut v = Vec::with_capacity((e - s) * 2);
             for f in s..e {
+                if cancelled(f) {
+                    return Err(track::audio::CANCELLED.into());
+                }
                 let l = x[f * ch] as i16;
                 v.push(l);
                 v.push(if ch == 2 { x[f * ch + 1] as i16 } else { l });
@@ -108,14 +121,54 @@ pub fn decode_slot(p: &Packed, pcm: &Pcm, start: u32, length: u32, rate: u32, fi
         }
         Pcm::Int(x) => {
             let scale = 1.0 / (1u64 << (bits - 1)) as f32;
-            stereo_f32(&|i| x[i] as f32 * scale)
+            stereo_f32(&|i| x[i] as f32 * scale)?
         }
-        Pcm::Float(x) => stereo_f32(&|i| x[i]),
+        Pcm::Float(x) => stereo_f32(&|i| x[i])?,
     };
     if !need_resample {
         return Ok(Pcm2::F32(v.into_boxed_slice()));
     }
-    Ok(Pcm2::F32(filters.get(p.rate, rate)?.run_stereo(&v).into_boxed_slice()))
+    match filters.get(p.rate, rate)?.run_stereo_with(&v, stop) {
+        Some(o) => Ok(Pcm2::F32(o.into_boxed_slice())),
+        None => Err(track::audio::CANCELLED.into()),
+    }
+}
+
+/// 부분 디코딩 (README 4-3 3, 3-5): 슬롯 출력 프레임 [from, to)만 `decode_slot`과 비트까지 같게 만든다. 지금은 Vorbis만
+/// (첫 소리를 좌우하는 긴 반주 stem). 원래 소리의 절대 위치로 디코딩·리샘플링하고, 필터에 필요한 앞뒤 입력을 같이 디코딩한다.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_slot_partial(p: &Packed, start: u32, length: u32, rate: u32, filters: &Filters, from: i64, to: i64, stop: &dyn Fn() -> bool) -> Result<crate::runtime::Partial, String> {
+    use track::audio::Codec;
+    if p.codec != Codec::Vorbis {
+        return Err("부분 디코딩은 Vorbis만".into());
+    }
+    let ch = p.channels as usize;
+    if ch == 0 || ch > 2 {
+        return Err(format!("채널 {ch}개는 지원하지 않음"));
+    }
+    let s = (start as u64).min(p.frames) as i64;
+    let n_src = cut_frames(p, start, length) as i64;
+    let filter = if p.rate != rate { Some(filters.get(p.rate, rate)?) } else { None };
+    let total = filter.as_ref().map_or(n_src, |f| f.out_len(n_src as usize) as i64);
+    let (from, to) = (from.clamp(0, total), to.clamp(0, total));
+    if from >= to {
+        return Err("빈 구간".into());
+    }
+    let (ia, ib) = filter.as_ref().map_or((from, to), |f| f.src_span(from as usize, to as usize));
+    let (ia, ib) = (ia.max(0), ib.min(n_src));
+    let (f0, pcm) = track::audio::decode_vorbis_range(p, (s + ia) as u64, (s + ib) as u64, stop)?;
+    let mut v = Vec::with_capacity((ib - ia) as usize * 2);
+    for f in ia..ib {
+        let k = (s + f - f0 as i64) as usize * ch;
+        let l = pcm[k];
+        v.push(l);
+        v.push(if ch == 2 { pcm[k + 1] } else { l });
+    }
+    let out = match &filter {
+        Some(f) => f.run_stereo_range(&v, ia, n_src as usize, from as usize, to as usize, stop)?,
+        None => v,
+    };
+    Ok(crate::runtime::Partial { from, pcm: Pcm2::F32(out.into_boxed_slice()) })
 }
 
 pub fn plan_chart(b: &Bundle, index: usize, o: &LoadOpts) -> Result<Plan, String> {
@@ -223,7 +276,8 @@ pub fn plan_chart_reuse(b: &Bundle, index: usize, o: &LoadOpts, cache: &mut Slot
     if o.budget > 0 && peak_bytes > o.budget {
         return Err(format!("메모리 예산 초과: 최고 {:.0} MB 추정 > 예산 {:.0} MB (시작하지 않음)", peak_bytes as f64 / 1e6, o.budget as f64 / 1e6));
     }
-    let bank = SoundBank { rate, sounds, data };
+    let partial = (0..data.len()).map(|_| std::sync::Arc::new(std::sync::OnceLock::new())).collect();
+    let bank = SoundBank { rate, sounds, data, partial };
     let lanes = sec
         .lanes
         .iter()

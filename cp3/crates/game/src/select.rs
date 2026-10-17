@@ -369,8 +369,10 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(pl) = p.play.as_mut() {
                 while pl.mix.pop().is_some() {}
                 while pl.blk.pop().is_some() {}
-                // 첫 소리까지 = 미리보기 시작 지점의 첫 콘텐츠 프레임(origin + D)을 오디오 스레드가 장치 버퍼에 쓴 순간 (세션 생성 반환이 아니라)
-                if p.first_ms.is_none() && pl.a.monitor.written.load(Ordering::Relaxed) > pl.a.info.origin + pl.a.monitor.d_frames.load(Ordering::Relaxed).max(0) {
+                // 첫 소리까지 = 미리보기 시작 지점의 첫 콘텐츠 프레임을 (버퍼링 없이 섞어) 오디오 스레드가 장치 버퍼에 쓴 순간
+                // (세션 생성 반환도, 버퍼링 무음도 아니라 — 리뷰 3-5 #4)
+                let fc = pl.a.monitor.first_content.load(Ordering::Relaxed);
+                if p.first_ms.is_none() && fc >= 0 && pl.a.monitor.written.load(Ordering::Relaxed) > fc {
                     let ms = p.settled.elapsed().as_secs_f64() * 1e3;
                     p.first_ms = Some(ms);
                     firsts.push(ms);

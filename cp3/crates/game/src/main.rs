@@ -6,10 +6,14 @@
 //!   cp3game run <묶음.trk> [--chart id] [...]       플레이 (game.rs 머리 주석)
 //!   cp3game run calib --calib sound|screen [...]   보정 (calib_ui.rs): 오프셋 A·B 제안
 //!   cp3game inputtest [--window]                    입력 경로 진단 (SendInput → Raw Input)
+//!   cp3game sounds <실행 폴더>                       그 실행의 차분 소리 표 (번호, 장치 프레임 수, 긴 소리?) — 싱크 분석용 (tools/analyze_sync.py)
+//!   cp3game notes <실행 폴더>                        그 실행의 노트 소리 목록 (레인, 노트, 노트 시각, offset, 소리) — 싱크 분석용
+//!   cp3game restream <실행 폴더> <출력.wav>          믹서 기록(mix_events.csv)으로 실제 출력 스트림을 다시 만든다 — 녹음 무결성 검사용
 //! 설정: `--settings settings.toml` (settings.rs). 선곡 화면 F1 = 설정 화면 (settings_ui.rs).
 //!   cp3game render <묶음.trk> [--chart id] [--rate 48000] [--from 초] <출력.f32>   정답 렌더(모든 노트를 제때 친 소리), --from이면 탐색 뒤부터
 
 mod audio;
+mod bench;
 mod bot;
 mod calib_ui;
 mod capture;
@@ -56,8 +60,9 @@ fn info_title(b: &Bundle) -> String {
     b.section(pack::K_INFO, 0).and_then(|s| pack::R::new(s).str().ok()).unwrap_or_default()
 }
 
-/// 메모리 예산 (바이트) ⚑ 3-5 측정으로 정한다. 계획의 최고 사용량 추정이 넘으면 시작하지 않는다 (README 4-3 9).
-pub(crate) const BUDGET: u64 = 4_000_000_000;
+/// 메모리 예산 (바이트, README 4-3 9): 계획의 최고 사용량 추정이 넘으면 시작하지 않는다. 3-5 측정: 라이브러리 871곡 중 추정 최대 952 MB
+/// (실제 최고 사적 메모리 926 MB, BMS 한 폴더 PCM 711 MB) → 그 약 2배. 선곡 화면은 Track 저장소 합집합이 절반을 넘으면 비운다.
+pub(crate) const BUDGET: u64 = 2_000_000_000;
 
 /// 묶음을 열어 차분 하나를 장치 속도로 불러온다. `chart` = 차분 id (비면 첫 차분), `choice` = "0,1,…" 변형 선택.
 /// `cache` = 같은 Track의 소리 저장소 (미리보기에서 넘겨받은 것): 준비된 슬롯은 다시 쓰고 모자란 것만 디코딩한다 (플레이 인계, README 4-3 7).
@@ -245,6 +250,108 @@ fn replay(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 실행 폴더의 meta.json으로 그 실행과 같은 차분(변형 선택 포함)을 장치 속도로 다시 불러온다.
+pub(crate) fn load_run(dir: &std::path::Path) -> Result<(Loaded, String), Box<dyn std::error::Error>> {
+    let meta = std::fs::read_to_string(dir.join("meta.json"))?;
+    let field = |k: &str| -> Option<String> {
+        let i = meta.find(&format!("\"{k}\": "))? + k.len() + 4;
+        let rest = &meta[i..];
+        let end = rest.find([',', '\n', '}']).unwrap_or(rest.len());
+        Some(rest[..end].trim().trim_matches('"').to_string())
+    };
+    let trk = field("track").ok_or("meta.json에 track 없음")?;
+    if trk == "calib" {
+        return Err("보정 실행은 대상 아님".into());
+    }
+    let rate: u32 = field("rate").and_then(|r| r.parse().ok()).ok_or("meta.json에 rate 없음")?;
+    let choice = meta.find("\"variant_choice\": [").and_then(|i| { let r = &meta[i + 19..]; r.find(']').map(|j| r[..j].replace(' ', "")) }).unwrap_or_default();
+    let l = load_track(&trk, &field("chart").unwrap_or_default(), &choice, rate, None, &mut SlotCache::new())?;
+    Ok((l, meta))
+}
+
+fn sounds(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (l, _) = load_run(std::path::Path::new(args.get(2).ok_or("실행 폴더")?))?;
+    println!("sound,frames,long");
+    for (i, s) in l.compiled.chart.bank.sounds.iter().enumerate() {
+        println!("{i},{},{}", s.frames, (s.kind == engine::runtime::SoundKind::Long) as u8);
+    }
+    Ok(())
+}
+
+/// 믹서는 결정적이라 "어느 소리를, 어느 프레임에, 어느 블록부터, 어떤 이득으로" 냈는지만 알면 출력을 그대로 다시 만든다 (CP2 restream과 같음).
+/// 보이스 이득 = 요청 이득 × 소리 표 이득 × 음량(반주/친 키음) × 마스터. 끊기(cut)는 그 프레임에서 끝.
+fn restream(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use engine::runtime::Pcm2;
+    use std::io::Write;
+    let dir = std::path::PathBuf::from(args.get(2).ok_or("실행 폴더")?);
+    let out_path = args.get(3).ok_or("출력.wav")?;
+    let (l, meta) = load_run(&dir)?;
+    let num = |k: &str| -> f32 { meta.find(&format!("\"{k}\": ")).and_then(|i| meta[i + k.len() + 4..].split([',', '\n', '}']).next()?.trim().parse().ok()).unwrap_or(1.0) };
+    let vols: Vec<f32> = meta.find("\"volumes\": [").and_then(|i| { let r = &meta[i + 12..]; r.find(']').map(|j| r[..j].split(',').filter_map(|x| x.trim().parse().ok()).collect()) }).unwrap_or_default();
+    let (vbgm, vkeys) = (vols.get(1).copied().unwrap_or(1.0), vols.get(2).copied().unwrap_or(1.0));
+    let gain = num("master_gain");
+    let rate = num("rate") as u32;
+    let bank = &l.compiled.chart.bank;
+    // (소리, 시작, 블록, 이득, 끝)
+    let mut starts: Vec<(u32, i64, i64, f32, i64)> = Vec::new();
+    for line in std::fs::read_to_string(dir.join("mix_events.csv"))?.lines().skip(1) {
+        let f: Vec<&str> = line.split(',').collect();
+        match f[0] {
+            "start" => {
+                let (sound, start, block, g, player): (u32, i64, i64, f32, bool) = (f[1].parse()?, f[3].parse()?, f[4].parse()?, f[7].parse()?, f[6] == "1");
+                let snd = bank.sounds[sound as usize];
+                starts.push((sound, start, block, g * snd.gain * if player { vkeys } else { vbgm }, start + snd.frames as i64));
+            }
+            "cut" => {
+                let (sound, at): (u32, i64) = (f[1].parse()?, f[2].parse()?);
+                for v in starts.iter_mut().filter(|v| v.0 == sound && v.4 > at) {
+                    v.4 = at;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = starts.iter().map(|v| v.4).max().unwrap_or(0).max(0) as usize;
+    let mut out = vec![0f32; end * 2];
+    for &(s, start, block, g, stop) in &starts {
+        let Some(pcm) = bank.data[bank.sounds[s as usize].data as usize].get() else { continue };
+        let lo = start.max(block).max(0);
+        let n = match pcm {
+            Pcm2::F32(x) => x.len() / 2,
+            Pcm2::I16(x) => x.len() / 2,
+        } as i64;
+        for f in lo..stop.min(start + n) {
+            let k = (f - start) as usize * 2;
+            let (a, b) = match pcm {
+                Pcm2::F32(x) => (x[k], x[k + 1]),
+                Pcm2::I16(x) => (x[k] as f32 / 32768.0, x[k + 1] as f32 / 32768.0),
+            };
+            out[f as usize * 2] += a * g;
+            out[f as usize * 2 + 1] += b * g;
+        }
+    }
+    out.iter_mut().for_each(|v| *v *= gain);
+    let data = (out.len() * 4) as u32;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(out_path)?);
+    w.write_all(b"RIFF")?;
+    w.write_all(&(36 + data).to_le_bytes())?;
+    w.write_all(b"WAVEfmt ")?;
+    w.write_all(&16u32.to_le_bytes())?;
+    w.write_all(&3u16.to_le_bytes())?;
+    w.write_all(&2u16.to_le_bytes())?;
+    w.write_all(&rate.to_le_bytes())?;
+    w.write_all(&(rate * 8).to_le_bytes())?;
+    w.write_all(&8u16.to_le_bytes())?;
+    w.write_all(&32u16.to_le_bytes())?;
+    w.write_all(b"data")?;
+    w.write_all(&data.to_le_bytes())?;
+    for v in &out {
+        w.write_all(&v.to_le_bytes())?;
+    }
+    println!("{out_path}: 발음 {} 개, {:.1}초", starts.len(), end as f64 / rate as f64);
+    Ok(())
+}
+
 /// 입력 경로 진단: Raw Input 스레드를 띄우고 SendInput으로 F24를 5번 눌렀다 뗀 뒤, 받은 이벤트 수와 앞 창을 출력한다.
 fn inputtest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let _w = if flag(args, "--window") { Some(game::create_window(windows::core::w!("입력 시험"))?) } else { None };
@@ -284,6 +391,13 @@ fn main() {
         Some("prevbench") => prevbench(&args),
         Some("replay") => replay(&args),
         Some("inputtest") => inputtest(&args),
+        Some("sounds") => sounds(&args),
+        Some("restream") => restream(&args),
+        Some("loadbench") => bench::loadbench(&args),
+        Some("prevsweep") => bench::prevsweep(&args),
+        Some("memtest") => bench::memtest(&args),
+        Some("partcheck") => bench::partcheck(&args),
+        Some("notes") => bench::notes(&args),
         _ => {
             eprintln!("사용법: cp3game list <묶음.trk> | cp3game run <묶음.trk> [--chart id] [--bot] … | cp3game render <묶음.trk> [--chart id] <출력.f32>");
             Ok(())

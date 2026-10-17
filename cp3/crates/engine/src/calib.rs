@@ -100,6 +100,7 @@ pub fn calib_chart(rate: u32, bpm: f64, count: usize, with_click: bool) -> Compi
         rate,
         sounds: vec![SoundRef { data: 0, frames: n as u32, kind: SoundKind::Short, gain: 1.0, cut: false, choke: 0 }],
         data: vec![Arc::new(slot)],
+        partial: vec![],
     };
     let notes = beats.iter().map(|&t| Note { t, end: t, sounds_start: 0, sounds_len: 0, kind: NoteKind::Tap, damage: -1 }).collect();
     let end = *beats.last().unwrap() + 1_000_000_000;

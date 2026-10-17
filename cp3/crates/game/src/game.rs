@@ -140,6 +140,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
+/// 창을 앞으로 (3-5): 뒤에서 띄운 프로세스는 Windows의 포커스 빼앗기 방지에 막히므로, 지금 앞 창의 입력 스레드에 잠깐 붙어서 올린다.
+/// 실패해도 진행한다 (봇은 앞 창이 아니면 누르지 않는다).
+fn bring_to_front(hwnd: HWND) {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow};
+    unsafe {
+        let fg = GetForegroundWindow();
+        let other = GetWindowThreadProcessId(fg, None);
+        let me = GetCurrentThreadId();
+        let attached = other != 0 && other != me && AttachThreadInput(me, other, true).as_bool();
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        if attached {
+            let _ = AttachThreadInput(me, other, false);
+        }
+    }
+}
+
 pub fn create_window(title: windows::core::PCWSTR) -> windows::core::Result<HWND> {
     unsafe {
         let hinst = GetModuleHandleW(None)?;
@@ -158,6 +176,7 @@ pub fn create_window(title: windows::core::PCWSTR) -> windows::core::Result<HWND
         AdjustWindowRect(&mut rc, style, false)?;
         let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), class, title, style, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, None, None, hinst, None)?;
         let _ = ShowWindow(hwnd, SW_SHOW);
+        bring_to_front(hwnd);
         Ok(hwnd)
     }
 }
@@ -698,7 +717,7 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
     let snap = a.clock.load();
     let hex: String = chart.chart.chart_hash.iter().map(|b| format!("{b:02x}")).collect();
     let meta = format!(
-        "{{\n \"track\": \"{}\", \"chart\": \"{}\", \"chart_hash\": \"{hex}\", \"title\": \"{}\", \"variant_choice\": {:?}, \"lanes\": {}, \"load_ms\": {load_ms:.1},\n \"device\": \"{}\", \"rate\": {rate}, \"buffer_frames\": {}, \"period_frames\": {}, \"path\": \"{}\", \"origin\": {origin}, \"d_frames\": {}, \"skips\": {}, \"skipped_frames\": {}, \"late_player\": {}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"display_offset_ns\": {display_offset_ns}, \"offset_a_ns\": {out_offset_ns}, \"rules_hash\": \"{rhash}\", \"volumes\": [{}, {}, {}], \"d_margin_ms\": {}, \"calib\": \"{}\", \"seed\": {seed_set}, \"empty_sound\": \"{empty_sound}\", \"scroll_base\": \"{scroll_base}\", \"base_bpm\": {base_bpm}, \"visible_ms\": {}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"resync_void\": {}, \"gauge\": \"{:?}\", \"windows_ns\": [{}, {}, {}, {}], \"scratch_windows_ns\": [{}, {}, {}, {}],\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"score\": {{\"ex\": {}, \"pgreat\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"poor\": {}, \"empty_poor\": {}, \"mines\": {}, \"max_combo\": {}, \"fast\": {}, \"slow\": {}, \"gauge\": {}, \"cleared\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
+        "{{\n \"track\": \"{}\", \"chart\": \"{}\", \"chart_hash\": \"{hex}\", \"title\": \"{}\", \"variant_choice\": {:?}, \"lanes\": {}, \"load_ms\": {load_ms:.1},\n \"device\": \"{}\", \"rate\": {rate}, \"buffer_frames\": {}, \"period_frames\": {}, \"path\": \"{}\", \"origin\": {origin}, \"d_frames\": {}, \"skips\": {}, \"skipped_frames\": {}, \"late_player\": {}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"display_offset_ns\": {display_offset_ns}, \"offset_a_ns\": {out_offset_ns}, \"rules_hash\": \"{rhash}\", \"volumes\": [{}, {}, {}], \"d_margin_ms\": {}, \"calib\": \"{}\", \"seed\": {seed_set}, \"empty_sound\": \"{empty_sound}\", \"scroll_base\": \"{scroll_base}\", \"base_bpm\": {base_bpm}, \"visible_ms\": {}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"bot_direct\": {direct}, \"bot_skipped_not_front\": {}, \"resync_void\": {}, \"gauge\": \"{:?}\", \"windows_ns\": [{}, {}, {}, {}], \"scratch_windows_ns\": [{}, {}, {}, {}],\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"score\": {{\"ex\": {}, \"pgreat\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"poor\": {}, \"empty_poor\": {}, \"mines\": {}, \"max_combo\": {}, \"fast\": {}, \"slow\": {}, \"gauge\": {}, \"cleared\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
         if calib.is_some() { "calib".to_string() } else { path.replace('\\', "/") },
         chart.chart.chart_id,
         loaded.title.replace('"', "'"),
@@ -722,6 +741,7 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
             None => "",
         },
         visible_s * 1e3,
+        bot::SKIPPED_NOT_FRONT.load(Ordering::Relaxed),
         resync_void,
         rules.gauge_kind,
         rules.key.late[0],

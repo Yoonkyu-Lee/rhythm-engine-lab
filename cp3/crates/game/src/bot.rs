@@ -107,14 +107,32 @@ impl View {
     }
 }
 
-fn send(vk: u16, down: bool) {
+/// 앞 창이 이 프로세스가 아니면 누름을 보내지 않는다: SendInput은 전역이라 다른 프로그램(편집기 등)에 키가 들어간다
+/// (게임 창이 뒤에 뜬 경우, 3-5). 뗌은 늘 보낸다(눌린 채 남지 않게).
+pub static SKIPPED_NOT_FRONT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn we_are_front() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid)) };
+    pid == std::process::id()
+}
+
+/// 보냈으면 true (앞 창이 아니라 누름을 건너뛰면 false — 기록에 q_sent = −1)
+fn send(vk: u16, down: bool) -> bool {
+    if down && !we_are_front() {
+        SKIPPED_NOT_FRONT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
     let ki = KEYBDINPUT { wVk: VIRTUAL_KEY(vk), dwFlags: if down { Default::default() } else { KEYEVENTF_KEYUP }, ..Default::default() };
     let input = INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki } };
     let n = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
     if n != 1 {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| eprintln!("봇: SendInput 실패 (키 {vk:#x}, 오류 {:?})", unsafe { windows::Win32::Foundation::GetLastError() }));
+        return false;
     }
+    true
 }
 
 /// 청취 곡 시각(ns) → 그 순간의 QPC 틱 (시계가 없으면 None).
@@ -224,13 +242,17 @@ pub fn spawn(chart: Arc<Compiled>, cfg: BotCfg, clock: Arc<SharedClock>, mut log
                     continue; // 오토 꺼짐: 이 노트는 건너뜀
                 }
                 held[lane][note as usize] = down;
-                let q_sent = qpc::now();
+                let mut q_sent = qpc::now();
                 match (keys.as_mut(), cfg.direct.as_ref()) {
                     (Some(k), Some(wm)) => {
                         let _ = k.push(KeyEvent { vkey: bot_key(lane), down, qpc: q_sent, msg_time_ms: 0, tick_ms: 0, floor_qpc: q_sent, recv_qpc: q_sent });
                         wm.store(qpc::now(), Ordering::Release);
                     }
-                    _ => send(bot_key(lane), down),
+                    _ => {
+                        if !send(bot_key(lane), down) {
+                            q_sent = -1;
+                        }
+                    }
                 }
                 let _ = log.push(BotLog { lane: lane as u16, note, down, target_ns: t, q_target: q, q_sent });
             }

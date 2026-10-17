@@ -227,6 +227,8 @@ fn zero_stats() -> AudioStats {
 pub struct AudioMonitor {
     /// 미리보기 버퍼링으로 쉰 횟수 (믹서 공개값)
     pub pauses: AtomicU64,
+    /// 첫 콘텐츠 프레임(시작 지점 소리)의 시간축 위치. 버퍼링하지 않고 그 프레임을 섞은 블록에서 정한다 (−1 = 아직). 미리보기 첫 소리 측정용 (리뷰 3-5 #4)
+    pub first_content: AtomicI64,
     pub blocks: AtomicU64,
     /// 공유 모드에서 버퍼가 비어 있던 블록 수 + 콘텐츠를 건너뛴 횟수.
     pub underruns: AtomicU64,
@@ -434,7 +436,14 @@ impl<'a> Core<'a> {
         // 3) 섞기
         let buf = &mut out[..n * ch];
         buf.fill(0.0);
+        let p0 = self.mixer.pauses;
         self.mixer.fill(buf, ch, tl, n);
+        if self.mixer.pauses == p0 && self.mon.first_content.load(Ordering::Relaxed) < 0 {
+            let fc = self.mixer.origin() + ns_to_frame(self.start_ns, self.rate as u32);
+            if tl + n as i64 > fc && self.calibrating == false {
+                self.mon.first_content.store(fc, Ordering::Relaxed);
+            }
+        }
         if self.master_gain != 1.0 {
             for v in buf.iter_mut() {
                 *v *= self.master_gain;
@@ -555,7 +564,7 @@ fn spawn_wasapi(
     let clock = Arc::new(SharedClock::new());
     let done = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
-    let monitor = Arc::new(AudioMonitor { d_frames: AtomicI64::new(-1), bgm_offset: AtomicI64::new(BGM_NONE), ..Default::default() });
+    let monitor = Arc::new(AudioMonitor { d_frames: AtomicI64::new(-1), bgm_offset: AtomicI64::new(BGM_NONE), first_content: AtomicI64::new(-1), ..Default::default() });
     let live = cfg.live.take();
     let (info_tx, info_rx) = std::sync::mpsc::channel::<Result<AudioInfo, String>>();
     let (clock2, done2, stop2, mon) = (clock.clone(), done.clone(), stop.clone(), monitor.clone());
@@ -921,7 +930,7 @@ fn spawn_asio(
     let clock = Arc::new(SharedClock::new());
     let done = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
-    let monitor = Arc::new(AudioMonitor { d_frames: AtomicI64::new(-1), bgm_offset: AtomicI64::new(BGM_NONE), ..Default::default() });
+    let monitor = Arc::new(AudioMonitor { d_frames: AtomicI64::new(-1), bgm_offset: AtomicI64::new(BGM_NONE), first_content: AtomicI64::new(-1), ..Default::default() });
     let live = cfg.live.take();
     let (info_tx, info_rx) = std::sync::mpsc::channel::<Result<AudioInfo, String>>();
     let (clock2, done2, stop2, mon) = (clock.clone(), done.clone(), stop.clone(), monitor.clone());

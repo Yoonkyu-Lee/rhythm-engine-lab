@@ -53,10 +53,32 @@ pub struct SoundBank {
     pub rate: u32,
     pub sounds: Vec<SoundRef>,
     pub data: Vec<Slot>,
+    /// 데이터 슬롯마다 부분 슬롯 (미리보기, 3-5). 비어 있으면 없음.
+    pub partial: Vec<PSlot>,
 }
 
 /// 데이터 슬롯 하나: 한 번 게시되는 PCM. `Arc`라 같은 Track의 차분 사이·미리보기 → 플레이에서 공유한다 (README 4-3 2·7).
 pub type Slot = std::sync::Arc<std::sync::OnceLock<Pcm2>>;
+
+/// 부분 슬롯 (README 4-3 3 부분 디코딩, 3-5): 긴 소리에서 들을 곳 근처만 먼저 디코딩한 것. `from` = 슬롯 안 첫 프레임.
+/// 전체 슬롯과 그 구간이 비트까지 같다. 전체 슬롯이 준비되면 믹서는 그쪽을 읽는다. 한 번만 게시된다.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Partial {
+    pub from: i64,
+    pub pcm: Pcm2,
+}
+
+pub type PSlot = std::sync::Arc<std::sync::OnceLock<Partial>>;
+
+impl Pcm2 {
+    /// 스테레오 프레임 수
+    pub fn frames(&self) -> i64 {
+        (match self {
+            Pcm2::F32(x) => x.len(),
+            Pcm2::I16(x) => x.len(),
+        } / 2) as i64
+    }
+}
 
 impl SoundBank {
     pub fn duration_ns(&self, sound: u32) -> i64 {
@@ -66,12 +88,36 @@ impl SoundBank {
     pub fn ready(&self, sound: u32) -> bool {
         self.data[self.sounds[sound as usize].data as usize].get().is_some()
     }
+
+    /// 데이터 슬롯 `d`의 프레임 `a`를 읽을 PCM: (PCM, 그 PCM의 슬롯 안 첫 프레임, 덮는 끝 프레임). 전체 우선, 없으면 `a`를 덮는 부분 슬롯.
+    pub fn view(&self, d: usize, a: i64) -> Option<(&Pcm2, i64, i64)> {
+        if let Some(p) = self.data[d].get() {
+            return Some((p, 0, p.frames()));
+        }
+        let q = self.partial.get(d)?.get()?;
+        let end = q.from + q.pcm.frames();
+        (q.from <= a && a < end).then_some((&q.pcm, q.from, end))
+    }
+
+    /// 소리 `sound`의 슬롯 프레임 [a, b)를 지금 읽을 수 있나 (전체 슬롯, 또는 그 구간을 덮는 부분 슬롯). 소리 길이 밖은 필요 없다.
+    pub fn covers(&self, sound: u32, a: i64, b: i64) -> bool {
+        let s = self.sounds[sound as usize];
+        let (a, b) = (a.max(0), b.min(s.frames as i64));
+        if a >= b {
+            return true;
+        }
+        let d = s.data as usize;
+        if self.data[d].get().is_some() {
+            return true;
+        }
+        self.partial.get(d).and_then(|p| p.get()).is_some_and(|q| q.from <= a && q.from + q.pcm.frames() >= b)
+    }
     pub fn all_ready(&self) -> bool {
         self.data.iter().all(|d| d.get().is_some())
     }
     /// 상주 메모리 (준비된 슬롯, 바이트)
     pub fn bytes(&self) -> usize {
-        self.data.iter().filter_map(|d| d.get()).map(|p| p.bytes()).sum()
+        self.data.iter().filter_map(|d| d.get()).map(|p| p.bytes()).sum::<usize>() + self.partial.iter().filter_map(|d| d.get()).map(|p| p.pcm.bytes()).sum::<usize>()
     }
 }
 

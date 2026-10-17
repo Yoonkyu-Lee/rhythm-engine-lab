@@ -172,23 +172,26 @@ impl<'a> Mixer<'a> {
         self.ready_cursor = self.cursor;
     }
 
-    /// 버퍼링이 필요한가: [block, block + n + lookahead) 안의 발음과 지금 울리는 보이스의 슬롯이 모두 준비됐나.
-    fn must_pause(&mut self, block_end: i64) -> bool {
+    /// 버퍼링이 필요한가: [block, block_end + lookahead) 동안 울릴 구간을 지금 울리는 보이스와 그 안에서 시작하는 발음의 슬롯이
+    /// 모두 덮었나 (전체 슬롯, 또는 그 구간을 덮는 부분 슬롯 — 3-5).
+    fn must_pause(&mut self, block: i64, block_end: i64) -> bool {
         if self.lookahead == 0 {
             return false;
         }
         let rate = self.c.chart.bank.rate;
         let bank = &self.c.chart.bank;
-        if self.voices.iter().any(|v| !bank.ready(v.sound)) {
+        let horizon = block_end + self.lookahead;
+        if self.voices.iter().any(|v| !bank.covers(v.sound, block.max(v.gate) - v.start, horizon.min(v.end) - v.start)) {
             return true;
         }
         self.ready_cursor = self.ready_cursor.max(self.cursor);
         while self.ready_cursor < self.sched.len() {
             let e = self.sched[self.ready_cursor];
-            if self.origin + ns_to_frame(e.t, rate) >= block_end + self.lookahead {
+            let due = self.origin + ns_to_frame(e.t, rate);
+            if due >= horizon {
                 return false;
             }
-            if !bank.ready(e.sound) {
+            if !bank.covers(e.sound, 0, horizon - due) {
                 return true;
             }
             self.ready_cursor += 1;
@@ -235,6 +238,9 @@ impl<'a> Mixer<'a> {
         for v in self.voices.iter_mut() {
             v.gate = v.gate.max(target);
         }
+        // 준비 안 됨은 실제로 들릴 첫 프레임(탐색 지점) 기준으로 센다 — 배정 중에는 세지 않았다 (부분 슬롯은 탐색 지점부터 덮는다)
+        let bank = &self.c.chart.bank;
+        self.unready += self.voices.iter().filter(|v| !bank.covers(v.sound, v.gate - v.start, v.gate - v.start + 1)).count() as u64;
         self.quiet = false;
         self.ready_cursor = self.cursor;
     }
@@ -362,7 +368,7 @@ impl<'a> Mixer<'a> {
             self.log(MixEvent::Overflow { sound, due, player });
             return;
         }
-        if !self.c.chart.bank.ready(sound) {
+        if !self.quiet && !self.c.chart.bank.covers(sound, from - start, from - start + 1) {
             self.unready += 1;
         }
         self.voices.push(Voice { sound, start, gate: start, gain: gain * snd.gain * self.vol[player as usize], end: start + frames, t, player });
@@ -382,17 +388,14 @@ impl<'a> Mixer<'a> {
                 continue;
             }
             let snd = bank.sounds[v.sound as usize];
-            // 준비 안 된 슬롯(비상, README 4-3 3): 보이스 상태는 그대로 두고 출력만 비운다 (admit에서 셌다)
-            let Some(data) = bank.data[snd.data as usize].get() else { continue };
-            let avail = match data {
-                Pcm2::F32(x) => x.len() / 2,
-                Pcm2::I16(x) => x.len() / 2,
-            } as i64;
-            let hi = hi.min(v.start + avail); // 슬롯이 예상보다 짧으면(디코딩 실패 → 빈 슬롯) 거기까지만
+            // 준비 안 된 슬롯(비상, README 4-3 3): 보이스 상태는 그대로 두고 출력만 비운다 (admit에서 셌다).
+            // 전체 슬롯이 없으면 이 구간을 덮는 부분 슬롯(3-5)을 읽는다 — 같은 구간은 비트까지 같다.
+            let Some((data, pfrom, pend)) = bank.view(snd.data as usize, lo - v.start) else { continue };
+            let hi = hi.min(v.start + pend); // 슬롯이 예상보다 짧으면(디코딩 실패 → 빈 슬롯) 또는 부분 슬롯 끝까지만
             if hi <= lo {
                 continue;
             }
-            let src0 = (lo - v.start) as usize * 2;
+            let src0 = (lo - v.start - pfrom) as usize * 2;
             let dst0 = (lo - block) as usize * out_ch;
             let frames = (hi - lo) as usize;
             let dst = &mut out[dst0..dst0 + frames * out_ch];
@@ -423,7 +426,7 @@ impl<'a> Mixer<'a> {
     /// 스트림 프레임 [block, block + n)을 채운다. `out`은 출력 채널 수(`out_ch`)만큼 끼워 넣은 버퍼이고 0으로 초기화돼 있어야 한다.
     pub fn fill(&mut self, out: &mut [f32], out_ch: usize, block: i64, n: usize) {
         let end = block + n as i64;
-        if self.must_pause(end) {
+        if self.must_pause(block, end) {
             self.pause(n as i64);
             return;
         }
@@ -541,7 +544,7 @@ mod tests {
                 title: "tiny".into(),
                 chart_id: "t".into(),
                 layout: "1".into(),
-                bank: SoundBank { rate, data, sounds: vec![snd(0, a, SoundKind::Short), s1, snd(2, c, SoundKind::Long)] },
+                bank: SoundBank { rate, data, sounds: vec![snd(0, a, SoundKind::Short), s1, snd(2, c, SoundKind::Long)], partial: vec![] },
                 auto: vec![
                     SoundEvent { t: 0, sound: 2, gain: 1.0 },
                     SoundEvent { t: 500_000_000, sound: 0, gain: 0.5 },
@@ -812,5 +815,43 @@ mod tests {
         assert!((ch.scroll_base("max") - 180.0).abs() < 1e-9); // 순간 이동(0.1 ms)은 뺀다
         assert!((ch.scroll_base("min") - 90.0).abs() < 1e-9);
         assert_eq!(ch.scroll_base("모름"), 120.0);
+    }
+
+    #[test]
+    fn partial_slot_mixes_like_full() {
+        // 긴 소리(슬롯 2)를 탐색 지점 근처만 부분 슬롯으로 두고 섞은 것 = 전체 슬롯으로 섞은 것 (그 구간)
+        let full = tiny(16, false);
+        let mut part = tiny(16, false);
+        let pcm = full.chart.bank.data[2].get().unwrap().clone();
+        let Pcm2::F32(x) = &pcm else { panic!() };
+        let (from, to) = (40_000i64, 90_000i64);
+        let lock = std::sync::OnceLock::new();
+        let _ = lock.set(crate::runtime::Partial { from, pcm: Pcm2::F32(x[from as usize * 2..to as usize * 2].to_vec().into_boxed_slice()) });
+        part.chart.bank.partial = vec![Default::default(), Default::default(), std::sync::Arc::new(lock)];
+        part.chart.bank.data[2] = std::sync::Arc::new(std::sync::OnceLock::new());
+        let t = (from as f64 / 44_100.0 * 1e9) as i64 + 10_000_000;
+        let run = |c: &Compiled| {
+            let mut m = Mixer::new(c, 0, LatePolicy::DEFAULT, 1024);
+            m.set_autoplay_notes();
+            m.seek(t);
+            m.set_lookahead(4096);
+            let mut out = vec![0f32; 2 * 8192];
+            m.fill(&mut out, 2, ns_to_frame(t, 44_100), 8192);
+            (out, m.pauses, m.unready)
+        };
+        let (a, pa, ua) = run(&full);
+        let (b, pb, ub) = run(&part);
+        assert_eq!((pa, ua), (0, 0));
+        assert_eq!((pb, ub), (0, 0), "부분 슬롯이 덮으면 쉬지 않는다");
+        assert_eq!(a, b);
+        // 부분 슬롯 끝을 넘는 곳까지 앞을 봐야 하면 쉰다 (건너뛰지 않음)
+        let mut m = Mixer::new(&part, 0, LatePolicy::DEFAULT, 1024);
+        m.set_autoplay_notes();
+        let t2 = (85_000.0 / 44_100.0 * 1e9) as i64;
+        m.seek(t2);
+        m.set_lookahead(44_100);
+        let mut out = vec![0f32; 2 * 1024];
+        m.fill(&mut out, 2, ns_to_frame(t2, 44_100), 1024);
+        assert_eq!(m.pauses, 1);
     }
 }
