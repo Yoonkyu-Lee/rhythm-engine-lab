@@ -34,8 +34,6 @@ pub struct Mark {
 pub struct LiveGraph {
     samples: VecDeque<SyncSample>,
     marks: VecDeque<Mark>,
-    /// IIDX식 slew: (QPC, +1 빨리감기 / −1 느리게감기)
-    slew: VecDeque<(i64, i8)>,
     pub visible: bool,
     last_skip: Option<(i64, f64)>,
     out: BufWriter<File>,
@@ -61,7 +59,7 @@ impl LiveGraph {
     pub fn new(dir: &Path, qf: i64) -> std::io::Result<LiveGraph> {
         let mut out = BufWriter::new(File::create(dir.join("live_sync.csv"))?);
         writeln!(out, "q,key,chart_ms,n,key_ms,new_ms,stems")?;
-        Ok(LiveGraph { samples: VecDeque::new(), marks: VecDeque::new(), slew: VecDeque::new(), visible: true, last_skip: None, out, qf })
+        Ok(LiveGraph { samples: VecDeque::new(), marks: VecDeque::new(), visible: true, last_skip: None, out, qf })
     }
 
     /// 오디오 스레드가 보낸 표본을 모두 꺼내 기록하고, 10초 넘게 지난 것은 버린다.
@@ -77,9 +75,6 @@ impl LiveGraph {
         }
         while self.marks.front().is_some_and(|m| m.q + m.len_q < old) {
             self.marks.pop_front();
-        }
-        while self.slew.front().is_some_and(|s| s.0 < old) {
-            self.slew.pop_front();
         }
         Ok(())
     }
@@ -102,10 +97,6 @@ impl LiveGraph {
         }
         self.last_skip = Some((q, ms));
         self.marks.push_back(Mark { q, len_q: 0, color: Rgba(1.0, 1.0, 1.0, 0.7), label: format!("+{ms:.0} ms 건너뜀") });
-    }
-
-    pub fn slew(&mut self, q: i64, dir: i8) {
-        self.slew.push_back((q, dir));
     }
 
     pub fn flush(&mut self) -> std::io::Result<()> {
@@ -212,20 +203,13 @@ impl LiveGraph {
                 list.rect(x + 2.0, y - 3.0, 1.0, 6.0, c);
             }
         }
-        // 아래 띠 1: 기준 없음(회색) / 소리 없음(빈 칸). 띠 2: IIDX식 빨리감기·느리게감기
+        // 아래 띠: 기준 없음(회색) / 소리 없음(빈 칸)
         let by = top + ph + 4.0;
         for col in 0..ncol {
             if has_any[col] && !has_ref[col] {
                 list.rect(x0 + col as f32 * COL_PX, by, COL_PX, 8.0, Rgba(0.5, 0.5, 0.5, 0.9));
             }
         }
-        for &(q, d) in &self.slew {
-            let x = xs(q);
-            if x >= x0 && x <= x0 + w {
-                let c = if d > 0 { Rgba(1.0, 0.6, 0.2, 1.0) } else { Rgba(0.3, 0.6, 1.0, 1.0) };
-                list.rect(x, by + 12.0, 2.0, 8.0, c);
-            }
-        }
-        list.text(x0, by + 22.0 - 2.0, 11.0, Rgba(0.6, 0.6, 0.65, 1.0), "회색: 기준(반주 조각) 없음 · 주황/파랑: IIDX식 빨리/느리게감기");
+        list.text(x0, by + 22.0 - 2.0, 11.0, Rgba(0.6, 0.6, 0.65, 1.0), "회색: 기준(반주 조각) 없음");
     }
 }

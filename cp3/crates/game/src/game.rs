@@ -36,8 +36,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, CreateWindowExW, DefWindowProcW, DispatchMessageW, LoadCursorW, PeekMessageW, PostQuitMessage, RegisterClassW,
-    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WM_DESTROY,
+    AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, LoadCursorW, PeekMessageW, RegisterClassW,
+    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WM_CLOSE,
     WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN, WNDCLASSW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
 };
 
@@ -99,8 +99,24 @@ struct FrameLog {
 }
 
 thread_local! {
+    /// 창 닫기 요청(X 버튼·Alt+F4)을 받았나. 그 화면의 루프만 끝낸다 — 플레이 창과 선곡 창이 같은 스레드라
+    /// WM_QUIT(스레드 전체 끝)을 쓰면 플레이 창을 닫을 때 선곡 화면까지 끝난다.
+    static CLOSE_REQ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 창이 받은 키 (창 스레드 = 메시지 루프 스레드에서만 쓴다). 한 프레임에 여러 키가 와도 잃지 않는다.
     static HOTKEYS: std::cell::RefCell<std::collections::VecDeque<u32>> = std::cell::RefCell::new(std::collections::VecDeque::with_capacity(16));
+}
+
+/// 창 닫기 요청을 꺼낸다 (한 번 읽으면 지워진다).
+pub fn take_close() -> bool {
+    CLOSE_REQ.with(|c| c.replace(false))
+}
+
+/// 화면이 끝날 때 자기 창을 닫는다 (렌더러를 먼저 놓은 뒤). 닫기 요청이 남아 있으면 지운다.
+pub fn close_window(hwnd: HWND) {
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+    let _ = take_close();
 }
 
 /// 창이 받은 키 (WM_KEYDOWN, 들어온 순서) 하나를 꺼낸다. 없으면 0.
@@ -122,8 +138,8 @@ pub fn window_vkey(wp: usize, lp: isize) -> u32 {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
-        WM_DESTROY => {
-            PostQuitMessage(0);
+        WM_CLOSE => {
+            CLOSE_REQ.with(|c| c.set(true));
             LRESULT(0)
         }
         WM_KEYDOWN | WM_SYSKEYDOWN if msg == WM_KEYDOWN || wp.0 == 0x12 => {
@@ -449,7 +465,7 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
             skip_on_stall: true,
             asio_capture: (apath == audio::AudioPath::Asio && !flag(args, "--no-capture")).then(|| dir.clone()),
             faults: vec![],
-            live: Some(audio::LiveSync { tx: live_tx, pclock: None }),
+            live: Some(audio::LiveSync { tx: live_tx }),
             preview: None,
         },
         key_rx,
@@ -485,7 +501,6 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
             jitter_ns: (arg(args, "--bot-jitter-ms", "0").parse::<f64>().unwrap_or(0.0) * 1e6) as i64,
             seed: 12345,
             adapt_ns: (arg(args, "--bot-adapt-ms", "0").parse::<f64>().unwrap_or(0.0) * 1e6) as i64,
-            follow: None,
             enabled: auto_on.clone(),
             direct: direct.then(|| input.watermark.clone()),
         };
@@ -541,6 +556,9 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+        }
+        if take_close() {
+            quit = true;
         }
         let now = qpc::now();
         let q_display = if last_sync_q > 0 { last_sync_q + ((now - last_sync_q) / period_q + 1) * period_q } else { now + period_q };
@@ -697,6 +715,9 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
             quit = true;
         }
     }
+    // 플레이 창 닫기 (선곡 화면에서 왔으면 그 창으로 돌아간다)
+    drop(rend);
+    close_window(hwnd);
     flog.flush()?;
     graph.flush()?;
     envlog.flush()?;
@@ -707,6 +728,13 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
     let _ = monitor_join.join();
     let _ = bot_join.join();
     let input_lost = input.lost.load(Ordering::Relaxed);
+    // 입력 스레드 진단 (CP2 기록과 같게): 깨어남 간격 최대, 2 ms 넘은 횟수, MMCSS 등록
+    let input_diag = format!(
+        "{{\"gap_max_us\": {}, \"gap_over_2ms\": {}, \"mmcss\": {}}}",
+        input.gap_max_us.load(Ordering::Relaxed),
+        input.gap_over_2ms.load(Ordering::Relaxed),
+        input.mmcss
+    );
     input.stop();
     log_stop.store(true, Ordering::Release);
     logger.join().map_err(|_| "기록 스레드 패닉")??;
@@ -720,7 +748,7 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
     let snap = a.clock.load();
     let hex: String = chart.chart.chart_hash.iter().map(|b| format!("{b:02x}")).collect();
     let meta = format!(
-        "{{\n \"track\": \"{}\", \"chart\": \"{}\", \"chart_hash\": \"{hex}\", \"title\": \"{}\", \"variant_choice\": {:?}, \"lanes\": {}, \"load_ms\": {load_ms:.1},\n \"device\": \"{}\", \"rate\": {rate}, \"buffer_frames\": {}, \"period_frames\": {}, \"path\": \"{}\", \"origin\": {origin}, \"d_frames\": {}, \"skips\": {}, \"skipped_frames\": {}, \"late_player\": {}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"display_offset_ns\": {display_offset_ns}, \"offset_a_ns\": {out_offset_ns}, \"rules_hash\": \"{rhash}\", \"volumes\": [{}, {}, {}], \"d_margin_ms\": {}, \"calib\": \"{}\", \"seed\": {seed_set}, \"empty_sound\": \"{empty_sound}\", \"scroll_base\": \"{scroll_base}\", \"base_bpm\": {base_bpm}, \"visible_ms\": {}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"bot_direct\": {direct}, \"bot_skipped_not_front\": {}, \"resync_void\": {}, \"gauge\": \"{:?}\", \"windows_ns\": [{}, {}, {}, {}], \"scratch_windows_ns\": [{}, {}, {}, {}],\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost},\n \"score\": {{\"ex\": {}, \"pgreat\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"poor\": {}, \"empty_poor\": {}, \"mines\": {}, \"max_combo\": {}, \"fast\": {}, \"slow\": {}, \"gauge\": {}, \"cleared\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
+        "{{\n \"track\": \"{}\", \"chart\": \"{}\", \"chart_hash\": \"{hex}\", \"title\": \"{}\", \"variant_choice\": {:?}, \"lanes\": {}, \"load_ms\": {load_ms:.1},\n \"device\": \"{}\", \"rate\": {rate}, \"buffer_frames\": {}, \"period_frames\": {}, \"path\": \"{}\", \"origin\": {origin}, \"d_frames\": {}, \"skips\": {}, \"skipped_frames\": {}, \"late_player\": {}, \"master_gain\": {gain}, \"render_peak\": {peak},\n \"display_offset_ns\": {display_offset_ns}, \"offset_a_ns\": {out_offset_ns}, \"rules_hash\": \"{rhash}\", \"volumes\": [{}, {}, {}], \"d_margin_ms\": {}, \"calib\": \"{}\", \"seed\": {seed_set}, \"empty_sound\": \"{empty_sound}\", \"scroll_base\": \"{scroll_base}\", \"base_bpm\": {base_bpm}, \"visible_ms\": {}, \"vsync\": {vsync}, \"bot\": {use_bot}, \"bot_direct\": {direct}, \"bot_skipped_not_front\": {}, \"resync_void\": {}, \"gauge\": \"{:?}\", \"windows_ns\": [{}, {}, {}, {}], \"scratch_windows_ns\": [{}, {}, {}, {}],\n \"written\": {}, \"blocks\": {}, \"overflows\": {}, \"log_lost\": {}, \"mix_lost\": {}, \"judge_log_lost\": {judge_lost}, \"input_lost\": {input_lost}, \"input\": {input_diag}, \"channels\": {}, \"audio_mmcss\": {},\n \"score\": {{\"ex\": {}, \"pgreat\": {}, \"great\": {}, \"good\": {}, \"bad\": {}, \"poor\": {}, \"empty_poor\": {}, \"mines\": {}, \"max_combo\": {}, \"fast\": {}, \"slow\": {}, \"gauge\": {}, \"cleared\": {}}},\n \"clock\": {{\"valid\": {}, \"epoch\": {}, \"t0\": {}, \"f0\": {}, \"a\": {}, \"b\": {}}}, \"qpc_freq\": {qf},\n \"capture\": {}\n}}\n",
         if calib.is_some() { "calib".to_string() } else { path.replace('\\', "/") },
         chart.chart.chart_id,
         loaded.title.replace('"', "'"),
@@ -760,6 +788,8 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
         st.overflows,
         st.log_lost,
         st.mix_lost,
+        a.info.channels,
+        a.info.mmcss,
         s.ex(),
         s.pgreat,
         s.great,
@@ -779,7 +809,7 @@ fn run_inner(args: &[String], cache: &mut engine::load::SlotCache) -> Result<Run
         snap.f0,
         snap.a,
         snap.b,
-        capm.map(|m| format!("{{\"name\": \"{}\", \"rate\": {}, \"frames\": {}, \"silent_packets\": {}}}", m.name, m.rate, m.frames, m.silent_packets)).unwrap_or_else(|| "null".into())
+        capm.map(|m| format!("{{\"name\": \"{}\", \"rate\": {}, \"channels\": {}, \"frames\": {}, \"silent_packets\": {}}}", m.name, m.rate, m.channels, m.frames, m.silent_packets)).unwrap_or_else(|| "null".into())
     );
     fs::write(dir.join("meta.json"), meta)?;
     let summary = format!(

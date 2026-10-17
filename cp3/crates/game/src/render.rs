@@ -74,8 +74,6 @@ pub trait Renderer {
     fn draw(&mut self, list: &DrawList) -> windows::core::Result<()>;
     /// present 하고 시각을 보고한다.
     fn present(&mut self, vsync: bool) -> FrameTiming;
-    /// 프레임 시각 정보의 등급 (백엔드마다 다름).
-    fn timing_grade(&self) -> &'static str;
 }
 
 pub struct D3D11Renderer {
@@ -200,10 +198,6 @@ impl Renderer for D3D11Renderer {
         }
         self.pending = FrameTiming::default();
         t
-    }
-
-    fn timing_grade(&self) -> &'static str {
-        "dxgi_stats"
     }
 }
 

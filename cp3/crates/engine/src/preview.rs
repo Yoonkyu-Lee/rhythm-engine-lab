@@ -103,8 +103,6 @@ pub struct Store {
     pub plan: Arc<Plan>,
     /// 남은 작업 (슬롯 번호), 앞에서부터 꺼낸다
     queue: Arc<Mutex<Vec<u32>>>,
-    /// 부분 디코딩 작업 (전체 작업보다 먼저)
-    parts: Arc<Mutex<Vec<(u32, i64, i64)>>>,
     /// 이 저장소의 세대 (요청 당시 값). 전역 세대(`current`)와 다르면 작업을 멈춘다.
     gen: u64,
     current: Arc<AtomicU64>,
@@ -124,6 +122,7 @@ impl Store {
     pub fn start(plan: Plan, t0: i64, threads: usize, current: Arc<AtomicU64>, gen: u64) -> Store {
         let jobs: Vec<u32> = plan.jobs.iter().map(|j| j.slot).collect();
         let q = order(&plan.compiled, &jobs, t0);
+        // 부분 디코딩 작업 (전체 작업보다 먼저, 작업자끼리 나눠 꺼냄)
         let parts = Arc::new(Mutex::new(partial_jobs(&plan, t0)));
         let plan = Arc::new(plan);
         let queue = Arc::new(Mutex::new(q));
@@ -219,7 +218,7 @@ impl Store {
                 })
                 .collect()
         };
-        Store { plan, queue, parts, gen, current, workers, done, failed, errors }
+        Store { plan, queue, gen, current, workers, done, failed, errors }
     }
 
     pub fn compiled(&self) -> Arc<Compiled> {

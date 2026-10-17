@@ -37,31 +37,6 @@ pub struct BotLog {
     pub q_sent: i64,
 }
 
-/// 프레임 구동 프로필이 공개하는 자기 시계 (마지막 프레임의 QPC와 그때의 곡 시각 ns). 쓰는 쪽: t → q 순서, 읽는 쪽: q·t·q 확인.
-#[derive(Default)]
-pub struct ProfileClock {
-    pub q: std::sync::atomic::AtomicI64,
-    pub t: std::sync::atomic::AtomicI64,
-}
-
-impl ProfileClock {
-    pub fn publish(&self, q: i64, t_ns: i64) {
-        self.q.store(0, Ordering::Release);
-        self.t.store(t_ns, Ordering::Release);
-        self.q.store(q, Ordering::Release);
-    }
-    pub fn read(&self) -> Option<(i64, i64)> {
-        for _ in 0..4 {
-            let q = self.q.load(Ordering::Acquire);
-            let t = self.t.load(Ordering::Acquire);
-            if q != 0 && q == self.q.load(Ordering::Acquire) {
-                return Some((q, t));
-            }
-        }
-        None
-    }
-}
-
 pub struct BotCfg {
     pub origin: i64,
     pub rate: u32,
@@ -74,7 +49,6 @@ pub struct BotCfg {
     /// 사람 흉내: 시계 점프를 알아채기까지 걸리는 시간 (ns, 0이면 즉시 따름).
     pub adapt_ns: i64,
     /// 그 게임의 시계로 친다 (프레임 구동 프로필).
-    pub follow: Option<Arc<ProfileClock>>,
     /// 오토 켜짐 (누름 순간에 본다).
     pub enabled: Arc<AtomicBool>,
     /// 직접 입력 (`--bot-direct`): OS 입력(SendInput) 대신 입력 링에 넣고 watermark를 올린다. 앞 창이 더 높은 권한이면
@@ -137,10 +111,6 @@ fn send(vk: u16, down: bool) -> bool {
 
 /// 청취 곡 시각(ns) → 그 순간의 QPC 틱 (시계가 없으면 None).
 fn qpc_for_song(view: &mut View, clock: &SharedClock, t_ns: i64, cfg: &BotCfg) -> Option<i64> {
-    if let Some(pc) = cfg.follow.as_ref() {
-        let (q0, t0) = pc.read()?;
-        return Some(q0 + ((t_ns - t0) as i128 * qpc::frequency() as i128 / 1_000_000_000) as i64);
-    }
     let s = view.get(clock);
     if !s.valid {
         return None;

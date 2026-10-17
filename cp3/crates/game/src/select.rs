@@ -161,6 +161,9 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 DispatchMessageW(&msg);
             }
         }
+        if game::take_close() {
+            quit.store(true, Ordering::Relaxed);
+        }
         if let Some((v, nl)) = pending_lib.take() {
             *track_cache.lock().unwrap() = (usize::MAX, SlotCache::new());
             (entries, lib, sel, chart) = (v, nl, 0, 0);
@@ -459,6 +462,8 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(Duration::from_millis(1));
     }
     reset(&mut preview, &mut loading, &gen);
+    drop(rend);
+    game::close_window(hwnd);
     if !firsts.is_empty() {
         let mut v = firsts.clone();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());

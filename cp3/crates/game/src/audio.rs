@@ -29,7 +29,6 @@ use synchronizer::qpc;
 use synchronizer::shared_clock::{obs_ring, spawn_clock_thread, ClockSnapshot, ObsProducer, SharedClock};
 use synchronizer::timeline::ContentSkip;
 
-use crate::bot::ProfileClock;
 use synchronizer::wasapi::{self, IAudioClock, IAudioRenderClient, Mode, Stream};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Threading::WaitForSingleObject;
@@ -89,9 +88,6 @@ pub struct KeyReq {
 }
 
 impl KeyReq {
-    pub fn note(frame: i64, lane: u16, note: u32) -> KeyReq {
-        KeyReq { frame, press_ns: NO_T, lane, note, sound: u32::MAX, gain: 1.0, player: true, t: NO_T }
-    }
     /// 누른 순간의 청취 곡 시각 기준 노트 소리 (판정 스레드).
     pub fn note_at(press_ns: i64, lane: u16, note: u32) -> KeyReq {
         KeyReq { frame: 0, press_ns, lane, note, sound: u32::MAX, gain: 1.0, player: true, t: NO_T }
@@ -99,10 +95,6 @@ impl KeyReq {
     /// 누른 순간의 청취 곡 시각 기준 소리 하나 (빈 누름의 빈 레인 소리).
     pub fn sound_at(press_ns: i64, sound: u32, gain: f32) -> KeyReq {
         KeyReq { frame: 0, press_ns, lane: 0, note: 0, sound, gain, player: true, t: press_ns }
-    }
-    /// 곡 시각 `t`(ns)의 자동재생 소리.
-    pub fn sound_t(frame: i64, sound: u32, gain: f32, player: bool, t: i64) -> KeyReq {
-        KeyReq { frame, press_ns: NO_T, lane: 0, note: 0, sound, gain, player, t }
     }
 }
 
@@ -129,10 +121,9 @@ pub struct SyncSample {
     pub new_ms: f32,
 }
 
-/// 실시간 싱크 표본을 보낼 곳과, 프레임 구동 프로필이면 그 프로필의 시계.
+/// 실시간 싱크 표본을 보낼 곳.
 pub struct LiveSync {
     pub tx: Producer<SyncSample>,
-    pub pclock: Option<Arc<ProfileClock>>,
 }
 
 /// 오디오 블록 하나의 기록.
@@ -520,17 +511,8 @@ impl<'a> Core<'a> {
             }
         }
         let Some(live) = self.live.as_mut() else { return };
-        s.chart_ms = match &live.pclock {
-            None => 0.0,
-            Some(pc) => match pc.read() {
-                // 프로필 시계를 이 블록이 요청을 꺼낸 순간으로 늘인다. 마지막 공개가 50 ms보다 오래됐으면(게임 루프 정지) 모른다
-                Some((q0, t0)) if now - q0 <= qpc::frequency() / 20 => {
-                    let t_now = t0 as f64 + (now - q0) as f64 * 1e9 / qpc::frequency() as f64;
-                    ((tl as f64 - (origin_m as f64 + t_now * rate / 1e9)) * 1e3 / rate) as f32
-                }
-                _ => f32::NAN,
-            },
-        };
+        // 채보 시계 = 기록 시계 (우리 방식은 따로 시계가 없다 — CP2 프레임 구동 프로필의 시계는 가져오지 않음)
+        s.chart_ms = 0.0;
         if keys.is_empty() {
             let _ = live.tx.push(s);
         } else {
