@@ -5,6 +5,9 @@ use num_integer::Integer;
 use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 
+#[allow(unused_imports)]
+use num_integer::Integer as _;
+
 pub type Q = BigRational;
 
 pub fn int(n: i64) -> Q {
@@ -70,26 +73,71 @@ pub fn sec_to_ns(sec: &Q) -> Result<i64, String> {
     round_half_even(&(sec * int(1_000_000_000)))
 }
 
-/// 가장 가까운 f64 (IEEE 짝수 반올림에 가깝게: 분자·분모를 f64로 나누되 큰 수는 비트 정렬 후 나눗셈).
-pub fn to_f64(x: &Q) -> f64 {
-    // 분자·분모가 f64로 정확하면 한 번의 나눗셈이 정확한 반올림이다.
-    if let (Some(n), Some(d)) = (x.numer().to_i64(), x.denom().to_i64()) {
-        if n.unsigned_abs() < (1u64 << 53) && (d as u64) < (1u64 << 53) {
-            return n as f64 / d as f64;
-        }
+/// 유리수 → IEEE 이진 부동소수점 비트, 한 번의 짝수 반올림 (리뷰 3-1 #7).
+/// `mant` = 저장 가수 비트 수(f64 52, f32 23), `ebits` = 지수 비트 수(11, 8). 범위를 넘으면 None.
+fn to_ieee_bits(x: &Q, mant: u32, ebits: u32) -> Option<u64> {
+    let bias: i64 = (1 << (ebits - 1)) - 1;
+    let emin = 1 - bias; // 정규 수의 최소 지수
+    let emax = bias;
+    if x.is_zero() {
+        return Some(0);
     }
-    // 큰 수: 120비트 정밀도로 줄인 뒤 나눈다 (오차는 f64 반올림보다 훨씬 작음)
-    let shift = x.numer().bits().max(x.denom().bits()) as i64 - 120;
-    let (n, d) = if shift > 0 {
-        (x.numer() >> shift as usize, x.denom() >> shift as usize)
-    } else {
-        (x.numer().clone(), x.denom().clone())
+    let neg = x.is_negative();
+    let n = x.numer().abs();
+    let d = x.denom().clone();
+    // e = floor(log2(n/d))
+    let mut e = n.bits() as i64 - d.bits() as i64;
+    let ge = |e: i64| -> bool {
+        // n/d >= 2^e ?
+        if e >= 0 { n >= (&d << e as usize) } else { (&n << (-e) as usize) >= d }
     };
-    n.to_f64().unwrap_or(f64::NAN) / d.to_f64().unwrap_or(f64::NAN)
+    if !ge(e) {
+        e -= 1;
+    }
+    // 가수 비트 위치: 정규 수는 e, 비정규 수는 emin
+    let scale_exp = e.max(emin) - mant as i64; // 값 = m × 2^scale_exp
+    let (num, den) = if scale_exp >= 0 { (n.clone(), &d << scale_exp as usize) } else { (&n << (-scale_exp) as usize, d.clone()) };
+    let (mut m, r) = num.div_rem(&den);
+    let twice = &r * 2u32;
+    if twice > den || (twice == den && m.is_odd()) {
+        m += BigInt::one();
+    }
+    let mut m = m.to_u64()?;
+    let mut exp = e.max(emin);
+    if m >> (mant + 1) != 0 {
+        // 반올림으로 자리 올림
+        m >>= 1;
+        exp += 1;
+    }
+    let bits = if m >> mant == 0 {
+        // 비정규 수
+        m
+    } else {
+        if exp > emax {
+            return None;
+        }
+        (((exp + bias) as u64) << mant) | (m & ((1u64 << mant) - 1))
+    };
+    Some(bits | if neg { 1u64 << (mant + ebits) } else { 0 })
+}
+
+/// 가장 가까운 f64 (짝수 반올림 한 번). 범위 밖이면 Err.
+pub fn to_f64_checked(x: &Q) -> Result<f64, String> {
+    to_ieee_bits(x, 52, 11).map(f64::from_bits).ok_or_else(|| format!("f64 범위 밖: {x}"))
+}
+
+/// 가장 가까운 f32 (f64를 거치지 않고 짝수 반올림 한 번). 범위 밖이면 Err.
+pub fn to_f32_checked(x: &Q) -> Result<f32, String> {
+    to_ieee_bits(x, 23, 8).map(|b| f32::from_bits(b as u32)).ok_or_else(|| format!("f32 범위 밖: {x}"))
+}
+
+/// 범위가 이미 검사된 값용 (범위 밖이면 무한대).
+pub fn to_f64(x: &Q) -> f64 {
+    to_f64_checked(x).unwrap_or(if x.is_negative() { f64::NEG_INFINITY } else { f64::INFINITY })
 }
 
 pub fn to_f32(x: &Q) -> f32 {
-    to_f64(x) as f32
+    to_f32_checked(x).unwrap_or(if x.is_negative() { f32::NEG_INFINITY } else { f32::INFINITY })
 }
 
 pub fn is_neg(x: &Q) -> bool {
@@ -125,5 +173,26 @@ mod tests {
         assert_eq!(round_half_even(&frac(7, 3)).unwrap(), 2);
         assert_eq!(round_half_even(&frac(-7, 3)).unwrap(), -2);
         assert_eq!(sec_to_ns(&frac(13, 3)).unwrap(), 4_333_333_333);
+    }
+
+    #[test]
+    fn float_conversion_single_rounding() {
+        let p = |e: i64| if e >= 0 { Q::from_integer(BigInt::from(1) << e as usize) } else { Q::new(BigInt::from(1), BigInt::from(1) << (-e) as usize) };
+        assert_eq!(to_f64_checked(&p(120)).unwrap(), 2f64.powi(120));
+        assert_eq!(to_f64_checked(&p(-120)).unwrap(), 2f64.powi(-120));
+        assert_eq!(to_f32_checked(&p(120)).unwrap(), 2f32.powi(120));
+        // 1 + 2^-24 + 2^-80 → f32 1.0000001192092896 (f64를 거치면 1.0이 되는 이중 반올림 사례)
+        let x = int(1) + p(-24) + p(-80);
+        assert_eq!(to_f32_checked(&x).unwrap(), 1.000_000_119_209_289_6_f32);
+        assert_eq!(to_f64_checked(&frac(1, 3)).unwrap(), 1.0 / 3.0);
+        assert_eq!(to_f32_checked(&frac(1, 3)).unwrap(), 1.0f32 / 3.0);
+        assert_eq!(to_f64_checked(&frac(-7, 2)).unwrap(), -3.5);
+        assert_eq!(to_f32_checked(&frac(21, 20)).unwrap(), 1.05f32);
+        assert_eq!(to_f64_checked(&parse("179.94").unwrap()).unwrap(), 179.94);
+        assert!(to_f32_checked(&p(200)).is_err());
+        // 비정규 수와 0
+        assert_eq!(to_f64_checked(&p(-1074)).unwrap(), f64::from_bits(1));
+        assert_eq!(to_f64_checked(&p(-1076)).unwrap(), 0.0);
+        assert_eq!(to_f32_checked(&p(-149)).unwrap(), f32::from_bits(1));
     }
 }

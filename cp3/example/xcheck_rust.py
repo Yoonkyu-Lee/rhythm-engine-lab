@@ -32,7 +32,7 @@ for cid in sorted(py):
     pl = sorted((x["lane"], ce.ns(x["t"]), x["sound"]) for x in p["lane_sounds"])
     rl = sorted((a[0], int(a[1]), a[2]) for a in r["lsnd"])
     pb = sorted(ce.ns(t) for t in p["bars"]); rb = sorted(int(a[0]) for a in r["bar"])
-    psc = [(ce.ns(t), float(pp)) for t, pp, s in p["scroll"]]; rsc = [(int(a[0]), float(a[1])) for a in r["scroll"]]
+    psc = [(ce.ns(t), float(pp), float(s)) for t, pp, s in p["scroll"]]; rsc = [(int(a[0]), float(a[1]), float(a[2])) for a in r["scroll"]]  # 위치와 속도 모두
     ok = [ps == rs, pn == rn, pl == rl, pb == rb, sorted(psc) == sorted(rsc)]
     print(f"{cid:12} 소리 시작 {len(rs):3} {'같음' if ok[0] else '다름'} | 노트 {len(rn)} {'같음' if ok[1] else '다름'} | 빈 레인 소리 {'같음' if ok[2] else '다름'} | 마디선 {'같음' if ok[3] else '다름'} | 스크롤 {'같음' if ok[4] else '다름'}")
     if not all(ok):

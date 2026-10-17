@@ -456,8 +456,10 @@ pub fn write_bundle(t: &TrackOut) -> Vec<u8> {
     b[12..16].copy_from_slice(&(HEADER as u32).to_le_bytes());
     b[16..32].copy_from_slice(&t.id);
     b[32..36].copy_from_slice(&t.revision.to_le_bytes());
-    let comp = format!("trackc {}", env!("CARGO_PKG_VERSION"));
-    b[40..40 + comp.len()].copy_from_slice(comp.as_bytes());
+    let comp = compiler_id();
+    let cb = comp.as_bytes();
+    b[40..40 + cb.len().min(32)].copy_from_slice(&cb[..cb.len().min(32)]);
+    b[104..128].copy_from_slice(&t.source_key); // 컴파일 캐시 열쇠
     for (k, (kind, off, len, h)) in index.iter().enumerate() {
         let o = HEADER + INDEX_ENTRY * k;
         b[o..o + 4].copy_from_slice(&kind.to_le_bytes());
@@ -513,6 +515,16 @@ impl<'a> R<'a> {
     pub fn bytes(&mut self, n: usize) -> Result<&'a [u8], String> {
         self.take(n)
     }
+    pub fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.p)
+    }
+    /// 개수 n × 최소 크기가 남은 바이트 안인지 (할당 전에 검사, 리뷰 3-1 #2)
+    pub fn need(&self, n: usize, each: usize) -> Result<(), String> {
+        match n.checked_mul(each) {
+            Some(x) if x <= self.remaining() => Ok(()),
+            _ => Err(format!("개수 {n}가 남은 바이트보다 많음 (손상)")),
+        }
+    }
     pub fn str(&mut self) -> Result<String, String> {
         let n = self.u32()? as usize;
         String::from_utf8(self.take(n)?.to_vec()).map_err(|_| "UTF-8 아님".to_string())
@@ -540,6 +552,9 @@ impl Bundle {
         let minor = u16::from_le_bytes([bytes[6], bytes[7]]);
         let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
         let hsize = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        if hsize < HEADER || n.checked_mul(INDEX_ENTRY).and_then(|x| x.checked_add(hsize)).map(|x| x > bytes.len()).unwrap_or(true) {
+            return Err("구역 색인이 파일 밖 (손상)".into());
+        }
         let mut zeroed = bytes.clone();
         zeroed[72..104].fill(0);
         if blake3::hash(&zeroed).as_bytes() != &bytes[72..104] {
@@ -552,7 +567,7 @@ impl Bundle {
             let kind = u32::from_le_bytes(e[0..4].try_into().unwrap());
             let off = u64::from_le_bytes(e[8..16].try_into().unwrap()) as usize;
             let len = u64::from_le_bytes(e[16..24].try_into().unwrap()) as usize;
-            let body = bytes.get(off..off + len).ok_or("구역이 파일 밖")?;
+            let body = off.checked_add(len).and_then(|e| bytes.get(off..e)).ok_or("구역이 파일 밖")?;
             if blake3::hash(body).as_bytes() != &e[24..56] {
                 return Err(format!("구역 {k} (kind {kind}) 해시가 맞지 않음"));
             }
@@ -574,8 +589,10 @@ pub fn read_sounds(b: &Bundle) -> Result<Vec<([u8; 32], Packed)>, String> {
     let mut r = R::new(b.section(K_SOUNDS, 0).ok_or("SOUNDS 없음")?);
     let _decoders = r.str()?;
     let n = r.u32()? as usize;
+    r.need(n, 72)?;
     let mut tr = R::new(b.section(K_CODEC_TABLES, 0).ok_or("CODEC_TABLES 없음")?);
     let nt = tr.u32()? as usize;
+    tr.need(nt, 4)?;
     let mut tables = Vec::new();
     for _ in 0..nt {
         let l = tr.u32()? as usize;
@@ -593,6 +610,9 @@ pub fn read_sounds(b: &Bundle) -> Result<Vec<([u8; 32], Packed)>, String> {
             c => return Err(format!("알 수 없는 코덱 {c}")),
         };
         let channels = r.u8()?;
+        if !(1..=8).contains(&channels) {
+            return Err(format!("채널 수 {channels}"));
+        }
         let int16 = r.u8()? != 0;
         r.u8()?;
         let rate = r.u32()?;
@@ -611,7 +631,7 @@ pub fn read_sounds(b: &Bundle) -> Result<Vec<([u8; 32], Packed)>, String> {
                 skip_front,
                 int16,
                 codec_table: tables.get(table).ok_or("코덱 표 번호 범위 밖")?.clone(),
-                data: data.get(off..off + len).ok_or("소리 데이터 범위 밖")?.to_vec(),
+                data: off.checked_add(len).and_then(|e| data.get(off..e)).ok_or("소리 데이터 범위 밖")?.to_vec(),
             },
         ));
     }
@@ -635,6 +655,7 @@ pub struct ChartEntry {
 pub fn read_charts(b: &Bundle) -> Result<Vec<ChartEntry>, String> {
     let mut r = R::new(b.section(K_CHARTS, 0).ok_or("CHARTS 없음")?);
     let n = r.u32()?;
+    r.need(n as usize, 4 * 3 + 32 + 4 + 4 + 8 * 3 + 4)?;
     let mut out = Vec::new();
     for _ in 0..n {
         let id = r.str()?;
@@ -647,6 +668,7 @@ pub fn read_charts(b: &Bundle) -> Result<Vec<ChartEntry>, String> {
         let scale = (r.i64()?, r.i64()?);
         let shift = r.i64()?;
         let m = r.u32()? as usize;
+        r.need(m, 4)?;
         let mut l2t = Vec::with_capacity(m);
         for _ in 0..m {
             l2t.push(r.u32()?);
@@ -672,14 +694,24 @@ pub fn decode_chart(sec: &[u8]) -> Result<ChartSec, String> {
     let long_note = h.u8()?;
     let empty_lane = h.u8()?;
     let voice_budget = h.u32()?;
-    if ntab < TABLES {
-        return Err("표가 모자람".into());
+    if ntab < TABLES || CHART_HEADER + 12 * ntab > sec.len() {
+        return Err("표 디렉터리가 모자라거나 구역 밖".into());
     }
     let mut dir = Vec::new();
     let mut d = R::new(sec);
     d.p = CHART_HEADER;
-    for _ in 0..ntab {
-        dir.push((d.u32()? as usize, d.u32()? as usize, d.u32()? as usize));
+    for t in 0..ntab {
+        let (off, n, st) = (d.u32()? as usize, d.u32()? as usize, d.u32()? as usize);
+        if t < TABLES {
+            if st < STRIDES[t] as usize {
+                return Err(format!("표 {t}: stride {st} < {}", STRIDES[t]));
+            }
+            match n.checked_mul(st).and_then(|x| x.checked_add(off)) {
+                Some(e) if e <= sec.len() => {}
+                _ => return Err(format!("표 {t}가 구역 밖 (손상)")),
+            }
+        }
+        dir.push((off, n, st));
     }
     let rec = |t: usize, i: usize| -> Result<R, String> {
         let (off, n, st) = dir[t];
@@ -793,5 +825,94 @@ pub fn decode_chart(sec: &[u8]) -> Result<ChartSec, String> {
         let (s, n) = (r.u32()? as usize, r.u32()? as usize);
         conds.push(terms.get(s..s + n).ok_or("조건 항 범위 밖")?.to_vec());
     }
-    Ok(ChartSec { shift, end, reference_scroll, long_note, empty_lane, voice_budget, sounds, lanes, groups, auto, note_sounds, scroll, bars, variants, conds })
+    let c = ChartSec { shift, end, reference_scroll, long_note, empty_lane, voice_budget, sounds, lanes, groups, auto, note_sounds, scroll, bars, variants, conds };
+    validate_chart(&c)?;
+    Ok(c)
+}
+
+/// 차분 구역의 의미 검사 (리뷰 3-1 #2): 참조 번호, enum, 레인 비트, 유한 실수, 정렬. 읽는 쪽(엔진·도구)은 이것을 통과한 것만 쓴다.
+pub fn validate_chart(c: &ChartSec) -> Result<(), String> {
+    let ns = c.sounds.len() as u32;
+    let nc = c.conds.len() as u32;
+    let fin = |x: f64, what: &str| if x.is_finite() { Ok(()) } else { Err(format!("{what}가 유한하지 않음")) };
+    let gain_ok = |g: f32| g.is_finite() && g >= 0.0;
+    if c.lanes.is_empty() || c.lanes.len() > 64 || c.long_note > 2 || c.empty_lane > 2 {
+        return Err("레인 수·규칙 값 범위 밖".into());
+    }
+    fin(c.reference_scroll, "reference_scroll")?;
+    if c.conds.is_empty() || !c.conds[0].is_empty() {
+        return Err("조건 0번은 빈 조건이어야 함".into());
+    }
+    for cd in &c.conds {
+        for &(v, ch) in cd {
+            let nv = c.variants.get(v as usize).ok_or("조건이 없는 변형을 가리킴")?;
+            if ch as usize >= nv.1.len() {
+                return Err("조건이 없는 선택지를 가리킴".into());
+            }
+        }
+    }
+    if c.variants.iter().any(|v| v.1.is_empty() || v.1.iter().any(|w| *w == 0)) {
+        return Err("변형 가중치 오류".into());
+    }
+    let nchoke = c.sounds.iter().filter(|s| s.choke > 0).map(|s| s.choke).max().unwrap_or(0);
+    for s in &c.sounds {
+        if !gain_ok(s.gain) || s.retrigger > 1 || s.choke > nchoke {
+            return Err("차분 안 소리 값 범위 밖".into());
+        }
+    }
+    let mut prev = i64::MIN;
+    for a in &c.auto {
+        if a.1 >= ns || a.3 >= nc || !gain_ok(a.2) || a.0 < prev {
+            return Err("자동재생 레코드 오류 (참조·이득·정렬)".into());
+        }
+        prev = a.0;
+    }
+    for s in &c.note_sounds {
+        if s.1 >= ns || !gain_ok(s.2) {
+            return Err("노트 소리 레코드 오류".into());
+        }
+    }
+    for l in &c.lanes {
+        if l.role > 4 && l.role != 255 {
+            return Err("레인 역할 값 범위 밖".into());
+        }
+        let mut prev = i64::MIN;
+        for n in &l.notes {
+            let end = n.ns_start as usize + n.ns_len as usize;
+            if n.kind > 2 || n.cond >= nc || n.end < n.t || n.t < prev || end > c.note_sounds.len() || (n.kind == 1) != (n.end > n.t) {
+                return Err(format!("노트 레코드 오류 (레인 {})", l.id));
+            }
+            if n.damage < -1 || n.damage > 100_000 || (n.damage != -1 && n.kind != 2) {
+                return Err("지뢰 damage 범위 밖".into());
+            }
+            prev = n.t;
+        }
+        let mut prev = i64::MIN;
+        for x in &l.lsnds {
+            if x.1 >= ns || x.2 >= nc || x.0 < prev {
+                return Err("빈 레인 소리 레코드 오류".into());
+            }
+            prev = x.0;
+        }
+    }
+    let lane_mask = if c.lanes.len() == 64 { u64::MAX } else { (1u64 << c.lanes.len()) - 1 };
+    if c.groups.iter().any(|g| g.1 & !lane_mask != 0) {
+        return Err("묶음이 없는 레인을 가리킴".into());
+    }
+    let mut prev = i64::MIN;
+    for s in &c.scroll {
+        fin(s.1, "스크롤 위치")?;
+        fin(s.2, "스크롤 속도")?;
+        if s.0 < prev {
+            return Err("스크롤 시간순 아님".into());
+        }
+        prev = s.0;
+    }
+    if c.scroll.is_empty() {
+        return Err("스크롤 점 없음".into());
+    }
+    if c.bars.windows(2).any(|w| w[1] < w[0]) {
+        return Err("마디선 시간순 아님".into());
+    }
+    Ok(())
 }

@@ -72,9 +72,10 @@ impl Timing {
                 Some((p, _)) if p.is_zero() => {}
                 _ => return Err("unit이 beat·tick이면 tempo는 위치 0에서 시작해야 함 (G10)".into()),
             }
-            if !tempo[0].1.is_positive() {
-                return Err("첫 tempo는 양수여야 함".into());
-            }
+        }
+        // 모든 bpm은 양수 (리뷰 3-1 #5). BMS의 0·음수 BPM은 컨버터가 STOP·[scroll]로 옮긴다.
+        if let Some((_, b)) = tempo.iter().find(|(_, b)| !b.is_positive()) {
+            return Err(format!("bpm은 양수여야 함: {b} (0·음수 BPM은 STOP·[scroll]로 표현)"));
         }
         let mut stops = Vec::new();
         for s in &t.stops {
@@ -88,6 +89,15 @@ impl Timing {
             stops.push((tm.beat(&s.at)?, b));
         }
         stops.sort_by(|a, b| a.0.cmp(&b.0));
+        // 같은 위치의 정지는 합친다 (리뷰 3-1 #6)
+        let mut merged: Vec<(Q, Q)> = Vec::new();
+        for (b, d) in stops {
+            match merged.last_mut() {
+                Some(l) if l.0 == b => l.1 += d,
+                _ => merged.push((b, d)),
+            }
+        }
+        let stops = merged;
         tm.tempo = tempo;
         tm.stops = stops;
         Ok(tm)
@@ -155,9 +165,6 @@ impl Timing {
             if b <= tb {
                 break;
             }
-            if !bpm.is_positive() {
-                continue; // bpm ≤ 0은 시간 계산에 쓰지 않음 (명세 3-1)
-            }
             let end = self.tempo.get(i + 1).map(|x| &x.0);
             let hi = match end {
                 Some(e) if e < b => e.clone(),
@@ -195,9 +202,12 @@ impl Timing {
         match self.unit {
             Unit::Ms => Ok((parse(base)? + parse(r)?) / int(1000)),
             Unit::Tick => {
-                let a: i64 = base.trim().parse().map_err(|_| format!("tick은 정수: {base:?}"))?;
-                let b: i64 = r.trim().parse().map_err(|_| format!("tick은 정수: {rel:?}"))?;
-                Ok(self.sec_of_beat(&(int(a + b) / int(self.tpb as i64))))
+                let a = parse(base)?;
+                let b = parse(r)?;
+                if !a.is_integer() || !b.is_integer() {
+                    return Err(format!("tick은 정수: {base:?} {rel:?}"));
+                }
+                Ok(self.sec_of_beat(&((a + b) / int(self.tpb as i64)))) // 큰 정수에서도 넘치지 않게 유리수로 더함 (리뷰 3-1 #9)
             }
             Unit::Beat => Ok(self.sec_of_beat(&(self.beat(base)? + parse(r)?))),
         }

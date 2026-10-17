@@ -4,7 +4,7 @@
 //! (반올림된 ns를 다시 나누지 않는다).
 
 use crate::audio::{self, Packed};
-use crate::rational::{self, int, parse, sec_to_ns, to_f32, to_f64, Q};
+use crate::rational::{self, int, parse, sec_to_ns, to_f32, to_f32_checked, to_f64_checked, Q};
 use crate::source::*;
 use crate::timing::{Timing, Unit};
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -12,8 +12,62 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 pub const FORMAT_MAJOR: u16 = 1;
-pub const FORMAT_MINOR: u16 = 3;
+pub const FORMAT_MINOR: u16 = 4;
 pub const BIN_NS: i64 = 250_000_000;
+/// 자원 상한 (악성·손상 입력에서 과대 할당 방지, 리뷰 3-1 #9)
+pub const MAX_CHART_NS: i64 = 24 * 3600 * 1_000_000_000;
+pub const MAX_BARS: usize = 1_000_000;
+
+/// 스크롤 점들 (시각, 위치?, 속도 박/초)을 정지 구간과 함께 시간순으로 처리한다.
+/// 위치가 없는 점은 앞 기준점에서 **이동 시간**(정지 구간 제외)만큼 적분한다. 정지 시작에 (위치, 0), 끝에 (같은 위치, 그때의 속도).
+/// 같은 시각의 항목 순서: 정지 끝 → 점 → 정지 시작. 같은 시각에 여러 점이 나오면 마지막 것만 남긴다(위치는 같다).
+fn integrate_scroll(pts: &[(Q, Option<Q>, Q)], stops: &[(Q, Q)]) -> Vec<(Q, Q, Q)> {
+    enum It<'a> {
+        End,
+        Pt(&'a Option<Q>, &'a Q),
+        Start,
+    }
+    let mut items: Vec<(Q, u8, It)> = Vec::new();
+    for (t, pos, v) in pts {
+        items.push((t.clone(), 1, It::Pt(pos, v)));
+    }
+    for (t0, d) in stops {
+        items.push((t0.clone(), 2, It::Start));
+        items.push((t0 + d, 0, It::End));
+    }
+    items.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    let mut out: Vec<(Q, Q, Q)> = Vec::new();
+    let (mut t_ref, mut pos_ref, mut v) = (Q::zero(), Q::zero(), Q::zero());
+    let mut in_stop = false;
+    let emit = |out: &mut Vec<(Q, Q, Q)>, t: Q, p: Q, s: Q| {
+        if out.last().map(|l| l.0 == t).unwrap_or(false) {
+            out.pop();
+        }
+        out.push((t, p, s));
+    };
+    for (t, _, it) in items {
+        let here = if in_stop { pos_ref.clone() } else { &pos_ref + &v * (&t - &t_ref) };
+        match it {
+            It::Pt(pos, nv) => {
+                let p = pos.clone().unwrap_or(here);
+                v = nv.clone();
+                emit(&mut out, t.clone(), p.clone(), if in_stop { Q::zero() } else { v.clone() });
+                pos_ref = p;
+            }
+            It::Start => {
+                emit(&mut out, t.clone(), here.clone(), Q::zero());
+                pos_ref = here;
+                in_stop = true;
+            }
+            It::End => {
+                in_stop = false;
+                emit(&mut out, t.clone(), pos_ref.clone(), v.clone());
+            }
+        }
+        t_ref = t;
+    }
+    out
+}
 
 #[derive(Clone, Debug)]
 pub struct LayoutOut {
@@ -122,6 +176,8 @@ pub struct MediaOut {
 
 #[derive(Clone, Debug)]
 pub struct TrackOut {
+    /// 컴파일 캐시 열쇠 (입력 전체 + 컴파일러 식별자, 묶음 머리 104..128)
+    pub source_key: [u8; 24],
     pub id: [u8; 16],
     pub revision: u32,
     pub info: InfoOut,
@@ -164,10 +220,16 @@ fn role_code(r: &str) -> Result<u8, String> {
 }
 
 fn parse_uuid(s: &str) -> Result<[u8; 16], String> {
-    let hex: String = s.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 || s.len() != 36 {
-        return Err(format!("Track id는 UUID 형식: {s}"));
+    // ASCII 16진수 32자 + 하이픈 4개(8·13·18·23번째), 버전 7, RFC 변형 (리뷰 3-1 #3)
+    let b = s.as_bytes();
+    let ok = b.len() == 36
+        && b.iter().enumerate().all(|(i, &c)| if [8, 13, 18, 23].contains(&i) { c == b'-' } else { c.is_ascii_hexdigit() })
+        && b[14] == b'7'
+        && matches!(b[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b');
+    if !ok {
+        return Err(format!("Track id는 UUIDv7 형식이어야 함: {s}"));
     }
+    let hex: String = s.chars().filter(|c| *c != '-').collect();
     let mut out = [0u8; 16];
     for i in 0..16 {
         out[i] = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| format!("Track id는 UUID 형식: {s}"))?;
@@ -185,8 +247,54 @@ fn uniq<'a>(what: &str, it: impl Iterator<Item = &'a str>) -> Result<(), String>
     Ok(())
 }
 
+/// 컴파일러 식별자 (캐시 열쇠와 묶음 머리에 들어감).
+pub fn compiler_id() -> String {
+    format!("trackc {} fmt {FORMAT_MAJOR}.{FORMAT_MINOR}", env!("CARGO_PKG_VERSION"))
+}
+
+/// 컴파일 캐시 열쇠 = BLAKE3("TRKC" ‖ 컴파일러 식별자 ‖ 디코더 식별자 ‖ 입력 파일마다 (경로, 길이, 바이트))의 앞 24바이트.
+/// 입력 = track.toml, charts/*.toml(이름순), report.md(있으면), track.toml이 참조하는 소리 파일 (리뷰 3-1 #12).
+pub fn source_key(dir: &Path) -> Result<[u8; 24], String> {
+    let mut h = blake3::Hasher::new();
+    h.update(b"TRKC");
+    for s in [compiler_id(), crate::pack::DECODERS.to_string()] {
+        h.update(&(s.len() as u64).to_le_bytes());
+        h.update(s.as_bytes());
+    }
+    let mut add = |rel: &str, bytes: &[u8]| {
+        h.update(&(rel.len() as u64).to_le_bytes());
+        h.update(rel.as_bytes());
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    };
+    let tt = std::fs::read(dir.join("track.toml")).map_err(|e| format!("track.toml: {e}"))?;
+    add("track.toml", &tt);
+    let mut files: Vec<_> = std::fs::read_dir(dir.join("charts"))
+        .map_err(|e| format!("charts/: {e}"))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "toml").unwrap_or(false))
+        .collect();
+    files.sort();
+    for p in &files {
+        let rel = format!("charts/{}", p.file_name().unwrap().to_string_lossy());
+        add(&rel, &std::fs::read(p).map_err(|e| e.to_string())?);
+    }
+    if let Ok(r) = std::fs::read(dir.join("report.md")) {
+        add("report.md", &r);
+    }
+    let tr: TrackToml = toml::from_str(std::str::from_utf8(&tt).map_err(|e| e.to_string())?).map_err(|e| format!("track.toml: {e}"))?;
+    for s in &tr.sound {
+        add(&s.file, &std::fs::read(dir.join(&s.file)).map_err(|e| format!("소리 {}: {e}", s.file))?);
+    }
+    let mut k = [0u8; 24];
+    k.copy_from_slice(&h.finalize().as_bytes()[..24]);
+    Ok(k)
+}
+
 /// 작성 형식 폴더 → 컴파일된 Track.
 pub fn compile_dir(dir: &Path) -> Result<TrackOut, String> {
+    let source_key = source_key(dir)?;
     let track_text = std::fs::read_to_string(dir.join("track.toml")).map_err(|e| format!("track.toml: {e}"))?;
     let tr: TrackToml = toml::from_str(&track_text).map_err(|e| format!("track.toml: {e}"))?;
     match tr.format.split_once('.') {
@@ -232,7 +340,7 @@ pub fn compile_dir(dir: &Path) -> Result<TrackOut, String> {
         if packed.frames == 0 {
             return Err(format!("소리 {}: 샘플 수 0", s.id));
         }
-        let hash = audio::sound_hash(packed.rate, packed.channels, packed.frames, &pcm);
+        let hash = audio::content_hash(&packed, &pcm);
         let start = match &s.start {
             None => 0,
             Some(x) => {
@@ -250,6 +358,7 @@ pub fn compile_dir(dir: &Path) -> Result<TrackOut, String> {
         if gain.is_negative() {
             return Err(format!("소리 {}: 이득이 음수", s.id));
         }
+        to_f32_checked(&gain).map_err(|e| format!("소리 {}: {e}", s.id))?;
         let retrigger = match s.retrigger.as_deref().unwrap_or("overlap") {
             "overlap" => 0,
             "cut" => 1,
@@ -350,6 +459,7 @@ pub fn compile_dir(dir: &Path) -> Result<TrackOut, String> {
         }
     }
     let mut charts = Vec::new();
+    let mut layer_in: Vec<LayerEv> = Vec::new();
     for (cid, c) in &raw {
         let (q, scale, shift, refs, base) = match &c.base {
             None => {
@@ -394,6 +504,7 @@ pub fn compile_dir(dir: &Path) -> Result<TrackOut, String> {
             }
         };
         let (sec, local_to_track) = finalize(cid, &q, &scale, &shift, &refs, &ctx)?;
+        layer_in.extend(layer_events(charts.len(), &q, &scale, sec.shift, &sound_ids, &datas)?);
         let stats = chart_stats(&q, &sec, &scale, info.highlight);
         let scale_i = (scale.numer().to_i64().ok_or("time_scale 분자 범위")?, scale.denom().to_i64().ok_or("time_scale 분모 범위")?);
         charts.push(ChartOut {
@@ -407,8 +518,8 @@ pub fn compile_dir(dir: &Path) -> Result<TrackOut, String> {
             stats,
         });
     }
-    warnings.extend(layer_warnings(&charts, &sound_ids, &datas));
-    let mut t = TrackOut { id, revision: tr.revision, info, layouts, sound_ids, chokes, datas, charts, media, source, warnings };
+    warnings.extend(layer_warnings(&charts, layer_in));
+    let mut t = TrackOut { source_key, id, revision: tr.revision, info, layouts, sound_ids, chokes, datas, charts, media, source, warnings };
     fill_local_hashes(&mut t);
     Ok(t)
 }
@@ -467,9 +578,15 @@ fn compile_q(cid: &str, c: &ChartToml, ctx: &Ctx) -> Result<QChart, String> {
     };
     let tm = Timing::new(c.timing.as_ref().ok_or_else(|| format!("{cid}: timing 필요"))?).map_err(|e| format!("{cid} timing: {e}"))?;
     uniq(&format!("{cid} 변형"), c.variant.iter().map(|v| v.id.as_str()))?;
+    if c.variant.len() > u16::MAX as usize {
+        return Err(format!("{cid}: 변형이 너무 많음"));
+    }
     let mut variants = Vec::new();
     for v in &c.variant {
         uniq(&format!("{cid} 변형 {} 선택", v.id), v.choices.iter().map(|s| s.as_str()))?;
+        if v.choices.len() > u16::MAX as usize {
+            return Err(format!("{cid} 변형 {}: 선택지가 너무 많음", v.id));
+        }
         if v.choices.is_empty() {
             return Err(format!("{cid} 변형 {}: 선택지 없음", v.id));
         }
@@ -561,65 +678,47 @@ fn compile_q(cid: &str, c: &ChartToml, ctx: &Ctx) -> Result<QChart, String> {
     for ls in &c.lane_sound {
         lsnds.push((lane_idx(&ls.lane)?, tm.seconds(&ls.at)?, ctx.sound(cid, &ls.sound)?, cond(&ls.when)?));
     }
-    // 스크롤 (명세 3-2)
+    // 스크롤 (명세 3-2): 점 (시각, 위치?, 속도) → 정지 구간을 끼우며 이동 시간만 적분 (리뷰 3-1 #6)
     let sixty = int(60);
-    let mut scroll: Vec<(Q, Q, Q)> = Vec::new();
+    let mut pts: Vec<(Q, Option<Q>, Q)> = Vec::new();
     if let Some(sd) = &c.scroll {
-        let mut prev: Option<(Q, Q, Q)> = None;
-        for p in &sd.points {
+        if sd.points.is_empty() {
+            return Err(format!("{cid}: [scroll] points가 비었음"));
+        }
+        for (i, p) in sd.points.iter().enumerate() {
             let t = tm.seconds(&p.at)?;
-            let spd = parse(&p.speed)? / &sixty;
-            let pos = match (&prev, &p.pos) {
-                (None, pos) => {
-                    if !t.is_zero() {
-                        return Err(format!("{cid}: 첫 스크롤 점은 at = 0"));
-                    }
-                    pos.as_deref().map(parse).transpose()?.unwrap_or_else(Q::zero)
-                }
-                (Some(_), Some(p)) => parse(p)?,
-                (Some((pt, pp, ps)), None) => pp + ps * (&t - pt),
-            };
-            if let Some((pt, _, _)) = &prev {
-                if &t < pt {
+            if i == 0 && !t.is_zero() {
+                return Err(format!("{cid}: 첫 스크롤 점은 at = 0"));
+            }
+            if let Some(prev) = pts.last() {
+                if t < prev.0 {
                     return Err(format!("{cid}: 스크롤 점이 시간순이 아님"));
                 }
             }
-            prev = Some((t.clone(), pos.clone(), spd.clone()));
-            scroll.push((t, pos, spd));
+            let pos = match (&p.pos, i) {
+                (Some(x), _) => Some(parse(x)?),
+                (None, 0) => Some(Q::zero()),
+                (None, _) => None,
+            };
+            pts.push((t, pos, parse(&p.speed)? / &sixty));
         }
     } else if tm.unit == Unit::Ms {
         if tm.tempo.is_empty() {
             return Err(format!("{cid}: unit = ms에 tempo도 scroll도 없음"));
         }
-        let mut pos = Q::zero();
-        let mut prev: Option<(Q, Q)> = None;
-        for (ms, bpm) in &tm.tempo {
+        for (i, (ms, bpm)) in tm.tempo.iter().enumerate() {
             let t = ms / int(1000);
-            if let Some((pt, pb)) = &prev {
-                pos += (&t - pt) * pb / &sixty;
+            if i == 0 && !t.is_zero() {
+                pts.push((Q::zero(), Some(Q::zero()), bpm / &sixty));
             }
-            scroll.push((t.clone(), pos.clone(), bpm / &sixty));
-            prev = Some((t, bpm.clone()));
-        }
-        if !scroll[0].0.is_zero() {
-            let s0 = scroll[0].2.clone();
-            scroll.insert(0, (Q::zero(), Q::zero(), s0));
+            pts.push((t, if pts.is_empty() { Some(Q::zero()) } else { None }, bpm / &sixty));
         }
     } else {
         for (b, bpm) in &tm.tempo {
-            scroll.push((tm.sec_of_beat(b), b.clone(), bpm / &sixty));
+            pts.push((tm.sec_of_beat(b), Some(b.clone()), bpm / &sixty));
         }
     }
-    // STOP 구간 삽입
-    for (t0, d) in tm.stop_spans() {
-        let i = scroll.iter().rposition(|p| p.0 <= t0).unwrap_or(0);
-        let (pt, pp, ps) = scroll[i].clone();
-        let pos = &pp + &ps * (&t0 - &pt);
-        let mut later: Vec<_> = scroll.split_off(i + 1);
-        scroll.push((t0.clone(), pos.clone(), Q::zero()));
-        scroll.push((&t0 + &d, pos, ps));
-        scroll.append(&mut later);
-    }
+    let scroll = integrate_scroll(&pts, &tm.stop_spans());
     // 마디선
     let mut bars = Vec::new();
     if !tm.bars.is_empty() {
@@ -639,6 +738,9 @@ fn compile_q(cid: &str, c: &ChartToml, ctx: &Ctx) -> Result<QChart, String> {
             let t = tm.sec_of_beat(&tm.measure_start(m));
             if t > last {
                 break;
+            }
+            if bars.len() >= MAX_BARS {
+                return Err(format!("{cid}: 마디선이 {MAX_BARS}개를 넘음"));
             }
             bars.push(t);
             m += 1;
@@ -721,13 +823,13 @@ fn finalize(cid: &str, q: &QChart, scale: &Q, shift: &Q, refs: &Q, ctx: &Ctx) ->
                     }
                 }
             };
-            LocalSound { hash: [0; 32], start: sid.start, gain: to_f32(&sid.gain), retrigger: sid.retrigger, choke }
+            LocalSound { hash: [0; 32], start: sid.start, gain: to_f32(&sid.gain), retrigger: sid.retrigger, choke } // gain은 compile_dir에서 f32 범위 검사됨
         })
         .collect();
     // 자동재생
     let mut auto: Vec<(i64, usize, u32, f32, u32)> = Vec::new();
     for a in &q.auto {
-        auto.push((at(&a.0)?, a.4, local_of[&a.1], to_f32(&a.2), cond_of(&a.3)));
+        auto.push((at(&a.0)?, a.4, local_of[&a.1], to_f32_checked(&a.2)?, cond_of(&a.3)));
     }
     auto.sort_by_key(|x| (x.0, x.1));
     // 노트·노트 소리 (레인마다 시각순, 같은 시각이면 작성 순서)
@@ -744,7 +846,8 @@ fn finalize(cid: &str, q: &QChart, scale: &Q, shift: &Q, refs: &Q, ctx: &Ctx) ->
         }
         let ns_start = note_sounds.len() as u32;
         for s in &n.6 {
-            note_sounds.push((at(&s.0)? - t, local_of[&s.1], to_f32(&s.2))); // round(소리) − round(노트) (명세 3-1의 6)
+            let off = at(&s.0)?.checked_sub(t).ok_or_else(|| format!("{cid}: 노트 소리 offset이 i64 범위 밖"))?;
+            note_sounds.push((off, local_of[&s.1], to_f32_checked(&s.2)?)); // round(소리) − round(노트) (명세 3-1의 6)
         }
         lanes[n.0].notes.push(NoteRec {
             t,
@@ -759,27 +862,23 @@ fn finalize(cid: &str, q: &QChart, scale: &Q, shift: &Q, refs: &Q, ctx: &Ctx) ->
     for (_, l) in &ls_sorted {
         lanes[l.0].lsnds.push((at(&l.1)?, local_of[&l.2], cond_of(&l.3)));
     }
-    // 같은 레인 겹침: 변형 선택 조합마다 (ns 반올림 뒤)
-    let combos: Vec<Vec<u16>> = q.variants.iter().fold(vec![vec![]], |acc, v| {
-        acc.iter().flat_map(|c| (0..v.1.len() as u16).map(move |i| [c.clone(), vec![i]].concat())).collect()
-    });
-    for combo in &combos {
-        let on = |ci: u32| conds[ci as usize].iter().all(|(v, ch)| combo[*v as usize] == *ch);
-        for lane in &lanes {
-            let mut prev_end: Option<i64> = None;
-            for n in lane.notes.iter().filter(|n| on(n.cond)) {
-                if let Some(pe) = prev_end {
-                    if n.t <= pe {
-                        return Err(format!("{cid}: 레인 {} 노트 겹침 (변형 {combo:?}, ns {})", lane.id, n.t));
-                    }
-                }
-                prev_end = Some(n.end);
+    // 같은 레인 겹침 (ns 반올림 뒤): 두 노트의 조건이 동시에 참일 수 있으면 겹침 — 조합을 펼치지 않는다 (리뷰 3-1 #4)
+    let compatible = |a: u32, b: u32| -> bool {
+        conds[a as usize].iter().all(|(v, ch)| conds[b as usize].iter().all(|(v2, ch2)| v != v2 || ch == ch2))
+    };
+    for lane in &lanes {
+        let mut active: Vec<&NoteRec> = Vec::new(); // 아직 끝나지 않은 앞 노트들 (t 순으로 지나감)
+        for n in &lane.notes {
+            active.retain(|a| a.end >= n.t);
+            if let Some(a) = active.iter().find(|a| compatible(a.cond, n.cond)) {
+                return Err(format!("{cid}: 레인 {} 노트 겹침 (ns {} 와 {}, 동시에 있을 수 있는 변형 조건)", lane.id, a.t, n.t));
             }
+            active.push(n);
         }
     }
     // 스크롤·마디선
     let scroll: Vec<(i64, f64, f64)> =
-        q.scroll.iter().map(|(t, p, s)| Ok((at(t)?, to_f64(p), to_f64(&(s * scale))))).collect::<Result<_, String>>()?;
+        q.scroll.iter().map(|(t, p, s)| Ok((at(t)?, to_f64_checked(p)?, to_f64_checked(&(s * scale))?))).collect::<Result<_, String>>()?;
     let bars: Vec<i64> = q.bars.iter().map(at).collect::<Result<_, String>>()?;
     let end = auto
         .iter()
@@ -795,7 +894,7 @@ fn finalize(cid: &str, q: &QChart, scale: &Q, shift: &Q, refs: &Q, ctx: &Ctx) ->
         let (frames, rate) = ctx.sound_dur[s.sound as usize];
         let dur = (frames as i128 * 1_000_000_000 / rate as i128) as i64;
         ev.push((s.t, 1));
-        ev.push((s.t + dur.max(1), -1));
+        ev.push((s.t.saturating_add(dur.max(1)), -1));
     }
     ev.sort();
     let (mut cur, mut peak) = (0i32, 0i32);
@@ -804,10 +903,14 @@ fn finalize(cid: &str, q: &QChart, scale: &Q, shift: &Q, refs: &Q, ctx: &Ctx) ->
         peak = peak.max(cur);
     }
     let peak = peak as u32;
+    let lo = starts.iter().map(|s| s.t).chain(lanes.iter().flat_map(|l| l.notes.iter().map(|n| n.t))).min().unwrap_or(0);
+    if end > MAX_CHART_NS || lo < -MAX_CHART_NS {
+        return Err(format!("{cid}: 차분 시각이 ±24시간 상한 밖"));
+    }
     let sec = ChartSec {
         shift: ns(shift)?,
         end,
-        reference_scroll: to_f64(refs),
+        reference_scroll: to_f64_checked(refs)?,
         long_note: q.long_note,
         empty_lane: q.empty_lane,
         voice_budget: peak + peak / 4 + 8,
@@ -845,7 +948,7 @@ fn chart_stats(_q: &QChart, sec: &ChartSec, _scale: &Q, track_highlight: Option<
         max_nps = max_nps.max((i - j + 1) as u32);
     }
     let highlight = match track_highlight {
-        Some(h) => h - sec.shift,
+        Some(h) => h.saturating_sub(sec.shift),
         None => {
             let w = 40.min(nb); // 10초 창
             let mut best = (0u32, 0usize);
@@ -865,33 +968,71 @@ fn chart_stats(_q: &QChart, sec: &ChartSec, _scale: &Q, track_highlight: Option<
     ChartStats { notes: ts.len() as u32, bins, highlight, max_nps }
 }
 
-/// 음악 레이어 경고: 차분 사이에 같지 않은 이벤트 수 (명세 3-6, README 2장).
-fn layer_warnings(charts: &[ChartOut], sids: &[SoundIdOut], datas: &[SoundDataOut]) -> Vec<String> {
-    let mut layer: BTreeMap<(i64, [u8; 32], u32, u32), BTreeSet<&str>> = BTreeMap::new();
-    for c in charts {
-        let s = &c.sec;
-        let key = |t: i64, local: u32, g: f32| {
-            let sid = &sids[c.local_to_track[local as usize] as usize];
-            (t + s.shift, datas[sid.data as usize].hash, sid.start, (to_f32(&sid.gain) * g).to_bits())
-        };
-        for a in &s.auto {
-            layer.entry(key(a.0, a.1, a.2)).or_default().insert(&c.id);
+/// 음악 레이어 항목: (차분 번호, Track 시각 ns, 소리 해시, start, 최종 이득(유리수), 조건부인가)
+type LayerEv = (usize, i64, [u8; 32], u32, Q, bool);
+
+fn layer_events(ci: usize, q: &QChart, scale: &Q, shift: i64, sids: &[SoundIdOut], datas: &[SoundDataOut]) -> Result<Vec<LayerEv>, String> {
+    let mut out = Vec::new();
+    let mut push = |t: &Q, s: u32, g: &Q, cond: bool| -> Result<(), String> {
+        let sid = &sids[s as usize];
+        let tt = sec_to_ns(&(t / scale))?.checked_add(shift).ok_or("Track 시각이 i64 범위 밖")?;
+        out.push((ci, tt, datas[sid.data as usize].hash, sid.start, &sid.gain * g, cond));
+        Ok(())
+    };
+    for a in &q.auto {
+        push(&a.0, a.1, &a.2, !a.3.is_empty())?;
+    }
+    for n in &q.notes {
+        for s in &n.6 {
+            push(&s.0, s.1, &s.2, !n.4.is_empty())?;
         }
-        for l in &s.lanes {
-            for n in &l.notes {
-                for ns_ in &s.note_sounds[n.ns_start as usize..n.ns_start as usize + n.ns_len as usize] {
-                    layer.entry(key(n.t + ns_.0, ns_.1, ns_.2)).or_default().insert(&c.id);
+    }
+    Ok(out)
+}
+
+/// 음악 레이어 경고 (명세 3-6): 같은 (Track 시각, 소리 해시, start, 유리수 이득)을 하나로 세고, 차분 ID 집합으로 공유를 센다.
+/// 조건부(변형) 발음은 따로 센다. 같은 소리가 차분 사이에서 1 ms 안으로 어긋난 쌍도 센다 (명세 3-3 경고).
+fn layer_warnings(charts: &[ChartOut], evs: Vec<LayerEv>) -> Vec<String> {
+    let n = charts.len();
+    let mut by_key: BTreeMap<(i64, [u8; 32], u32, String), (BTreeSet<usize>, bool)> = BTreeMap::new();
+    for (ci, t, h, st, g, cond) in &evs {
+        let e = by_key.entry((*t, *h, *st, g.to_string())).or_default();
+        e.0.insert(*ci);
+        e.1 |= *cond;
+    }
+    let mut w = Vec::new();
+    if n > 1 {
+        let partial = by_key.values().filter(|v| v.0.len() < n).count();
+        let cond = by_key.values().filter(|v| v.1).count();
+        if partial > 0 {
+            w.push(format!("음악 레이어 {}개 중 {partial}개는 모든 차분에 있지 않음 (차분마다 소리가 다름; 변형 조건부 {cond}개)", by_key.len()));
+        }
+    }
+    // 1 ms 안 어긋남: 같은 (소리, start, 이득)의 시각을 차분별로 모아 다른 차분끼리 0 < |Δ| ≤ 1 ms
+    let mut times: BTreeMap<([u8; 32], u32, String), Vec<(i64, usize)>> = BTreeMap::new();
+    for (ci, t, h, st, g, _) in &evs {
+        times.entry((*h, *st, g.to_string())).or_default().push((*t, *ci));
+    }
+    let mut near = 0usize;
+    for v in times.values_mut() {
+        v.sort();
+        v.dedup();
+        for i in 0..v.len() {
+            for j in i + 1..v.len() {
+                let d = v[j].0 - v[i].0;
+                if d > 1_000_000 {
+                    break;
+                }
+                if d > 0 && v[j].1 != v[i].1 {
+                    near += 1;
                 }
             }
         }
     }
-    let n = charts.len();
-    let partial = layer.values().filter(|v| v.len() < n).count();
-    if n > 1 && partial > 0 {
-        vec![format!("음악 레이어 {}개 중 {partial}개는 모든 차분에 있지 않음 (차분마다 소리가 다름)", layer.len())]
-    } else {
-        vec![]
+    if near > 0 {
+        w.push(format!("같은 소리가 차분 사이에서 1 ms 안으로 어긋난 쌍 {near}개 (합치지 않고 별개 이벤트로 둠)"));
     }
+    w
 }
 
 /// 차분 안 소리 표의 해시를 데이터 해시로 채운다.
@@ -901,5 +1042,24 @@ pub fn fill_local_hashes(t: &mut TrackOut) {
             let sid = &t.sound_ids[*ts as usize];
             c.sec.sounds[i].hash = t.datas[sid.data as usize].hash;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rational::frac;
+
+    #[test]
+    fn stop_excluded_from_scroll_integration() {
+        // 리뷰 3-1 #6 반례: BPM 60, 1박에서 1박 STOP, 명시 점 (0박, 60), (2박, 60) — 두 번째 점은 3초·위치 2
+        let pts = vec![(int(0), Some(int(0)), int(1)), (int(3), None, int(1))];
+        let stops = vec![(int(1), int(1))];
+        let s = integrate_scroll(&pts, &stops);
+        assert_eq!(s, vec![(int(0), int(0), int(1)), (int(1), int(1), int(0)), (int(2), int(1), int(1)), (int(3), int(2), int(1))]);
+        // 같은 시각의 점과 정지 시작: 점의 속도가 정지 끝에서 되살아난다
+        let pts = vec![(int(0), Some(int(0)), int(1)), (int(1), None, int(2))];
+        let s = integrate_scroll(&pts, &[(int(1), frac(1, 2))]);
+        assert_eq!(s, vec![(int(0), int(0), int(1)), (int(1), int(1), int(0)), (frac(3, 2), int(1), int(2))]);
     }
 }

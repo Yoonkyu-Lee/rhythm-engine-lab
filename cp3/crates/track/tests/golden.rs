@@ -26,3 +26,23 @@ fn deterministic_and_golden() {
         assert_eq!(pack::encode_chart(&pack::decode_chart(sec).unwrap()), sec);
     }
 }
+
+#[test]
+fn audio_roundtrip_same_hash() {
+    // 예시 소리마다: 파일 → 묶음 형태 → 파일로 되살리기 → 묶음 형태 → 같은 소리 해시·같은 PCM (명세 5-2)
+    use track::audio;
+    for e in std::fs::read_dir(example().join("audio")).unwrap() {
+        let p = e.unwrap().path();
+        if !matches!(p.extension().and_then(|x| x.to_str()), Some("ogg" | "flac" | "wav")) {
+            continue;
+        }
+        let a = audio::pack_file(&std::fs::read(&p).unwrap()).unwrap();
+        let pa = audio::decode(&a).unwrap();
+        let (bytes, _) = audio::to_file(&a).unwrap();
+        let b = audio::pack_file(&bytes).unwrap();
+        let pb = audio::decode(&b).unwrap();
+        assert_eq!(audio::content_hash(&a, &pa), audio::content_hash(&b, &pb), "{}", p.display());
+        assert_eq!(pa, pb, "{}", p.display());
+        assert_eq!((a.frames, a.skip_front, a.rate, a.channels), (b.frames, b.skip_front, b.rate, b.channels));
+    }
+}

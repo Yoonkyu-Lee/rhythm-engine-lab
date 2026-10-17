@@ -89,7 +89,29 @@ pub fn decode(p: &Packed) -> Result<Pcm, String> {
     }
 }
 
-/// 소리 해시 = BLAKE3("SND1" ‖ rate u32 ‖ channels u16 ‖ frames u64 ‖ PCM). 정수는 i32 LE, Vorbis는 f32 LE.
+/// 소리 해시 (명세 3-5, v1.4). 정수 코덱(FLAC·MS-ADPCM) = BLAKE3("SND1" ‖ rate ‖ channels ‖ frames ‖ 디코딩 PCM i32 LE).
+/// Vorbis = BLAKE3("SNDV" ‖ rate ‖ channels ‖ frames ‖ skip_front ‖ 코덱 표 길이 u64 ‖ 코덱 표 ‖ 데이터) — 보존한 패킷 자체로 정한다.
+/// Vorbis 디코더(lewton)는 표를 실행 중 f32 sin/cos로 만들어 플랫폼마다 PCM 비트가 다를 수 있으므로(리뷰 3-1 #11),
+/// 소리·차분 해시가 환경에 따라 바뀌지 않게 디코딩 결과를 해시에 넣지 않는다.
+pub fn content_hash(p: &Packed, pcm: &Pcm) -> [u8; 32] {
+    match p.codec {
+        Codec::Vorbis => {
+            let mut h = blake3::Hasher::new();
+            h.update(b"SNDV");
+            h.update(&p.rate.to_le_bytes());
+            h.update(&(p.channels as u16).to_le_bytes());
+            h.update(&p.frames.to_le_bytes());
+            h.update(&p.skip_front.to_le_bytes());
+            h.update(&(p.codec_table.len() as u64).to_le_bytes());
+            h.update(&p.codec_table);
+            h.update(&p.data);
+            *h.finalize().as_bytes()
+        }
+        _ => sound_hash(p.rate, p.channels, p.frames, pcm),
+    }
+}
+
+/// PCM 해시 = BLAKE3("SND1" ‖ rate u32 ‖ channels u16 ‖ frames u64 ‖ PCM). 정수는 i32 LE, Vorbis는 f32 LE.
 pub fn sound_hash(rate: u32, channels: u8, frames: u64, pcm: &Pcm) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(b"SND1");
@@ -115,46 +137,70 @@ pub fn sound_hash(rate: u32, channels: u8, frames: u64, pcm: &Pcm) -> [u8; 32] {
 
 /// Ogg 페이지를 훑어 패킷과 (그 페이지에서 끝난 패킷 수 누계, granule) 목록을 만든다. 논리 스트림 하나만.
 fn ogg_packets(bytes: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<(usize, i64, bool)>), String> {
+    // 페이지 검증: 버전 0, 순번 0부터 1씩, CRC, BOS는 첫 페이지만, EOS 뒤 데이터 없음, 이어짐 표시 = 앞 패킷이 끝나지 않음 (리뷰 3-1 #10)
     let mut pos = 0usize;
     let mut packets: Vec<Vec<u8>> = Vec::new();
     let mut cur: Vec<u8> = Vec::new();
+    let mut open = false;
     let mut granules = Vec::new();
     let mut serial = None;
+    let mut seq_expect = 0u32;
+    let mut eos_seen = false;
     while pos < bytes.len() {
-        if bytes.len() < pos + 27 || &bytes[pos..pos + 4] != b"OggS" {
+        if eos_seen {
+            return Err("Ogg EOS 페이지 뒤에 데이터가 있음".into());
+        }
+        let head = bytes.get(pos..pos + 27).ok_or("Ogg 페이지 머리가 잘림")?;
+        if &head[0..4] != b"OggS" || head[4] != 0 {
             return Err(format!("Ogg 페이지가 아님 (오프셋 {pos})"));
         }
-        let header_type = bytes[pos + 5];
-        let granule = i64::from_le_bytes(bytes[pos + 6..pos + 14].try_into().unwrap());
-        let ser = u32::from_le_bytes(bytes[pos + 14..pos + 18].try_into().unwrap());
+        let header_type = head[5];
+        let granule = i64::from_le_bytes(head[6..14].try_into().unwrap());
+        let ser = u32::from_le_bytes(head[14..18].try_into().unwrap());
+        let seq = u32::from_le_bytes(head[18..22].try_into().unwrap());
+        let crc = u32::from_le_bytes(head[22..26].try_into().unwrap());
         match serial {
             None => serial = Some(ser),
             Some(s) if s != ser => return Err("Ogg 스트림이 둘 이상 (연결·다중 스트림은 미지원)".into()),
             _ => {}
         }
-        if header_type & 0x02 != 0 && !packets.is_empty() {
-            return Err("Ogg 연결(chained) 스트림은 미지원".into());
+        if seq != seq_expect {
+            return Err(format!("Ogg 페이지 순번이 이어지지 않음 ({seq} != {seq_expect})"));
         }
-        let nseg = bytes[pos + 26] as usize;
-        let segs = &bytes[pos + 27..pos + 27 + nseg];
+        seq_expect = seq_expect.wrapping_add(1);
+        if (header_type & 0x02 != 0) != (seq == 0) {
+            return Err("Ogg BOS 표시가 첫 페이지에만 있지 않음 (연결 스트림은 미지원)".into());
+        }
+        if (header_type & 0x01 != 0) != open {
+            return Err("Ogg 이어짐 표시가 패킷 상태와 맞지 않음".into());
+        }
+        let nseg = head[26] as usize;
+        let segs = bytes.get(pos + 27..pos + 27 + nseg).ok_or("Ogg 세그먼트 표가 잘림")?;
+        let body_len: usize = segs.iter().map(|&x| x as usize).sum();
+        let page_end = pos + 27 + nseg + body_len;
+        let page = bytes.get(pos..page_end).ok_or("Ogg 페이지가 잘림")?;
+        let mut zeroed = page.to_vec();
+        zeroed[22..26].fill(0);
+        if ogg_crc(&zeroed) != crc {
+            return Err(format!("Ogg CRC가 맞지 않음 (페이지 {seq})"));
+        }
         let mut body = pos + 27 + nseg;
         for &len in segs {
             let len = len as usize;
-            if body + len > bytes.len() {
-                return Err("Ogg 페이지가 잘림".into());
-            }
             cur.extend_from_slice(&bytes[body..body + len]);
             body += len;
             if len < 255 {
                 packets.push(std::mem::take(&mut cur));
             }
         }
+        open = segs.last().map(|&l| l == 255).unwrap_or(open);
         if granule != -1 {
             granules.push((packets.len(), granule, header_type & 0x04 != 0)); // (끝난 패킷 누계, granule, EOS)
         }
-        pos = body;
+        eos_seen = header_type & 0x04 != 0;
+        pos = page_end;
     }
-    if !cur.is_empty() {
+    if !cur.is_empty() || open {
         return Err("마지막 Ogg 패킷이 끝나지 않음".into());
     }
     Ok((packets, granules))
@@ -319,8 +365,8 @@ struct AdpcmFmt {
 }
 
 fn parse_adpcm_fmt(f: &[u8]) -> Result<AdpcmFmt, String> {
-    if f.len() < 20 {
-        return Err("WAV fmt가 짧음".into());
+    if f.len() < 22 {
+        return Err("WAV fmt가 짧음 (MS-ADPCM은 22바이트 이상)".into());
     }
     let u16_at = |o: usize| u16::from_le_bytes([f[o], f[o + 1]]);
     let tag = u16_at(0);
@@ -333,6 +379,9 @@ fn parse_adpcm_fmt(f: &[u8]) -> Result<AdpcmFmt, String> {
     let samples_per_block = u16_at(18) as usize;
     let ncoef = u16_at(20) as usize;
     let mut coefs = Vec::new();
+    if ncoef > 256 {
+        return Err("ADPCM 계수가 너무 많음".into());
+    }
     for i in 0..ncoef {
         let o = 22 + 4 * i;
         if f.len() < o + 4 {
@@ -369,7 +418,8 @@ fn pack_wav_adpcm(bytes: &[u8]) -> Result<Packed, String> {
     let decoded = decode_adpcm(&fmt_b, &data)?.len() / f.channels as usize;
     let frames = match fact {
         Some(n) if (n as usize) <= decoded => n as u64,
-        _ => decoded as u64,
+        Some(n) => return Err(format!("ADPCM fact 길이 {n}가 실제 디코딩 길이 {decoded}보다 큼 (손상)")),
+        None => decoded as u64,
     };
     Ok(Packed { codec: Codec::MsAdpcm, channels: f.channels as u8, rate: f.rate, frames, skip_front: 0, int16: true, codec_table: fmt_b, data })
 }
@@ -386,10 +436,10 @@ fn decode_adpcm(fmt_b: &[u8], data: &[u8]) -> Result<Vec<i32>, String> {
             break;
         }
         let mut pred = [0usize; 2];
-        let mut delta = [0i32; 2];
-        let mut s1 = [0i32; 2];
-        let mut s2 = [0i32; 2];
-        let rd16 = |o: usize| i16::from_le_bytes([block[o], block[o + 1]]) as i32;
+        let mut delta = [0i64; 2];
+        let mut s1 = [0i64; 2];
+        let mut s2 = [0i64; 2];
+        let rd16 = |o: usize| i16::from_le_bytes([block[o], block[o + 1]]) as i64;
         for c in 0..ch {
             pred[c] = block[c] as usize;
             if pred[c] >= f.coefs.len() {
@@ -402,10 +452,10 @@ fn decode_adpcm(fmt_b: &[u8], data: &[u8]) -> Result<Vec<i32>, String> {
         // 블록 머리의 두 샘플: sample2 먼저, 그다음 sample1
         let mut frame_out = 2usize;
         for c in 0..ch {
-            out.push(s2[c]);
+            out.push(s2[c] as i32);
         }
         for c in 0..ch {
-            out.push(s1[c]);
+            out.push(s1[c] as i32);
         }
         let body = &block[7 * ch..];
         let mut nib = 0usize; // 니블 순번 (높은 니블 먼저, 채널 교대)
@@ -413,16 +463,18 @@ fn decode_adpcm(fmt_b: &[u8], data: &[u8]) -> Result<Vec<i32>, String> {
         while frame_out < f.samples_per_block && nib + ch <= total_nibbles {
             for c in 0..ch {
                 let byte = body[nib / 2];
-                let n = if nib % 2 == 0 { byte >> 4 } else { byte & 0x0f } as i32;
+                let n = if nib % 2 == 0 { byte >> 4 } else { byte & 0x0f } as i64;
                 nib += 1;
                 let (c1, c2) = f.coefs[pred[c]];
-                let predict = (s1[c] * c1 + s2[c] * c2) / 256; // 0 쪽 버림 (Microsoft 명세)
+                // 64비트 중간 연산 (리뷰 3-1 #8). 예측값은 0 쪽 버림 (Microsoft 명세)
+                let predict = (s1[c] * c1 as i64 + s2[c] * c2 as i64) / 256;
                 let signed = if n & 8 != 0 { n - 16 } else { n };
                 let sample = (predict + signed * delta[c]).clamp(-32768, 32767);
-                delta[c] = ((ADAPT[n as usize] * delta[c]) / 256).max(16);
+                // delta 상한은 ffmpeg와 같은 i32::MAX / 768 (손상 파일에서 끝없이 커지지 않게)
+                delta[c] = ((ADAPT[n as usize] as i64 * delta[c]) / 256).clamp(16, (i32::MAX / 768) as i64);
                 s2[c] = s1[c];
                 s1[c] = sample;
-                out.push(sample);
+                out.push(sample as i32);
             }
             frame_out += 1;
         }
@@ -445,35 +497,49 @@ fn ogg_crc(data: &[u8]) -> u32 {
     crc
 }
 
-fn ogg_page(out: &mut Vec<u8>, header_type: u8, granule: i64, serial: u32, seq: u32, packet: &[u8]) {
-    let mut segs = Vec::new();
+/// 패킷 하나를 페이지 여러 개로 (페이지당 세그먼트 255개까지). 패킷이 끝나는 마지막 페이지에만 granule, 나머지는 -1.
+fn ogg_packet_pages(out: &mut Vec<u8>, first_flags: u8, last_flags: u8, granule: i64, serial: u32, seq: &mut u32, packet: &[u8]) {
+    let mut lacing = Vec::new();
     let mut n = packet.len();
     loop {
         if n >= 255 {
-            segs.push(255u8);
+            lacing.push(255u8);
             n -= 255;
         } else {
-            segs.push(n as u8);
+            lacing.push(n as u8);
             break;
         }
     }
-    let start = out.len();
-    out.extend_from_slice(b"OggS");
-    out.push(0);
-    out.push(header_type);
-    out.extend_from_slice(&granule.to_le_bytes());
-    out.extend_from_slice(&serial.to_le_bytes());
-    out.extend_from_slice(&seq.to_le_bytes());
-    out.extend_from_slice(&[0, 0, 0, 0]);
-    out.push(segs.len() as u8);
-    out.extend_from_slice(&segs);
-    out.extend_from_slice(packet);
-    let crc = ogg_crc(&out[start..]);
-    out[start + 22..start + 26].copy_from_slice(&crc.to_le_bytes());
+    let chunks: Vec<&[u8]> = lacing.chunks(255).collect();
+    let mut off = 0usize;
+    for (i, segs) in chunks.iter().enumerate() {
+        let first = i == 0;
+        let last = i + 1 == chunks.len();
+        let mut flags = if first { first_flags } else { 0x01 };
+        if last {
+            flags |= last_flags;
+        }
+        let body_len: usize = segs.iter().map(|&x| x as usize).sum();
+        let start = out.len();
+        out.extend_from_slice(b"OggS");
+        out.push(0);
+        out.push(flags);
+        out.extend_from_slice(&(if last { granule } else { -1 }).to_le_bytes());
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(&seq.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.push(segs.len() as u8);
+        out.extend_from_slice(segs);
+        out.extend_from_slice(&packet[off..off + body_len]);
+        off += body_len;
+        let crc = ogg_crc(&out[start..]);
+        out[start + 22..start + 26].copy_from_slice(&crc.to_le_bytes());
+        *seq += 1;
+    }
 }
 
 /// 묶음 형태 → 파일 바이트와 확장자. 되살린 파일을 다시 `pack_file` + `decode`하면 소리 해시가 같다.
-/// (Ogg는 패킷 하나당 페이지 하나로 다시 만든다. comment 머리는 비운다. 255 세그먼트를 넘는 큰 패킷은 지원하지 않음.)
+/// (Ogg는 패킷마다 페이지를 새로 시작하고, 큰 패킷은 이어지는 페이지로 나눈다. comment 머리는 비운다.)
 pub fn to_file(p: &Packed) -> Result<(Vec<u8>, &'static str), String> {
     match p.codec {
         Codec::Flac => {
@@ -525,12 +591,9 @@ pub fn to_file(p: &Packed) -> Result<(Vec<u8>, &'static str), String> {
             let serial = 0x5452_4b31; // "TRK1"
             let mut f = Vec::new();
             let mut seq = 0u32;
-            ogg_page(&mut f, 0x02, 0, serial, seq, ident);
-            seq += 1;
-            for (k, h) in [&comment[..], setup].iter().enumerate() {
-                let _ = k;
-                ogg_page(&mut f, 0, 0, serial, seq, h);
-                seq += 1;
+            ogg_packet_pages(&mut f, 0x02, 0, 0, serial, &mut seq, ident);
+            for h in [&comment[..], setup] {
+                ogg_packet_pages(&mut f, 0, 0, 0, serial, &mut seq, h);
             }
             let mut pwr = lewton::audio::PreviousWindowRight::new();
             let mut cum: i64 = 0;
@@ -538,15 +601,11 @@ pub fn to_file(p: &Packed) -> Result<(Vec<u8>, &'static str), String> {
             for i in 0..n {
                 let pkt = &p.data[off..off + lens[i]];
                 off += lens[i];
-                if pkt.len() >= 255 * 255 {
-                    return Err("너무 큰 Vorbis 패킷".into());
-                }
                 let s: crate::audio::VorbisOut = lewton::audio::read_audio_packet_generic(&id, &st, pkt, &mut pwr).map_err(|e| format!("{e:?}"))?;
                 cum += s.samples.len() as i64 / ch;
                 let last = i + 1 == n;
                 let granule = if last { p.frames as i64 } else { cum - p.skip_front as i64 };
-                ogg_page(&mut f, if last { 0x04 } else { 0 }, granule, serial, seq, pkt);
-                seq += 1;
+                ogg_packet_pages(&mut f, 0, if last { 0x04 } else { 0 }, granule, serial, &mut seq, pkt);
             }
             Ok((f, "ogg"))
         }
@@ -554,3 +613,59 @@ pub fn to_file(p: &Packed) -> Result<(Vec<u8>, &'static str), String> {
 }
 
 pub type VorbisOut = lewton::samples::InterleavedSamples<f32>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ogg_pages_roundtrip_large_packets() {
+        // 큰 패킷(세그먼트 255개 넘음)을 이어지는 페이지로 나눴다가 다시 읽으면 같은 패킷 (리뷰 3-1 #10)
+        let sizes = [0usize, 1, 254, 255, 256, 255 * 255 - 1, 255 * 255, 70_000, 200_000];
+        let mut f = Vec::new();
+        let mut seq = 0u32;
+        let pkts: Vec<Vec<u8>> = sizes.iter().map(|&n| (0..n).map(|i| (i * 7 + n) as u8).collect()).collect();
+        for (i, p) in pkts.iter().enumerate() {
+            let first = if i == 0 { 0x02 } else { 0 };
+            let last = if i + 1 == pkts.len() { 0x04 } else { 0 };
+            ogg_packet_pages(&mut f, first, last, i as i64, 7, &mut seq, p);
+        }
+        let (got, gr) = ogg_packets(&f).unwrap();
+        assert_eq!(got, pkts);
+        assert_eq!(gr.last().unwrap().1, (pkts.len() - 1) as i64);
+        // CRC 한 바이트를 바꾸면 거부
+        let mut bad = f.clone();
+        bad[30] ^= 1;
+        assert!(ogg_packets(&bad).is_err());
+        // 잘린 머리는 패닉 없이 거부
+        assert!(ogg_packets(&f[..20]).is_err());
+        let mut short = b"OggS\0\x02".to_vec();
+        short.extend_from_slice(&[0; 20]);
+        short.push(1); // nseg = 1 인데 세그먼트 표 없음
+        assert!(ogg_packets(&short).is_err());
+    }
+
+    #[test]
+    fn adpcm_extreme_delta_no_overflow() {
+        // 초기 delta 32767, 니블 8 반복: 64비트 중간 연산으로 넘치지 않고 결정적으로 디코딩 (리뷰 3-1 #8)
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&2u16.to_le_bytes()); // MS-ADPCM
+        fmt.extend_from_slice(&1u16.to_le_bytes()); // 모노
+        fmt.extend_from_slice(&22050u32.to_le_bytes());
+        fmt.extend_from_slice(&0u32.to_le_bytes());
+        fmt.extend_from_slice(&64u16.to_le_bytes()); // block_align
+        fmt.extend_from_slice(&4u16.to_le_bytes());
+        fmt.extend_from_slice(&32u16.to_le_bytes()); // cbSize
+        fmt.extend_from_slice(&116u16.to_le_bytes()); // samples per block
+        fmt.extend_from_slice(&1u16.to_le_bytes()); // 계수 1개
+        fmt.extend_from_slice(&256i16.to_le_bytes());
+        fmt.extend_from_slice(&0i16.to_le_bytes());
+        let mut block = vec![0u8, 0xff, 0x7f, 0, 0, 0, 0]; // pred 0, delta 32767, s1 0, s2 0
+        block.extend(std::iter::repeat(0x88).take(57));
+        let out = decode_adpcm(&fmt, &block).unwrap();
+        assert_eq!(out.len(), 116);
+        assert!(out.iter().all(|&s| (-32768..=32767).contains(&s)));
+        // fmt가 짧으면 패닉 없이 거부
+        assert!(decode_adpcm(&fmt[..21], &block).is_err());
+    }
+}

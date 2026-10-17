@@ -450,33 +450,41 @@ def compile_chart(cid, c, layouts, sounds):
     pts = []
     if "scroll" in c:
         keys(f"{cid} scroll", c["scroll"], "scroll")
-        prev = None
-        for p in c["scroll"]["points"]:
+        for i, p in enumerate(c["scroll"]["points"]):
             keys(f"{cid} scroll point", p, "point")
             t = tm.seconds(p["at"])
-            spd = rat(p["speed"], f"{cid} scroll speed") / 60
-            if prev is None:
-                if t != 0:
-                    bad(f"{cid}: 첫 스크롤 점은 at = 0")
-                pos = rat(p.get("pos", "0"))
-            else:
-                pos = rat(p["pos"]) if "pos" in p else prev[1] + prev[2] * (t - prev[0])
-            pts.append((t, pos, spd))
-            prev = (t, pos, spd)
+            if i == 0 and t != 0:
+                bad(f"{cid}: 첫 스크롤 점은 at = 0")
+            pos = rat(p["pos"]) if "pos" in p else (F(0) if i == 0 else None)
+            pts.append((t, pos, rat(p["speed"], f"{cid} scroll speed") / 60))
     elif tm.unit != "ms":
         for tb, bpm in tm.tempo:
             t = tm.sec_of_beat(tb)
             pts.append((t, tb, bpm / 60))
-    # STOP 구간 삽입: 정지 시작 (위치, 0), 정지 끝 (위치, 직전 속도)
+    # 위치 없는 점은 이동 시간(정지 구간 제외)만 적분, 정지 시작 (위치, 0)·끝 (같은 위치, 그때 속도) — 명세 3-2
+    items = [(t_, 1, ("pt", pos, s)) for t_, pos, s in pts]
     if tm.unit != "ms":
         for sb, beats in tm.stops:
-            t0 = tm.sec_of_beat(sb)
-            d = beats * 60 / tm.bpm_at(sb)
-            before = [p for p in pts if p[0] <= t0]
-            last = before[-1]
-            pos = last[1] + last[2] * (t0 - last[0])
-            later = [(t, p, s) for t, p, s in pts if t > t0]  # 정지 뒤 점들은 박 기준이라 이미 d만큼 밀려 있음
-            pts = before + [(t0, pos, F(0)), (t0 + d, pos, last[2])] + later
+            t0 = tm.sec_of_beat(sb); d = beats * 60 / tm.bpm_at(sb)
+            items += [(t0, 2, ("start",)), (t0 + d, 0, ("end",))]
+    items.sort(key=lambda x: (x[0], x[1]))
+    out, t_ref, pos_ref, v, in_stop = [], F(0), F(0), F(0), False
+    for t_, _, it in items:
+        here = pos_ref if in_stop else pos_ref + v * (t_ - t_ref)
+        if it[0] == "pt":
+            v = it[2]
+            pnt = it[1] if it[1] is not None else here
+            out.append((t_, pnt, F(0) if in_stop else v)); pos_ref = pnt
+        elif it[0] == "start":
+            out.append((t_, here, F(0))); pos_ref = here; in_stop = True
+        else:
+            in_stop = False; out.append((t_, pos_ref, v))
+        t_ref = t_
+    pts = []
+    for x in out:
+        if pts and pts[-1][0] == x[0]:
+            pts.pop()
+        pts.append(x)
     for a, b in zip(pts, pts[1:]):
         if b[0] < a[0]:
             bad(f"{cid}: 스크롤 점 시간순 아님")
